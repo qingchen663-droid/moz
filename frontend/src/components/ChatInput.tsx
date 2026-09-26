@@ -139,7 +139,7 @@ export default function ChatInput() {
             )}
             {imageNotice && <div className="chat-input-preview-notice">{imageNotice}</div>}
           </div>
-          <button className="chat-input-preview-remove" onClick={clearImage}>
+          <button className="chat-input-preview-remove" onClick={clearImage} title="不要这张图了">
             ✕
           </button>
         </div>

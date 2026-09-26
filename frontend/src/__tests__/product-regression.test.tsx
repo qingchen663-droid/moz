@@ -234,6 +234,41 @@ describe('人设弹窗：读不到要说清楚，没保存要问一句', () => {
   })
 })
 
+describe('弹窗基本规矩：认得出自己是什么，Esc 关得掉', () => {
+  type DialogCase = [string, React.ComponentType<any>, Record<string, unknown>]
+  const cases = async (): Promise<DialogCase[]> => {
+    const [ModelDialog, PromptDialog, ConfirmDialog, Memory, Logs, MePanel] = await Promise.all([
+      import('../components/ModelDialog'),
+      import('../components/PromptDialog'),
+      import('../components/ConfirmDialog'),
+      import('../components/MemoryViewerModal'),
+      import('../components/LogViewerModal'),
+      import('../components/MePanel'),
+    ])
+    return [
+      ['模型', ModelDialog.default, {}],
+      ['人设', PromptDialog.default, {}],
+      ['确认', ConfirmDialog.default, { title: '确认框', message: 'x', onConfirm: () => {} }],
+      ['记忆', Memory.default, {}],
+      ['日志', Logs.default, {}],
+      ['设置', MePanel.default, {}],
+    ]
+  }
+
+  it('六个弹窗都有 role/aria-label，且按 Esc 会关', async () => {
+    for (const [name, Comp, extra] of await cases()) {
+      cleanup()
+      const onClose = vi.fn()
+      const { container } = render(<Comp onClose={onClose} onCancel={onClose} {...extra} />)
+      const box = container.querySelector<HTMLElement>('[role]')
+      expect(box, `${name}弹窗没有 role`).toBeTruthy()
+      expect(box!.getAttribute('aria-label'), `${name}弹窗没有 aria-label`).toBeTruthy()
+      fireEvent.keyDown(window, { key: 'Escape' })
+      expect(onClose, `${name}弹窗按 Esc 不关`).toHaveBeenCalled()
+    }
+  })
+})
+
 describe('图片上传入口', () => {
   it('模型未声明能看图时上传按钮仍在（只是低调态）', async () => {
     render(<App />)

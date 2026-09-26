@@ -93,7 +93,11 @@ export default function ChatArea() {
                 重试
               </button>
             )}
-            <button className="chat-dismiss-btn" onClick={() => useStore.setState({ error: null })}>
+            <button
+              className="chat-dismiss-btn"
+              title="关掉这条提示"
+              onClick={() => useStore.setState({ error: null })}
+            >
               ✕
             </button>
           </div>

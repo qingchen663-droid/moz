@@ -40,9 +40,7 @@ export default function PromptDialog({ onClose }: Props) {
 
   // 编辑过又没保存时，任何退出方式都得先问一句
   const confirmDiscard = () =>
-    !editing ||
-    text === persona ||
-    window.confirm('这些改动还没保存，丢掉吗？')
+    !editing || text === persona || window.confirm('这些改动还没保存，丢掉吗？')
 
   const requestClose = () => {
     if (confirmDiscard()) onClose()

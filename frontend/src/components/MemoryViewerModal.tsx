@@ -187,11 +187,16 @@ export default function MemoryViewerModal({ onClose }: Props) {
 
   return (
     <div className="mem-viewer-overlay" onClick={onClose}>
-      <div className="mem-viewer-content" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="mem-viewer-content"
+        role="dialog"
+        aria-label="moz 记得什么"
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Header */}
         <div className="mem-viewer-header">
           <span className="mem-viewer-title">moz 记得什么</span>
-          <button className="mem-viewer-close" onClick={onClose}>
+          <button className="mem-viewer-close" onClick={onClose} title="关闭">
             &times;
           </button>
         </div>
@@ -509,7 +514,9 @@ function MemoryList({
   if (memories.length === 0) {
     return (
       <div className="mem-empty">
-        {querying ? '没搜到。换个词试试，或者点上面的"全部"。' : '这一层还没有东西，点上面的"全部"看别的。'}
+        {querying
+          ? '没搜到。换个词试试，或者点上面的"全部"。'
+          : '这一层还没有东西，点上面的"全部"看别的。'}
       </div>
     )
   }
@@ -531,7 +538,11 @@ function MemoryList({
                 <button className="mem-act" onClick={() => onWrong(m)} title="这条不对，以后少提">
                   不对
                 </button>
-                <button className="mem-act mem-act--danger" onClick={() => onForget(m)} title="彻底忘掉这条">
+                <button
+                  className="mem-act mem-act--danger"
+                  onClick={() => onForget(m)}
+                  title="彻底忘掉这条"
+                >
                   忘掉
                 </button>
               </span>

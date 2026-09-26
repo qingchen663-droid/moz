@@ -45,6 +45,14 @@ export default function ModelDialog({ onClose }: Props) {
       })
   }, [])
 
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', handleEsc)
+    return () => window.removeEventListener('keydown', handleEsc)
+  }, [onClose])
+
   // 当选择预设或自定义时，初始化表单值
   const handleSelectPreset = (name: string) => {
     setSelectedPreset(name)
@@ -87,7 +95,7 @@ export default function ModelDialog({ onClose }: Props) {
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!formModel.trim() || !formBaseUrl.trim()) {
-      setSaveMessage({ type: 'error', text: '模型名称与 Base URL 不能为空' })
+      setSaveMessage({ type: 'error', text: '模型名字和接口地址都得填，少了哪一样 moz 都不知道发到哪。' })
       return
     }
 
@@ -102,9 +110,15 @@ export default function ModelDialog({ onClose }: Props) {
         multimodal: formMultimodal,
       })
       await loadModelConfig()
-      setSaveMessage({ type: 'success', text: '配置保存成功，已即时生效！无需重启服务。' })
+      setSaveMessage({
+        type: 'success',
+        text: '已保存，下一条消息就用它。这个中转回一句通常要 20~35 秒，别以为卡住了。',
+      })
     } catch (err: any) {
-      setSaveMessage({ type: 'error', text: err?.message || '保存失败，请检查网络或后端' })
+      setSaveMessage({
+        type: 'error',
+        text: `保存没成功：${err?.message || '后端没应答'}。可以先点「查地址和密钥通不通」验证，再保存。`,
+      })
     } finally {
       setSaving(false)
     }
@@ -113,10 +127,15 @@ export default function ModelDialog({ onClose }: Props) {
   if (loading) {
     return (
       <div className="dialog-overlay" onClick={onClose}>
-        <div className="dialog-content model-dialog" onClick={(e) => e.stopPropagation()}>
+        <div
+          className="dialog-content model-dialog"
+          role="dialog"
+          aria-label="模型配置"
+          onClick={(e) => e.stopPropagation()}
+        >
           <div className="dialog-header">
             <h2>模型配置</h2>
-            <button className="close-btn" onClick={onClose}>
+            <button className="close-btn" onClick={onClose} title="关闭">
               ×
             </button>
           </div>
@@ -128,10 +147,15 @@ export default function ModelDialog({ onClose }: Props) {
 
   return (
     <div className="dialog-overlay" onClick={onClose}>
-      <div className="dialog-content model-dialog" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="dialog-content model-dialog"
+        role="dialog"
+        aria-label="模型配置"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="dialog-header">
           <h2>模型配置</h2>
-          <button className="close-btn" onClick={onClose}>
+          <button className="close-btn" onClick={onClose} title="关闭">
             ×
           </button>
         </div>
@@ -267,11 +291,16 @@ export default function ModelDialog({ onClose }: Props) {
                         formBaseUrl.trim() ? '用上面的地址和密钥查询可用模型' : '请先填写接口地址'
                       }
                     >
-                      {modelsLoading ? '查询中...' : '获取模型列表'}
+                      {modelsLoading ? '查询中...' : '查地址和密钥通不通'}
                     </button>
                     {models && (
                       <span className="model-fetch-hint">
-                        {models.length} 个可用，点一下填进上面
+                        能连上，{models.length} 个模型可用；点一下填进上面
+                      </span>
+                    )}
+                    {!modelsLoading && !models && !modelsError && (
+                      <span className="model-fetch-hint">
+                        这一步只验证地址和密钥，不代表一定能出字
                       </span>
                     )}
                   </div>

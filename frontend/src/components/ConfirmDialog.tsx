@@ -30,7 +30,12 @@ export default function ConfirmDialog({
 
   return (
     <div className="dialog-overlay" onClick={onCancel}>
-      <div className="dialog-content confirm-dialog" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="dialog-content confirm-dialog"
+        role="alertdialog"
+        aria-label={title}
+        onClick={(e) => e.stopPropagation()}
+      >
         <h3 className="dialog-title">{title}</h3>
         <p className="dialog-message">{message}</p>
         <div className="dialog-actions">

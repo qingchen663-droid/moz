@@ -39,6 +39,14 @@ export default function LogViewerModal({ onClose }: Props) {
     }
   }, [logs])
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
   const handleScroll = () => {
     if (!bodyRef.current) return
     const { scrollTop, scrollHeight, clientHeight } = bodyRef.current
@@ -47,7 +55,12 @@ export default function LogViewerModal({ onClose }: Props) {
 
   return (
     <div className="log-viewer-overlay" onClick={onClose}>
-      <div className="log-viewer-content" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="log-viewer-content"
+        role="dialog"
+        aria-label="系统日志"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="log-viewer-header">
           <span className="log-viewer-title">系统日志</span>
           <div className="log-viewer-actions">
@@ -61,7 +74,7 @@ export default function LogViewerModal({ onClose }: Props) {
             >
               {paused ? '▶ 恢复' : '⏸ 暂停'}
             </button>
-            <button className="log-viewer-btn log-viewer-btn--close" onClick={onClose}>
+            <button className="log-viewer-btn log-viewer-btn--close" onClick={onClose} title="关闭">
               ✕
             </button>
           </div>
@@ -70,7 +83,8 @@ export default function LogViewerModal({ onClose }: Props) {
         <div className="log-viewer-body" ref={bodyRef} onScroll={handleScroll}>
           {logs.length === 0 ? (
             <div className="log-viewer-empty">
-              这里还是空的：后端一有动静就会写进来。发一句话还没出现，多半是后端（8000 端口）没在跑。
+              这里还是空的：后端一有动静就会写进来。发一句话还没出现，多半是后端（8000
+              端口）没在跑。
             </div>
           ) : (
             logs.map((log, i) => (
