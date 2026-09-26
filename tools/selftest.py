@@ -334,6 +334,73 @@ def care_switch_logic():
         s._conn().commit()
 
 
+def probe_cleaner_works():
+    """清理器本身必须被测：错杀真实数据比留下残渣严重得多。
+
+    在 moz.db 的临时副本上造"一条真实记忆 + 一条探针记忆 + 两对对话"，
+    要求只吃掉探针那部分，且删完的测试句不能再被全文检索搜到。
+    """
+    import shutil
+    import tempfile
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    import clean_probe_data as CP
+
+    tmp = Path(tempfile.mkdtemp()) / "moz_copy.db"
+    shutil.copy2(DB, tmp)
+    conn = sqlite3.connect(tmp)
+    now = time.time()
+    try:
+        conn.execute("DELETE FROM memories WHERE user_id = ?", (USER,))
+        conn.executemany(
+            "INSERT INTO memories VALUES (?,?,?)",
+            [
+                (USER, "real01", json.dumps({"content": "妈妈生日是 10 月 5 日", "created_at": now}, ensure_ascii=False)),
+                (USER, "junk01", json.dumps({"content": "[对话摘要] 用户说：只说颜色名，这张图是什么颜色？",
+                                             "created_at": now}, ensure_ascii=False)),
+            ],
+        )
+        blob = {"current_id": "c1", "conversations": {"c1": {"title": "你是谁", "created": "09/25 09:29", "messages": [
+            {"role": "user", "content": "你是谁"},
+            {"role": "assistant", "content": "我是 moz 啊"},
+            {"role": "user", "content": "这张图是什么颜色？只回颜色名", "image": "data:image/png;base64,xxx"},
+            {"role": "assistant", "content": "我这边看到的是一片纯白，没图案"},
+        ]}}}
+        conn.execute("INSERT OR REPLACE INTO conversations VALUES (?,?)",
+                     (USER, json.dumps(blob, ensure_ascii=False)))
+        conn.execute("DELETE FROM working_memory WHERE user_id = ?", (USER,))
+        conn.execute("INSERT INTO working_memory (user_id,summary,open_topics,current_emotion,updated_at) "
+                     "VALUES (?,?,?,?,?)", (USER, "用户反复追问这张图的颜色", "[]", "neutral", now))
+        conn.commit()
+
+        CP.apply_(CP.scan(conn, now - 60), conn, db_path=tmp, api=None)
+
+        left = [json.loads(r[0])["content"] for r in
+                conn.execute("SELECT data FROM memories WHERE user_id = ?", (USER,)).fetchall()]
+        msgs = json.loads(conn.execute("SELECT data FROM conversations WHERE user_id = ?", (USER,))
+                          .fetchone()[0])["conversations"]["c1"]["messages"]
+        wm = conn.execute("SELECT summary FROM working_memory WHERE user_id = ?", (USER,)).fetchone()[0]
+        fts = conn.execute("SELECT COUNT(*) FROM conversation_fts WHERE user_id = ? AND content LIKE '%颜色%'",
+                           (USER,)).fetchone()[0]
+        bad = []
+        if "妈妈生日是 10 月 5 日" not in left:
+            bad.append(f"真实记忆被错删：{left}")
+        if any("颜色" in c for c in left):
+            bad.append("探针记忆没删掉")
+        if [m["content"] for m in msgs] != ["你是谁", "我是 moz 啊"]:
+            bad.append(f"对话清理结果不对：{msgs}")
+        if any("image" in m for m in msgs):
+            bad.append("测试图片还留在会话里")
+        if (wm or "").strip():
+            bad.append("工作记忆没清空")
+        if fts:
+            bad.append("全文检索还能搜到删掉的测试句")
+        return "; ".join(bad) or True
+    finally:
+        conn.close()
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
 def css_uses_dvh():
     """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。"""
     bad = []
@@ -370,6 +437,15 @@ def db_invariants():
         probe = conn.execute("SELECT COUNT(*) FROM care_items WHERE title LIKE '%__selftest%'").fetchone()[0]
         probe += conn.execute("SELECT COUNT(*) FROM care_log WHERE text LIKE '%__selftest%'").fetchone()[0]
         probe += conn.execute("SELECT COUNT(*) FROM care_settings WHERE user_id LIKE '__selftest%'").fetchone()[0]
+        # --full 探针会走真实 /api/chat，测试内容会变成"用户说过的话"落进长期记忆。
+        # 探针跑完自己负责擦干净（probe_cleanup），这条就是防止它没擦干净。
+        # 只认探针原话这种"用户不会照着念"的字样，别拿"图/颜色"这种常用词误伤真实数据。
+        TEST_SAYS = ("自测探针", "只回颜色名", "只说颜色名")
+        for table, col in (("memories", "data"), ("conversations", "data"), ("working_memory", "summary")):
+            for phrase in TEST_SAYS:
+                probe += conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {col} LIKE ?", (f"%{phrase}%",)
+                ).fetchone()[0]
         if probe:
             return f"测试数据残留 {probe} 条"
         return True
@@ -397,6 +473,29 @@ def avatar_probe():
 
 
 # ── 6. 慢检：真实对话往返 ────────────────────────────────
+PROBE_START = time.time()  # 本次跑之前库里不该有属于"这段时间"的测试内容
+
+
+def probe_cleanup():
+    """--full 探针走的是真实 /api/chat，测试内容会变成"用户说过的话"落进长期记忆。
+
+    跑完自己擦干净：只删探针时间窗之后、且命中探针特征的东西，宁可漏擦不可错删。
+    复用 tools/clean_probe_data.py，避免两套判定漂移。
+    """
+    sys.path.insert(0, str(ROOT / "tools"))
+    import clean_probe_data as CP
+
+    conn = sqlite3.connect(DB)
+    try:
+        res = CP.scan(conn, PROBE_START - 5)
+        moved = len(res["mem_drop"]) + sum(res["conv_drop"].values()) + len(res["working"])
+        if moved:
+            CP.apply_(res, conn)
+        return moved
+    finally:
+        conn.close()
+
+
 def full_chat_roundtrip():
     _, before = http(f"/conversations/{USER}")
     cid = before.get("current_id")
@@ -563,6 +662,7 @@ def main():
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)
     check("数据库不变量", db_invariants)
+    check("探针清理器不错杀", probe_cleaner_works)
     check("天气源可用", weather_probe)
     check("头像字节流", avatar_probe)
     check("前端高度用dvh", css_uses_dvh)
@@ -570,6 +670,12 @@ def main():
     if a.full:
         check("真实对话往返", full_chat_roundtrip, tier="full")
         check("中转看图能力", vision_probe, tier="full")
+        # 探针跑完必须自己擦干净，否则用户第二天看到的是"自己没说过的话"
+        try:
+            print(f"[cleanup] 探针擦掉测试痕迹 {probe_cleanup()} 处")
+        except Exception as e:
+            print(f"[cleanup] 探针清理失败，请跑 tools/clean_probe_data.py：{type(e).__name__}: {e}")
+        check("探针没留残渣", db_invariants, tier="full")
 
     fails = [r for r in results if r["status"] == "fail"]
     warns = [r for r in results if r["status"] == "warn"]
