@@ -363,6 +363,9 @@ def probe_cleaner_works():
         blob = {"current_id": "c1", "conversations": {"c1": {"title": "你是谁", "created": "09/25 09:29", "messages": [
             {"role": "user", "content": "你是谁"},
             {"role": "assistant", "content": "我是 moz 啊"},
+            # 探针问句 + 一句"看着人畜无害"的回复：只能靠配对关系识别，不能靠字样
+            {"role": "user", "content": "自测探针：请用一句话回答你好"},
+            {"role": "assistant", "content": "你好，我在呢。"},
             {"role": "user", "content": "这张图是什么颜色？只回颜色名", "image": "data:image/png;base64,xxx"},
             {"role": "assistant", "content": "我这边看到的是一片纯白，没图案"},
         ]}}}
@@ -476,24 +479,52 @@ def avatar_probe():
 PROBE_START = time.time()  # 本次跑之前库里不该有属于"这段时间"的测试内容
 
 
-def probe_cleanup():
-    """--full 探针走的是真实 /api/chat，测试内容会变成"用户说过的话"落进长期记忆。
+def read_care_settings(user_id):
+    conn = sqlite3.connect(DB)
+    try:
+        row = conn.execute("SELECT data FROM care_settings WHERE user_id = ?", (user_id,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
-    跑完自己擦干净：只删探针时间窗之后、且命中探针特征的东西，宁可漏擦不可错删。
-    复用 tools/clean_probe_data.py，避免两套判定漂移。
+
+def write_care_settings(user_id, data):
+    if data is None:
+        return
+    conn = sqlite3.connect(DB)
+    try:
+        conn.execute("UPDATE care_settings SET data = ? WHERE user_id = ?", (data, user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def probe_cleanup(rounds=6, gap=8):
+    """把 --full 探针在真实用户库里留下的痕迹擦干净。
+
+    记忆抽取是后端异步任务，比对话晚到十几秒，所以一遍扫不干净：
+    每轮先等一下再扫，扫到没东西为止。只删命中探针特征、且在本次探针窗口内的，
+    宁可漏擦不可错删（判定复用 tools/clean_probe_data.py，别写两套）。
     """
     sys.path.insert(0, str(ROOT / "tools"))
     import clean_probe_data as CP
 
-    conn = sqlite3.connect(DB)
-    try:
-        res = CP.scan(conn, PROBE_START - 5)
-        moved = len(res["mem_drop"]) + sum(res["conv_drop"].values()) + len(res["working"])
-        if moved:
-            CP.apply_(res, conn)
-        return moved
-    finally:
-        conn.close()
+    total = 0
+    for _ in range(rounds):
+        time.sleep(gap)
+        moved = 0
+        conn = sqlite3.connect(DB)
+        try:
+            res = CP.scan(conn, PROBE_START - 5, include_summaries=True)
+            moved = len(res["mem_drop"]) + sum(res["conv_drop"].values()) + len(res["working"])
+            if moved:
+                CP.apply_(res, conn, reset_talk_score=False)
+        finally:
+            conn.close()
+        total += moved
+        if not moved:
+            break
+    return total
 
 
 def full_chat_roundtrip():
@@ -668,13 +699,17 @@ def main():
     check("前端高度用dvh", css_uses_dvh)
     check("前端无孤儿杂物", frontend_no_junk)
     if a.full:
-        check("真实对话往返", full_chat_roundtrip, tier="full")
-        check("中转看图能力", vision_probe, tier="full")
-        # 探针跑完必须自己擦干净，否则用户第二天看到的是"自己没说过的话"
+        # 探针会污染"话多话少"的学习值（探针全是一句话回答），跑完原样还回去
+        care_before = read_care_settings(USER)
         try:
-            print(f"[cleanup] 探针擦掉测试痕迹 {probe_cleanup()} 处")
-        except Exception as e:
-            print(f"[cleanup] 探针清理失败，请跑 tools/clean_probe_data.py：{type(e).__name__}: {e}")
+            check("真实对话往返", full_chat_roundtrip, tier="full")
+            check("中转看图能力", vision_probe, tier="full")
+        finally:
+            try:
+                print(f"[cleanup] 探针擦掉测试痕迹 {probe_cleanup()} 处")
+            except Exception as e:
+                print(f"[cleanup] 探针清理失败，请跑 tools/clean_probe_data.py：{type(e).__name__}: {e}")
+            write_care_settings(USER, care_before)
         check("探针没留残渣", db_invariants, tier="full")
 
     fails = [r for r in results if r["status"] == "fail"]

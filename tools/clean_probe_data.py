@@ -29,9 +29,7 @@ API = os.environ.get("MOZ_SELFTEST_API", "http://127.0.0.1:8000/api")
 
 # 探针原话：正常用户不会照着念这几句
 PROBE_USER = re.compile(r"这张图是什么颜色|只回颜色名|只说颜色名|自测探针")
-# 探针那一轮的回复：只用于"紧跟在探针提问后面"的第二道确认（模型常只回一个颜色词）
 COLOR = r"(?:红|绿|蓝|黄|紫|橙|灰|黑|白|纯白|浅灰)色?"
-PROBE_REPLY = re.compile(rf"图|颜色|色块|白底|无法回复|{COLOR}")
 # 记忆里的测试痕迹一律是自动兜底的对话摘要
 PROBE_MEMORY = re.compile(rf"^\[对话摘要\].*(图|颜色|色块|白底|自测探针|无法回复|{COLOR})")
 TEST_USER = re.compile(r"^(care_engine|care_smoketest|__selftest|selftest|probe_)")
@@ -41,21 +39,31 @@ def _f(text):
     return dt.datetime.strptime(text, "%Y-%m-%d %H:%M").timestamp()
 
 
-def scan(conn, since_ts):
-    rows = conn.execute("SELECT user_id, memory_id, data FROM memories").fetchall()
-    mem_drop, mem_keep = [], []
-    for user_id, mid, data in rows:
+def plan_memories(conn, since_ts, include_summaries=False):
+    """命中探针特征的记忆。
+
+    include_summaries=True 只给 --full 跑完后的自动清理用：那两分钟里没人聊天，
+    探针窗口内新出现的自动摘要一律算测试内容（模型回什么我们控制不了，
+    光靠"图/颜色"这类字样会漏）。手工跑的工具不开这个口子。
+    """
+    drop, keep = [], []
+    for user_id, mid, data in conn.execute("SELECT user_id, memory_id, data FROM memories").fetchall():
         try:
             d = json.loads(data)
         except json.JSONDecodeError:
             d = {}
         content = str(d.get("content", ""))
         created = float(d.get("created_at", 0) or 0)
-        hit = created >= since_ts and PROBE_MEMORY.search(content)
-        (mem_drop if hit else mem_keep).append((user_id, mid, content, created))
+        probe_like = bool(PROBE_MEMORY.search(content))
+        late_summary = include_summaries and content.startswith("[对话摘要]")
+        hit = created >= since_ts and (probe_like or late_summary)
+        (drop if hit else keep).append((user_id, mid, content, created))
+    return drop, keep
 
-    conv_drop, conv_new = {}, {}
-    suspicious = []
+
+def plan_conversation(conn):
+    """按"探针问句 + 它后面那句回复"配对删对话；其余一律保留。"""
+    conv_new, conv_drop, suspicious = {}, {}, []
     for user_id, data in conn.execute("SELECT user_id, data FROM conversations").fetchall():
         try:
             blob = json.loads(data)
@@ -63,19 +71,19 @@ def scan(conn, since_ts):
             continue
         cleaned, removed = {}, 0
         for cid, conv in (blob.get("conversations") or {}).items():
-            keep, probing = [], False
+            keep, was_probe = [], False
             for m in conv.get("messages", []):
                 text = str(m.get("content", ""))
                 if m.get("role") == "user" and PROBE_USER.search(text):
-                    probing = True
+                    was_probe = True  # 这句是探针发的，它后面那句回复也一定是探针产物
                     removed += 1
                     continue
-                if probing and m.get("role") == "assistant" and PROBE_REPLY.search(text):
-                    probing = False
+                if was_probe and m.get("role") == "assistant":
+                    was_probe = False
                     removed += 1
                     continue
-                probing = False
-                if m.get("image") or PROBE_USER.search(text):
+                was_probe = False
+                if m.get("image"):
                     suspicious.append(f"{user_id}: {text[:50]}")
                 keep.append(m)
             if keep or not conv.get("messages"):
@@ -84,13 +92,19 @@ def scan(conn, since_ts):
                 cleaned[cid] = c
         conv_new[user_id] = cleaned
         conv_drop[user_id] = removed
+    return conv_new, conv_drop, suspicious
+
+
+def scan(conn, since_ts, include_summaries=False):
+    mem_drop, mem_keep = plan_memories(conn, since_ts, include_summaries)
+    conv_new, conv_drop, suspicious = plan_conversation(conn)
 
     working = []
     for user_id, summary, updated in conn.execute(
         "SELECT user_id, summary, updated_at FROM working_memory"
     ).fetchall():
         # 工作记忆的摘要是模型写的，不带固定前缀：只认"这段时间 + 整段都在讲那张图"
-        if float(updated or 0) >= since_ts and re.search(r"这张图|图片|颜色|色块", summary or ""):
+        if float(updated or 0) >= since_ts and re.search(r"这张图|图片|颜色|色块|自测探针", summary or ""):
             working.append((user_id, summary))
 
     test_rows = []
@@ -165,7 +179,7 @@ def delete_memories(entries, conn, api=API):
     return len(left)
 
 
-def apply_(res, conn, db_path=DB, api=API):
+def apply_(res, conn, db_path=DB, api=API, reset_talk_score=True):
     # 不显式开事务：python 的 sqlite3 自己会隐式 BEGIN，再写 BEGIN 会直接报错
     for u, cleaned in res["conv_new"].items():
         if res["conv_drop"][u]:
@@ -178,17 +192,19 @@ def apply_(res, conn, db_path=DB, api=API):
         conn.execute("UPDATE working_memory SET summary='', open_topics='[]', updated_at=0 WHERE user_id=?", (u,))
     for table, u, _n in res["test_rows"]:
         conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (u,))
-    # 话多话少是被测试对话喂出来的（探针全是一句话回答），一律回落到中性
-    for u, data in conn.execute("SELECT user_id, data FROM care_settings").fetchall():
-        try:
-            d = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        if d.get("talk_score") not in (None, 0.5):
-            d["talk_score"] = 0.5
-            conn.execute("UPDATE care_settings SET data=? WHERE user_id=?",
-                         (json.dumps(d, ensure_ascii=False), u))
-            print(f"talk_score 回落到 0.5：{u}")
+    # 话多话少是被测试对话喂出来的（探针全是一句话回答），一律回落到中性。
+    # 自动清理（selftest --full）不该动这个值，它会自己把探针前的值写回去。
+    if reset_talk_score:
+        for u, data in conn.execute("SELECT user_id, data FROM care_settings").fetchall():
+            try:
+                d = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if d.get("talk_score") not in (None, 0.5):
+                d["talk_score"] = 0.5
+                conn.execute("UPDATE care_settings SET data=? WHERE user_id=?",
+                             (json.dumps(d, ensure_ascii=False), u))
+                print(f"talk_score 回落到 0.5：{u}")
     conn.commit()
     rebuild_conversation_index([u for u, n in res["conv_drop"].items() if n], db_path)
 
