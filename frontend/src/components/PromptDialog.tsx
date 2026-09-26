@@ -110,11 +110,11 @@ export default function PromptDialog({ onClose }: Props) {
             <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
             <circle cx="12" cy="7" r="4" />
           </svg>
-          自定义人设
+          人设
         </h3>
 
         <p className="prompt-dialog-desc">
-          自定义你的 AI 情感伴侣的性格、说话风格和身份设定。修改后立即生效，无需重启服务。
+          moz 是什么性格、怎么说话、跟你是什么关系，都写在这儿。改完立即生效，不用重启。
         </p>
 
         <div className="prompt-avatar">
@@ -203,22 +203,22 @@ export default function PromptDialog({ onClose }: Props) {
           </div>
         ) : (
           <div className="prompt-dialog-editor">
-            <div className="prompt-dialog-editor-label">编辑人设提示词</div>
+            <div className="prompt-dialog-editor-label">编辑人设</div>
             <textarea
               className="prompt-dialog-textarea"
               value={text}
               onChange={(e) => setText(e.target.value)}
-              placeholder="描述你想要的 AI 伴侣的性格、身份、说话风格..."
+              placeholder="想要 moz 怎样：它的名字和性格、说话语气、什么事它不该主动提..."
               rows={12}
               autoFocus
             />
             <div className="prompt-dialog-char-count">{text.length} / 5000</div>
             <div className="prompt-dialog-editor-tips">
-              <p>💡 提示：好的提示词应该包含：</p>
+              <p>💡 写具体比写抽象好用，比如：</p>
               <ul>
-                <li>身份设定（名字、性格、关系）</li>
-                <li>说话风格（语气、用词习惯）</li>
-                <li>行为规则（如何回应用户）</li>
+                <li>它是谁（名字、性格、跟你的关系）</li>
+                <li>怎么说话（语气、长短、用不用表情）</li>
+                <li>遇到什么该怎么反应（你难过时、你敷衍时）</li>
               </ul>
             </div>
             <div className="prompt-dialog-actions">

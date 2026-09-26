@@ -69,7 +69,7 @@ const railLabels = () =>
 describe('产品形态回归：单条长期陪伴流', () => {
   it('侧栏只有四个入口，且没有会话/用户管理', async () => {
     render(<App />)
-    await waitFor(() => expect(railLabels()).toEqual(['人设', '认知', '设置', '模型']))
+    await waitFor(() => expect(railLabels()).toEqual(['人设', '记忆', '设置', '模型']))
     expect(document.body.textContent).not.toContain('开启新对话')
     expect(document.body.textContent).not.toContain('添加用户')
     expect(document.body.textContent).not.toContain('当前用户')
@@ -124,6 +124,26 @@ describe('产品形态回归：单条长期陪伴流', () => {
     // talk_score 百分比这种内部数字不该出现在界面上，用户看得懂的是"一天最多几条"
     expect(text).not.toMatch(/自动判断值|%.*慢慢调/)
     expect(text).toMatch(/一天最多 2 条/)
+  })
+})
+
+describe('一个东西只许有一个名字', () => {
+  it('侧栏和弹窗不再出现"认知""人设提示词""AI 情感伴侣"', async () => {
+    render(<App />)
+    await waitFor(() => expect(railLabels()).toEqual(['人设', '记忆', '设置', '模型']))
+    expect(document.body.textContent).not.toContain('认知')
+
+    fireEvent.click(screen.getByText('人设'))
+    await waitFor(() => expect(document.querySelector('.prompt-dialog')).toBeTruthy())
+    const view = document.querySelector('.prompt-dialog')!.textContent!
+    expect(view).not.toMatch(/情感伴侣|提示词/)
+    expect(view).toContain('人设')
+
+    fireEvent.click(screen.getByText('自定义人设'))
+    await waitFor(() => expect(document.querySelector('.prompt-dialog-editor')).toBeTruthy())
+    const editor = document.querySelector('.prompt-dialog-editor')!.textContent!
+    expect(editor).toContain('编辑人设')
+    expect(editor).not.toMatch(/提示词|AI 伴侣/)
   })
 })
 
@@ -291,7 +311,7 @@ describe('危险操作先问再做', () => {
 })
 
 describe('后端结构变化不能弄崩应用', () => {
-  it('工作话题是结构化对象时，认知界面照样打得开', async () => {
+  it('工作话题是结构化对象时，记忆界面照样打得开', async () => {
     const { default: MemoryViewerModal } = await import('../components/MemoryViewerModal')
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       const url = typeof input === 'string' ? input : String(input)

@@ -23,7 +23,7 @@ export default function Sidebar() {
       <button
         className="rail-item"
         onClick={() => setShowPrompt(true)}
-        title={promptConfig?.is_custom ? '自定义人设 · 已自定义' : '自定义人设 · 默认人设'}
+        title={promptConfig?.is_custom ? '人设 · 已自定义' : '人设 · 默认'}
       >
         <span className="rail-icon">
           {avatar ? (
@@ -50,7 +50,7 @@ export default function Sidebar() {
       <button
         className="rail-item"
         onClick={() => setShowMemory(true)}
-        title="记忆与认知 · 档案卡、分层记忆、工作记忆"
+        title="moz 记得什么 · 档案卡、记忆、还没聊完的话题"
       >
         <span className="rail-icon">
           <svg
@@ -69,7 +69,7 @@ export default function Sidebar() {
           </svg>
           {total > 0 && <span className="rail-badge">{total > 99 ? '99+' : total}</span>}
         </span>
-        <span className="rail-label">认知</span>
+        <span className="rail-label">记忆</span>
       </button>
 
       <div className="rail-spacer" />
