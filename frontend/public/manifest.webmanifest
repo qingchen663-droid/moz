@@ -1,0 +1,38 @@
+{
+  "id": "http://127.0.0.1:3000/",
+  "name": "moz - AI 情感陪伴",
+  "short_name": "moz",
+  "description": "带长期记忆的本地 AI 情感陪伴",
+  "start_url": "http://127.0.0.1:3000/",
+  "scope": "http://127.0.0.1:3000/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#F9F6F2",
+  "theme_color": "#D4785C",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -1,0 +1,638 @@
+/* ModelDialog.css - 精美治愈风模型配置与编辑表单 */
+
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(45, 36, 32, 0.45);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: dialogFadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes dialogFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.model-dialog {
+  background: #FFFFFF;
+  border-radius: 20px;
+  width: 90%;
+  max-width: 560px;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 40px rgba(45, 36, 32, 0.16), 0 0 0 1px rgba(212, 120, 92, 0.08);
+  animation: dialogSlideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  overflow: hidden;
+}
+
+@keyframes dialogSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* 弹窗头部 */
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 24px;
+  border-bottom: 1px solid #F0E8DE;
+  background: #FCFAF8;
+}
+
+.dialog-header h2 {
+  font-size: 18px;
+  font-weight: 700;
+  color: #2D2420;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.close-btn {
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  color: #8C7E74;
+  cursor: pointer;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+}
+
+.close-btn:hover {
+  background: #F0E6DC;
+  color: #2D2420;
+  transform: rotate(90deg);
+}
+
+/* 弹窗主体 */
+.dialog-body {
+  padding: 20px 24px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.dialog-body::-webkit-scrollbar {
+  width: 6px;
+}
+.dialog-body::-webkit-scrollbar-thumb {
+  background: #E2D7CC;
+  border-radius: 3px;
+}
+.dialog-body::-webkit-scrollbar-thumb:hover {
+  background: #D0C2B4;
+}
+
+/* 当前模型卡片 */
+.current-model-section {
+  background: linear-gradient(135deg, #FFF9F5 0%, #FFF3EC 100%);
+  border: 1px solid #F5DDD2;
+  border-radius: 14px;
+  padding: 14px 16px;
+  position: relative;
+  box-shadow: 0 2px 8px rgba(212, 120, 92, 0.06);
+}
+
+.current-model-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #D4785C;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+.current-model-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.current-model-info .model-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: #2D2420;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+.current-model-info .model-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: #FFFFFF;
+  background: #D4785C;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.current-model-url {
+  font-size: 12px;
+  color: #7A6E64;
+  margin-top: 4px;
+  word-break: break-all;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+/* 预设模型区域 */
+.presets-section h3,
+.help-section h3 {
+  font-size: 14px;
+  font-weight: 700;
+  color: #2D2420;
+  margin-bottom: 10px;
+}
+
+.presets-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.preset-card {
+  background: #FAFAF8;
+  border: 1.5px solid #EBE4DC;
+  border-radius: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.preset-card:hover {
+  background: #FFFFFF;
+  border-color: #D4785C;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(212, 120, 92, 0.12);
+}
+
+.preset-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: #2D2420;
+  margin-bottom: 3px;
+}
+
+.preset-model {
+  font-size: 12px;
+  color: #7A6E64;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+.preset-badge {
+  align-self: flex-start;
+  margin-top: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #D4785C;
+  background: rgba(212, 120, 92, 0.12);
+  border: 1px solid rgba(212, 120, 92, 0.25);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.preset-card.preset-custom {
+  background: #F8F5F0;
+  border-style: dashed;
+  grid-column: span 2;
+}
+.preset-card.preset-custom:hover {
+  background: #FFFDFC;
+  border-style: solid;
+}
+
+/* 帮助说明 */
+.help-section {
+  background: #FDFBF8;
+  border: 1px solid #EFEAE3;
+  border-radius: 12px;
+  padding: 12px 16px;
+}
+
+.help-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.help-list li {
+  font-size: 12px;
+  color: #63574E;
+  position: relative;
+  padding-left: 14px;
+  line-height: 1.5;
+}
+
+.help-list li::before {
+  content: '•';
+  color: #D4785C;
+  font-weight: bold;
+  position: absolute;
+  left: 3px;
+}
+
+/* 动态编辑表单 */
+.model-edit-container {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.config-guide-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #F0E8DE;
+}
+
+.config-guide-header h3 {
+  font-size: 15px;
+  font-weight: 700;
+  color: #2D2420;
+  margin: 0;
+}
+
+.close-guide-btn {
+  background: #F2ECE5;
+  border: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: #63574E;
+  cursor: pointer;
+  padding: 5px 12px;
+  border-radius: 6px;
+  transition: all 0.15s;
+}
+
+.close-guide-btn:hover {
+  background: #E5DCD2;
+  color: #2D2420;
+}
+
+.preset-quick-link {
+  font-size: 12px;
+  color: #7A6E64;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #FAF7F2;
+  padding: 8px 12px;
+  border-radius: 8px;
+}
+
+.support-link {
+  color: #D4785C;
+  font-weight: 600;
+  text-decoration: none;
+  transition: all 0.15s;
+}
+.support-link:hover {
+  text-decoration: underline;
+}
+
+.model-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: #FCFAF8;
+  border: 1px solid #EFEAE3;
+  padding: 16px;
+  border-radius: 12px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-group label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #4A3E36;
+}
+
+.label-tip {
+  font-size: 11px;
+  font-weight: normal;
+  color: #9A8D83;
+  margin-left: 6px;
+}
+
+.form-input {
+  height: 38px;
+  border: 1.5px solid #E0D6CB;
+  border-radius: 8px;
+  padding: 0 12px;
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  color: #2D2420;
+  background: #FFFFFF;
+  outline: none;
+  transition: all 0.2s;
+}
+
+.form-input:focus {
+  border-color: #D4785C;
+  box-shadow: 0 0 0 3px rgba(212, 120, 92, 0.12);
+}
+
+.form-checkbox-group {
+  padding: 4px 0;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #2D2420;
+  cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #D4785C;
+  cursor: pointer;
+}
+
+.form-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.save-btn {
+  flex: 1;
+  height: 38px;
+  background: #D4785C;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 2px 6px rgba(212, 120, 92, 0.25);
+}
+
+.save-btn:hover {
+  background: #C0684C;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px rgba(212, 120, 92, 0.35);
+}
+
+.save-btn:disabled {
+  background: #CDBEB5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.cancel-btn {
+  padding: 0 16px;
+  height: 38px;
+  background: transparent;
+  color: #7A6E64;
+  border: 1px solid #DCD2C7;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.cancel-btn:hover {
+  background: #F0E8DF;
+  color: #2D2420;
+}
+
+.model-dialog-message {
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.model-dialog-message--success {
+  background: #EDF7EE;
+  color: #2D6A3E;
+  border: 1px solid #CDE7D0;
+}
+
+.model-dialog-message--error {
+  background: #FDEAEA;
+  color: #B83838;
+  border: 1px solid #F7C6C6;
+}
+
+.loading-state {
+  padding: 40px;
+  text-align: center;
+  color: #7A6E64;
+  font-size: 14px;
+}
+
+/* 获取模型列表 */
+.model-fetch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.model-fetch-btn {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid #DCD2C7;
+  background: #FFF9F5;
+  color: #D4785C;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.model-fetch-btn:hover:not(:disabled) {
+  background: #FDF0E8;
+  border-color: #D4785C;
+}
+
+.model-fetch-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.model-fetch-hint {
+  font-size: 12px;
+  color: #7A6E64;
+}
+
+.model-fetch-error {
+  margin-top: 8px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: #FDEAEA;
+  border: 1px solid #F7C6C6;
+  color: #B83838;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.model-pick-list {
+  margin-top: 8px;
+  padding: 8px;
+  max-height: 180px;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  background: #FAF7F2;
+  border: 1px solid #ECE3D8;
+  border-radius: 10px;
+}
+
+.model-pick-item {
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: #FFFFFF;
+  color: #2D2420;
+  font-size: 12px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.model-pick-item:hover {
+  border-color: #D4785C;
+  color: #D4785C;
+}
+
+.model-pick-item.active {
+  background: rgba(212, 120, 92, 0.12);
+  border-color: #D4785C;
+  color: #C0684C;
+  font-weight: 700;
+}
+
+@media (max-width: 640px) {
+  .model-pick-list {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── 通用对话框基础件 ─────────────────────────────
+   ConfirmDialog / PromptDialog 依赖这些类，此前只存在于
+   未被 import 的 ModelDialog.new.css 里，导致弹窗裸奔。
+   PromptDialog.css 用的是更高优先级的作用域选择器，不受影响。 */
+.dialog-title {
+  font-size: 19px;
+  font-weight: 700;
+  color: #2D2420;
+  letter-spacing: -0.01em;
+  margin-bottom: 10px;
+}
+
+.dialog-message {
+  font-size: 13.5px;
+  color: #7A6E64;
+  line-height: 1.7;
+  margin: 0 0 24px 0;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.dialog-btn {
+  height: 38px;
+  padding: 0 18px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.18s, color 0.18s, border-color 0.18s, transform 0.18s, box-shadow 0.18s;
+}
+
+.dialog-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.dialog-btn--primary {
+  background: #D4785C;
+  color: #FFFFFF;
+  box-shadow: 0 2px 8px rgba(212, 120, 92, 0.25);
+}
+
+.dialog-btn--primary:hover:not(:disabled) {
+  background: #C0684C;
+  box-shadow: 0 4px 12px rgba(212, 120, 92, 0.3);
+  transform: translateY(-1px);
+}
+
+.dialog-btn--secondary {
+  background: #FFFFFF;
+  color: #7A6E64;
+  border-color: #DCD2C7;
+}
+
+.dialog-btn--secondary:hover:not(:disabled) {
+  background: #F7F3ED;
+  color: #2D2420;
+  border-color: #C9BCAE;
+}
+
+.dialog-btn--danger {
+  background: #C94A4A;
+  color: #FFFFFF;
+  box-shadow: 0 2px 8px rgba(201, 74, 74, 0.22);
+}
+
+.dialog-btn--danger:hover:not(:disabled) {
+  background: #B03A3A;
+  transform: translateY(-1px);
+}
+
+/* 确认框：它没有自己的卡片类，所以在这里给它一个 */
+.confirm-dialog {
+  background: #FFFFFF;
+  border-radius: 20px;
+  width: min(92%, 400px);
+  padding: 26px 28px 24px 28px;
+  box-shadow: 0 20px 40px rgba(45, 36, 32, 0.18), 0 0 0 1px rgba(212, 120, 92, 0.08);
+  animation: dialogSlideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}

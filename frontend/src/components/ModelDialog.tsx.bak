@@ -1,0 +1,190 @@
+import { useEffect, useState } from 'react'
+import { api } from '../api'
+import { useStore } from '../store'
+import type { ModelPresets } from '../types'
+import './ModelDialog.css'
+
+interface Props {
+  onClose: () => void
+}
+
+export default function ModelDialog({ onClose }: Props) {
+  const modelConfig = useStore((s) => s.modelConfig)
+  const [presets, setPresets] = useState<ModelPresets | null>(null)
+  const [selectedPreset, setSelectedPreset] = useState<string>('')
+  const [customModel, setCustomModel] = useState('')
+  const [customBaseUrl, setCustomBaseUrl] = useState('')
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const loadPresets = async () => {
+      try {
+        const data = await api.getModelPresets()
+        setPresets(data)
+      } catch (e) {
+        console.error('加载模型预设失败:', e)
+      } finally {
+        setLoading(false)
+      }
+    }
+    loadPresets()
+  }, [])
+
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', handleEsc)
+    return () => window.removeEventListener('keydown', handleEsc)
+  }, [onClose])
+
+  const handlePresetSelect = (presetName: string) => {
+    setSelectedPreset(presetName)
+    if (presets && presets[presetName]) {
+      const preset = presets[presetName]
+      setCustomModel(preset.model || '')
+      setCustomBaseUrl(preset.base_url || '')
+    }
+  }
+
+  return (
+    <div className="dialog-overlay" onClick={onClose}>
+      <div className="dialog-content model-dialog" onClick={(e) => e.stopPropagation()}>
+        <h3 className="dialog-title">模型配置</h3>
+        
+        <div className="model-current">
+          <div className="model-current-label">当前模型</div>
+          <div className="model-current-value">
+            {modelConfig ? (
+              <>
+                <span className="model-current-name">{modelConfig.model}</span>
+                <span className="model-current-badge">
+                  {modelConfig.multimodal ? '支持图片' : '文本对话'}
+                </span>
+              </>
+            ) : (
+              <span>加载中...</span>
+            )}
+          </div>
+        </div>
+
+        <div className="model-dialog-divider" />
+
+        <h4 className="model-dialog-subtitle">如何添加/切换模型</h4>
+        
+        {loading ? (
+          <p className="model-dialog-loading">加载预设配置中...</p>
+        ) : (
+          <>
+            <div className="model-preset-section">
+              <p className="model-dialog-desc">
+                选择一个预设模型,查看配置方法:
+              </p>
+              
+              <div className="model-preset-grid">
+                {presets && Object.entries(presets).map(([name, preset]) => (
+                  <button
+                    key={name}
+                    className={`model-preset-card ${selectedPreset === name ? 'active' : ''}`}
+                    onClick={() => handlePresetSelect(name)}
+                  >
+                    <div className="model-preset-name">{name}</div>
+                    {preset.use_thinking && (
+                      <span className="model-preset-badge">支持深度思考</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {selectedPreset && presets && presets[selectedPreset] && (
+              <div className="model-config-steps">
+                <h5 className="model-config-steps-title">
+                  配置步骤 - {selectedPreset}
+                </h5>
+                
+                <div className="model-config-step">
+                  <div className="model-config-step-num">1</div>
+                  <div className="model-config-step-content">
+                    <div className="model-config-step-title">获取 API Key</div>
+                    <p className="model-config-step-desc">
+                      {presets[selectedPreset].support_text}
+                    </p>
+                    {presets[selectedPreset].support_url && (
+                      <a 
+                        href={presets[selectedPreset].support_url} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="model-config-link"
+                      >
+                        前往获取 →
+                      </a>
+                    )}
+                  </div>
+                </div>
+
+                <div className="model-config-step">
+                  <div className="model-config-step-num">2</div>
+                  <div className="model-config-step-content">
+                    <div className="model-config-step-title">配置 .env 文件</div>
+                    <p className="model-config-step-desc">
+                      编辑项目根目录的 <code>.env</code> 文件,填入你的 API Key:
+                    </p>
+                    <pre className="model-dialog-code">
+{selectedPreset === 'DeepSeek(推荐)' && 'DEEPSEEK_API_KEY=sk-your-key-here'}
+{selectedPreset === 'OpenAI' && 'OPENAI_API_KEY=sk-your-key-here'}
+{selectedPreset === '智谱 AI' && 'ZHIPU_API_KEY=your-key-here'}
+{selectedPreset === '通义千问' && 'DASHSCOPE_API_KEY=sk-your-key-here'}
+{selectedPreset === 'SiliconFlow' && 'SILICONFLOW_API_KEY=sk-your-key-here'}
+{selectedPreset === '自定义' && '# 根据提供商添加对应的 API Key'}
+                    </pre>
+                  </div>
+                </div>
+
+                {customModel && customBaseUrl && (
+                  <div className="model-config-step">
+                    <div className="model-config-step-num">3</div>
+                    <div className="model-config-step-content">
+                      <div className="model-config-step-title">修改模型配置</div>
+                      <p className="model-config-step-desc">
+                        编辑 <code>backend/model_config.py</code>,修改以下两行:
+                      </p>
+                      <pre className="model-dialog-code">{`CHAT_MODEL = "${customModel}"
+CHAT_BASE_URL = "${customBaseUrl}"`}</pre>
+                    </div>
+                  </div>
+                )}
+
+                <div className="model-config-step">
+                  <div className="model-config-step-num">4</div>
+                  <div className="model-config-step-content">
+                    <div className="model-config-step-title">重启后端服务</div>
+                    <p className="model-config-step-desc">
+                      保存文件后,重启后端服务使配置生效。
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        <div className="model-dialog-divider" />
+
+        <div className="model-dialog-note">
+          <h5 className="model-dialog-note-title">💡 提示</h5>
+          <ul className="model-dialog-note-list">
+            <li>语义记忆检索需要配置 <code>ZHIPU_API_KEY</code>(必填)</li>
+            <li>系统会根据 <code>base_url</code> 自动识别提供商并匹配 API Key</li>
+            <li>支持多模态的模型可以上传图片进行对话</li>
+            <li>更多配置说明请查看 <code>docs/MODEL_CONFIG_GUIDE.md</code></li>
+          </ul>
+        </div>
+
+        <button className="dialog-btn dialog-btn--primary" onClick={onClose}>
+          关闭
+        </button>
+      </div>
+    </div>
+  )
+}
