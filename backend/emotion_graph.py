@@ -26,6 +26,7 @@
 import os
 import time
 import json
+import re
 import logging
 from collections import OrderedDict
 from typing import TypedDict, Annotated, Optional, List, Dict, Any
@@ -37,6 +38,7 @@ from langgraph.graph import StateGraph, END
 from memory_manager import MemoryManager, MemoryCategory, EmotionAnalyzer, EmotionType, rewrite_query
 from working_memory import WorkingMemoryStore, update_working_memory
 import care_extractor
+from llm_errors import friendly_llm_error
 from summary_service import SummaryService
 
 load_dotenv()
@@ -226,6 +228,33 @@ SUMMARY_TRIGGER_ROUNDS = 30
 SUMMARY_INTERVAL = 20
 MAX_RECENT_ROUNDS = 40
 
+# 前端每次把整个会话历史原样回传，图片是 data URL，几十张就能顶到中转的 15MB 上限；
+# 那个报错会被上层 except 吞掉，表现出来就是"它突然不记得我了"。历史只留最近这些、且不重发图片。
+HISTORY_MAX_MESSAGES = 30
+HISTORY_MAX_CHARS = 800
+
+_HISTORY_IMAGE_RE = re.compile(r"data:image/[a-zA-Z]+;base64,[A-Za-z0-9+/=\s]+")
+
+
+def _sanitize_history(history) -> List[Dict]:
+    clean = []
+    for msg in history or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = msg.get("content")
+        text = text if isinstance(text, str) else str(text or "")
+        if _HISTORY_IMAGE_RE.search(text) or msg.get("image"):
+            text = _HISTORY_IMAGE_RE.sub("", text).strip()
+            text = (text + " [这里曾发过一张图]").strip()
+        if len(text) > HISTORY_MAX_CHARS:
+            text = text[:HISTORY_MAX_CHARS] + "…"
+        if text:
+            clean.append({"role": role, "content": text})
+    return clean[-HISTORY_MAX_MESSAGES:]
+
 _summary_service: Optional[SummaryService] = None
 
 def get_summary_service() -> SummaryService:
@@ -269,7 +298,8 @@ SUMMARY_PROMPT = """请对以下对话历史生成简洁的摘要（200字以内
 
 def _generate_summary(llm, conversation_history: List[Dict]) -> str:
     conv_text = ""
-    for msg in conversation_history:
+    # 摘要只用于"更早的部分"，全量塞进去会超中转的大小上限
+    for msg in conversation_history[-60:]:
         role = "用户" if msg["role"] == "user" else "moz"
         conv_text += f"{role}: {msg['content']}\n"
     prompt = SUMMARY_PROMPT.format(conversation=conv_text)
@@ -430,13 +460,13 @@ def _build_dialogue_messages(state: AgentState) -> list:
 
     image_data = state.get("image_data")
     if image_data:
-        if image_data.startswith("data:image"):
-            b64_data = image_data.split(",", 1)[1]
-        else:
-            b64_data = image_data
+        # 必须给完整 data URL：裸 base64 会被中转当成非法 content 直接 400；
+        # 纯图片消息的 text 也不能是空串，同一个报错
+        url = image_data if image_data.startswith("data:") else f"data:image/jpeg;base64,{image_data}"
+        caption = (state.get("user_message") or "").strip() or "帮我看看这张图"
         user_content = [
-            {"type": "image_url", "image_url": {"url": b64_data}},
-            {"type": "text", "text": state["user_message"]},
+            {"type": "image_url", "image_url": {"url": url}},
+            {"type": "text", "text": caption},
         ]
         messages.append(HumanMessage(content=user_content))
     else:
@@ -637,7 +667,7 @@ def run_emotion_workflow(
     initial_state = {
         "user_id": user_id,
         "user_message": user_message,
-        "conversation_history": conversation_history or [],
+        "conversation_history": _sanitize_history(conversation_history),
         "image_data": image_data,
         "emotion_analysis": None,
         "emotion_summary": None,
@@ -692,7 +722,7 @@ def run_emotion_workflow_streaming(
         "user_id": user_id,
         "user_message": user_message,
         "conversation_id": conversation_id,
-        "conversation_history": conversation_history or [],
+        "conversation_history": _sanitize_history(conversation_history),
         "image_data": image_data,
         "emotion_analysis": None,
         "emotion_summary": None,
@@ -850,10 +880,10 @@ def run_emotion_workflow_streaming(
 
         except asyncio.TimeoutError:
             logger.error("流式工作流超时")
-            yield {'type': 'error', 'text': '回复生成超时，请重试'}
+            yield {'type': 'error', 'text': friendly_llm_error(TimeoutError(), bool(state.get("image_data")))}
         except Exception as e:
             logger.error(f"流式工作流失败: {e}", exc_info=True)
-            yield {'type': 'error', 'text': '对话处理失败，请稍后重试'}
+            yield {'type': 'error', 'text': friendly_llm_error(e, bool(state.get("image_data")))}
 
     return _stream()
 

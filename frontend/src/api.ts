@@ -58,9 +58,28 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   })
   if (!res.ok) {
     const err = await res.text()
-    throw new Error(err || `HTTP ${res.status}`)
+    throw new Error(readableError(err, res.status) || `HTTP ${res.status}`)
   }
   return res.json()
+}
+
+/**
+ * 后端 detail 有时是中文短句，有时是网关的 HTML 或 JSON 残渣。
+ * 这些会直接出现在聊天气泡里，所以先剥成一句话，别把 {"detail":"..."} 甩给用户。
+ */
+export function readableError(raw: string, status = 0): string {
+  const text = (raw || '').trim()
+  if (!text) return status ? `服务返回了空响应（${status}）` : ''
+  if (text.startsWith('<')) return '服务没正常响应（返回的是网关页面），稍后再试一次'
+  let detail = text
+  try {
+    const parsed = JSON.parse(text)
+    const d = parsed?.detail ?? parsed?.error?.message ?? parsed?.error
+    if (typeof d === 'string' && d.trim()) detail = d.trim()
+  } catch {
+    /* 不是 JSON，原文就是提示语 */
+  }
+  return detail.length > 160 ? detail.slice(0, 160) + '…' : detail
 }
 
 // Module-level abort controller for stopping generation
@@ -261,11 +280,18 @@ export const api = {
     imageData?: string
   ): AsyncGenerator<{ type: string; text?: string; conversation_id?: string }> {
     let lastError: Error | undefined
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // 不重试：/api/chat 会写库，失败很可能是"回复已生成但落库断了"，重发就等于说两遍
+    for (let attempt = 0; attempt < 1; attempt++) {
+      // catch 取不到 try 里声明的变量，所以超时标记放外面
+      let timedOut = false
       try {
         const controller = new AbortController()
         _activeController = controller
-        const timeoutId = setTimeout(() => controller.abort(), 30000)
+        // 中转一次正常回答就要 25~35s，30s 会把成功误判成超时
+        const timeoutId = setTimeout(() => {
+          timedOut = true
+          controller.abort()
+        }, 90000)
 
         let res: Response
         try {
@@ -275,7 +301,11 @@ export const api = {
             body: JSON.stringify({
               message,
               conversation_id: conversationId,
-              conversation_history: history,
+              // 只回传最近的文字：历史里的图片 data URL 会让请求体涨到中转直接拒收
+              conversation_history: history
+                .filter((m) => m.content)
+                .slice(-20)
+                .map((m) => ({ role: m.role, content: m.content })),
               image_data: imageData || null,
             }),
             signal: controller.signal,
@@ -285,7 +315,7 @@ export const api = {
         }
 
         if (!res.ok) {
-          throw new Error(await res.text())
+          throw new Error(await readableError(await res.text()))
         }
 
         const reader = res.body?.getReader()
@@ -330,11 +360,12 @@ export const api = {
         }
         return
       } catch (e) {
-        const isTimeout = e instanceof DOMException && e.name === 'AbortError'
-        if (isTimeout) {
-          throw new Error('连接超时，请检查网络')
+        const err = e as Error
+        if (err?.name === 'AbortError') {
+          if (!timedOut) return // 用户自己点了停止：已经流出来的字留着，别谎报网络错误
+          throw new Error('这次等得太久了（超过一分半），先没答上来。可以再发一次。')
         }
-        lastError = e as Error
+        lastError = err
         if (attempt === 0) {
           continue
         }

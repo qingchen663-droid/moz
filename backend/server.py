@@ -11,6 +11,7 @@ import uuid
 import json
 import asyncio
 import base64
+import io
 import time
 import datetime
 import logging
@@ -249,8 +250,10 @@ class RateLimiter:
         self._requests[key].append(now)
         return True
 
-_chat_limiter = RateLimiter(max_requests=30, window_seconds=60)
-_default_limiter = RateLimiter(max_requests=60, window_seconds=60)
+# 本地单机应用：正常翻界面、开日志、20s 一次轮询就会上百次请求，
+# 限流只该防"前端死循环"，不该防用户手快
+_chat_limiter = RateLimiter(max_requests=60, window_seconds=60)
+_default_limiter = RateLimiter(max_requests=300, window_seconds=60)
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -259,7 +262,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             if not _default_limiter.is_allowed(client_ip):
                 return JSONResponse(
                     status_code=429,
-                    content={"detail": "请求过于频繁，请稍后再试"},
+                    content={"detail": "这一分钟请求太密了，等几十秒再试就好"},
                 )
         response = await call_next(request)
         return response
@@ -269,7 +272,7 @@ app.add_middleware(RateLimitMiddleware)
 
 async def rate_limit_chat(user_id: str):
     if not _chat_limiter.is_allowed(user_id):
-        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+        raise HTTPException(status_code=429, detail="这一分钟说得有点多，等几十秒再发一条")
 
 # ================================================================
 # Pydantic 模型
@@ -363,6 +366,46 @@ def _ensure_conversation(user_id: str) -> tuple:
         store.save(user_id, convs, current_id)
     return convs, current_id
 
+_TURN_LOCKS: Dict[str, "asyncio.Lock"] = {}
+
+# 一张手机照片的 data URL 能有 1MB，全存进会话文件很快就几十 MB；历史也不该无限长
+MAX_MESSAGES_PER_CONVERSATION = 300
+_THUMB_MAX_SIDE = 768
+
+
+def _thumbnail_data_url(data_url: str, max_side: int = _THUMB_MAX_SIDE, quality: int = 72) -> str:
+    """把要长期存进会话的图片压成缩略图；压不动就原样返回，不因为省空间而丢图。"""
+    try:
+        raw = (data_url or "").strip()
+        if not raw.startswith("data:image"):
+            return raw
+        payload = raw.split(",", 1)[1]
+        from PIL import Image
+        img = Image.open(io.BytesIO(base64.b64decode(payload)))
+        img.load()
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > max_side:
+            ratio = max_side / float(max(w, h))
+            img = img.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode()
+    except Exception as e:
+        logger.warning("[图片] 缩略图生成失败，按原样保存: %s", e)
+        return data_url
+
+
+def _turn_lock(user_id: str) -> "asyncio.Lock":
+    """同一个用户一次只跑一轮对话：并行两轮会互相覆盖会话与记忆。"""
+    lock = _TURN_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _TURN_LOCKS[user_id] = lock
+    return lock
+
+
 def _append_assistant_message(user_id: str, text: str) -> None:
     """把主动关心说过的话写进当前对话：不然历史里查不到，模型下一轮也不记得自己说过。"""
     text = (text or "").strip()
@@ -408,6 +451,11 @@ async def chat(user_id: str, req: ChatRequest):
         cid = req.conversation_id or current_id
 
     async def event_stream():
+        lock = _turn_lock(user_id)
+        if lock.locked():
+            # 排队是常态（连点两次、托盘也发一条），别让界面看起来像卡死
+            yield f"data: {json.dumps({'type': 'status', 'text': '上一条还在收尾，等一下'})}\n\n"
+        await lock.acquire()
         try:
             reply = ""
             async for chunk in run_emotion_workflow_streaming(
@@ -450,9 +498,13 @@ async def chat(user_id: str, req: ChatRequest):
                 conv = convs[active_cid]
                 user_msg = {"role": "user", "content": req.message}
                 if req.image_data:
-                    user_msg["image"] = req.image_data
+                    # 存缩略图，原始大图只用于这一轮请求：否则会话文件很快就几十 MB
+                    user_msg["image"] = _thumbnail_data_url(req.image_data)
                 conv["messages"].append(user_msg)
                 conv["messages"].append({"role": "assistant", "content": reply})
+
+                if len(conv["messages"]) > MAX_MESSAGES_PER_CONVERSATION:
+                    conv["messages"] = conv["messages"][-MAX_MESSAGES_PER_CONVERSATION:]
 
                 if len(conv["messages"]) <= 2:
                     conv["title"] = req.message[:20] or "新对话"
@@ -464,6 +516,8 @@ async def chat(user_id: str, req: ChatRequest):
         except Exception as e:
             logger.error(f"对话处理失败: {e}", exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'text': '对话处理失败，请稍后重试'})}\n\n"
+        finally:
+            lock.release()
 
     return StreamingResponse(
         event_stream(),
@@ -618,8 +672,12 @@ async def clear_memories(user_id: str):
     if pm:
         pm.delete_profile(user_id)
 
-    logger.info("已清空用户 %s 的记忆/总结/工作记忆/档案卡", user_id)
-    return {"ok": True, "summaries_removed": removed_summaries}
+    # 主动关心记下的事也在 moz.db 里；不清的话"全部清空"会留下生日和提醒
+    care: Optional[CareStore] = _app_state.get("care_store")
+    removed_care = care.clear_user(user_id) if care else 0
+
+    logger.info("已清空用户 %s 的记忆/总结/工作记忆/档案卡/关心事项", user_id)
+    return {"ok": True, "summaries_removed": removed_summaries, "care_removed": removed_care}
 
 # ================================================================
 # API: 用户档案卡
@@ -1066,8 +1124,15 @@ async def export_user_data(user_id: str):
         with open(avatar_path, "rb") as f:
             avatar_data_url = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
 
+    # 主动关心那块也是用户数据的一部分：漏了就等于"导出了但没备份"
+    care: CareStore = _app_state["care_store"]
+    care_data = {
+        "items": care.list_items(user_id, status=None),
+        "settings": care.get_settings(user_id),
+    }
+
     return {
-        "version": 1,
+        "version": 2,
         "exported_at": datetime.datetime.now().isoformat(),
         "user_id": user_id,
         "conversations": convs or {},
@@ -1076,6 +1141,7 @@ async def export_user_data(user_id: str):
         "working_memory": working,
         "profile": profile_data,
         "avatar": avatar_data_url,
+        "care": care_data,
     }
 
 @app.post("/api/import/{user_id}", dependencies=[Depends(verify_admin_key)])
@@ -1108,7 +1174,33 @@ async def import_user_data(user_id: str, req: dict):
         except HTTPException as e:
             logger.warning("[导入] 头像被跳过: %s", e.detail)
 
-    return {"status": "ok", "memories_imported": imported_count}
+    care_imported = 0
+    care_data = req.get("care") or {}
+    care: Optional[CareStore] = _app_state.get("care_store")
+    if care and care_data.get("items"):
+        # 先清再写：否则同一个生日会在恢复快照后变成两条，到点说两遍
+        care.clear_user(user_id)
+        for it in care_data["items"]:
+            try:
+                care.add_item(
+                    user_id,
+                    title=str(it.get("title") or "")[:120],
+                    kind=str(it.get("kind") or "event"),
+                    detail=str(it.get("detail") or "")[:500],
+                    due_at=float(it.get("due_at") or 0),
+                    repeat=str(it.get("repeat") or "none"),
+                )
+                care_imported += 1
+            except (ValueError, TypeError) as e:
+                logger.warning("[导入] 跳过一条关心事项: %s", e)
+    if care and care_data.get("settings"):
+        care.save_settings(user_id, care_data["settings"])
+
+    return {
+        "status": "ok",
+        "memories_imported": imported_count,
+        "care_items_imported": care_imported,
+    }
 
 @app.get("/api/search/{user_id}", dependencies=[Depends(verify_access_key)])
 async def search_conversations(user_id: str, q: str):

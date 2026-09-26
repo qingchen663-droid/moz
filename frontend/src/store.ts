@@ -15,6 +15,21 @@ function nextMsgId(): string {
   return `msg_${Date.now()}_${++_msgIdCounter}`
 }
 
+/**
+ * 错误直接进聊天气泡，所以不能是 `{"detail":...}` 也不能是英文。
+ * 后端的 llm_errors 已经给过完整句子，这里只兜住前端自己的失败。
+ */
+function chatErrorText(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e ?? '')
+  if (/failed to fetch|networkerror|err_connection|load failed/i.test(raw)) {
+    return '没连上后端。确认后端还在跑（8000 端口），然后把刚才那句再发一次。'
+  }
+  if (/JSON|parse/i.test(raw) && !/[\u4e00-\u9fa5]/.test(raw)) {
+    return '后端返回了看不懂的内容，可能没启动完成。稍等几秒再试。'
+  }
+  return raw || '这条没发出去，再试一次。'
+}
+
 interface AppState {
   userId: string
   avatar: string | null
@@ -347,6 +362,8 @@ export const useStore = create<AppState>((set, get) => ({
           if (event.conversation_id && !currentConvId) {
             set({ currentConvId: event.conversation_id })
           }
+          // 发出去了就不留"重发上一条"，否则几小时前的旧话会被这个按钮再发一遍
+          set({ lastFailedMessage: null })
           get().loadConversations()
           get().loadMemoryStats()
           yield
@@ -355,11 +372,13 @@ export const useStore = create<AppState>((set, get) => ({
           throw new Error(event.text || 'Unknown error')
         }
       }
+      // 中途点"停止"时流是正常结束的（没有抛错），这里必须收掉"正在回复"，否则输入框一直锁着
+      set({ isLoading: false, statusText: '' })
     } catch (e) {
       const errMsg: Message = {
         id: nextMsgId(),
         role: 'assistant',
-        content: `抱歉，出现了一些问题：${e instanceof Error ? e.message : '未知错误'}`,
+        content: chatErrorText(e),
       }
       if (!assistantAdded) {
         set((s) => ({ messages: [...s.messages, errMsg], isLoading: false, statusText: '' }))

@@ -169,7 +169,7 @@ describe('消息交互', () => {
   it('sendMessage 应处理错误事件', async () => {
     const { api } = await import('../api')
     const mockStream = (async function* () {
-      yield { type: 'error', text: '连接超时' }
+      yield { type: 'error', text: '模型密钥被中转拒绝了。打开「模型」设置，重新填一次 API Key 再发。' }
     })()
     vi.mocked(api.sendMessage).mockReturnValueOnce(mockStream)
 
@@ -183,8 +183,11 @@ describe('消息交互', () => {
     }
 
     const msgs = useStore.getState().messages
-    const errMsg = msgs.find((m) => m.role === 'assistant' && m.content.includes('问题'))
+    const errMsg = msgs.find((m) => m.role === 'assistant' && m.content.includes('「模型」'))
     expect(errMsg).toBeTruthy()
+    // 后端已经给了可执行的句子，不要再套一层"抱歉，出现了一些问题"把重点埋掉
+    expect(errMsg!.content).not.toContain('抱歉，出现了一些问题')
+    expect(useStore.getState().isLoading).toBe(false)
   })
 })
 

@@ -270,6 +270,16 @@ class CareStore:
         self._conn().commit()
         return self.get_settings(user_id)
 
+    def clear_user(self, user_id: str) -> int:
+        """清掉这个用户记下的事和说过的话，但保留偏好设置——那里面还有"话多话少"的判断。"""
+        conn = self._conn()
+        removed = 0
+        for table in ("care_items", "proactive_queue", "care_log"):
+            cur = conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+            removed += max(cur.rowcount, 0)
+        conn.commit()
+        return removed
+
     # ── 话多话少 ─────────────────────────────────────────
     def daily_budget(self, user_id: str) -> int:
         """当日可主动开口的条数：手动模式优先，否则按 talk_score 换算。"""
