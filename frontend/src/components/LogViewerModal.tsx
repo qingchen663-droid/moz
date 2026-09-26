@@ -69,7 +69,9 @@ export default function LogViewerModal({ onClose }: Props) {
 
         <div className="log-viewer-body" ref={bodyRef} onScroll={handleScroll}>
           {logs.length === 0 ? (
-            <div className="log-viewer-empty">暂无日志，发送一条消息后即可看到</div>
+            <div className="log-viewer-empty">
+              这里还是空的：后端一有动静就会写进来。发一句话还没出现，多半是后端（8000 端口）没在跑。
+            </div>
           ) : (
             logs.map((log, i) => (
               <div key={i} className="log-viewer-line">

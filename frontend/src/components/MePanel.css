@@ -110,7 +110,8 @@
 
 .me-stats {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: max-content 1fr;
+  align-items: stretch;
   gap: 10px;
   margin-bottom: 22px;
 }
@@ -121,6 +122,20 @@
   border-radius: var(--radius-md);
   padding: 14px 12px;
   text-align: center;
+}
+
+/* 计数旁边那句"下一步能干什么"：字号要比 11px 的标签读得动 */
+.me-stat--wide {
+  text-align: left;
+  display: flex;
+  align-items: center;
+  padding: 12px 14px;
+}
+
+.me-stat--wide .me-stat-key {
+  margin-top: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 
 .me-stat-value {

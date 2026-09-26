@@ -136,15 +136,14 @@ export default function MePanel({ onClose }: { onClose: () => void }) {
             <div className="me-stats">
               <div className="me-stat">
                 <div className="me-stat-value">{memoryStats?.total ?? 0}</div>
-                <div className="me-stat-key">记忆总数</div>
+                <div className="me-stat-key">记着的事</div>
               </div>
-              <div className="me-stat">
-                <div className="me-stat-value">{memoryStats?.consolidated_count ?? 0}</div>
-                <div className="me-stat-key">已巩固</div>
-              </div>
-              <div className="me-stat">
-                <div className="me-stat-value">{(memoryStats?.avg_importance ?? 0).toFixed(1)}</div>
-                <div className="me-stat-key">平均重要性</div>
+              <div className="me-stat me-stat--wide">
+                <div className="me-stat-key">
+                  {(memoryStats?.total ?? 0) === 0
+                    ? '还没开始记。聊到重要的事它会自己留下，不用你填'
+                    : `点开左边的「记忆」能逐条看、能删、能说它记错了`}
+                </div>
               </div>
             </div>
 

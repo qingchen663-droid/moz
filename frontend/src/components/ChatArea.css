@@ -92,6 +92,17 @@
   position: relative;
 }
 
+/* 第一次打开时的上手提示：比正文弱一档，但要能看清 */
+.chat-welcome-text--hint {
+  font-size: 13px;
+  color: var(--color-text-dim);
+  opacity: 0.82;
+  max-width: 340px;
+  padding: 8px 12px;
+  border: 1px dashed var(--color-border);
+  border-radius: 10px;
+}
+
 .chat-thinking {
   display: flex;
   align-items: flex-end;

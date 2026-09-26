@@ -147,6 +147,37 @@ describe('一个东西只许有一个名字', () => {
   })
 })
 
+describe('冷启动：第一眼得知道下一步干什么', () => {
+  const welcome = () => document.querySelector('.chat-welcome')?.textContent ?? ''
+
+  it('一条记忆都没有时，给一句能马上照着试的话', async () => {
+    const base = globalThis.fetch
+    // App 挂载时会自己拉记忆统计，只改 store 会被覆盖回去
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes('/memory')) return mockResponse({ total: 0, avg_importance: 0, consolidated_count: 0 })
+      if (url.includes('/care/pending')) return mockResponse({ items: [] })
+      return base(input as RequestInfo)
+    }) as typeof fetch
+    try {
+      render(<App />)
+      await waitFor(() => expect(document.querySelector('.chat-welcome')).toBeTruthy())
+      await waitFor(() => expect(welcome()).toContain('想先试一下'))
+      expect(welcome()).toContain('记住，我妈生日是 10 月 5 日')
+      expect(welcome()).toContain('「记忆」')
+      expect(welcome()).not.toMatch(/层级|巩固|talk_score|检索/)
+    } finally {
+      globalThis.fetch = base
+    }
+  })
+
+  it('已经记过东西的老用户，不用再被手把手教', async () => {
+    render(<App />)
+    await waitFor(() => expect(document.querySelector('.chat-welcome')).toBeTruthy())
+    expect(welcome()).not.toContain('想先试一下')
+  })
+})
+
 describe('图片上传入口', () => {
   it('模型未声明能看图时上传按钮仍在（只是低调态）', async () => {
     render(<App />)
@@ -269,6 +300,25 @@ describe('记忆可读可改：能筛选、能纠错', () => {
     await openViewer({ core: [], important: [], regular: [] })
     fireEvent.click(screen.getByText('记忆'))
     expect(document.querySelector('.mem-empty')?.textContent).toContain('记住')
+  })
+
+  it('记忆卡片不摆内部指标：检索次数、重要性百分比、已巩固', async () => {
+    await openViewer({
+      core: [
+        {
+          ...memory('c1', '妈妈生日是 10 月 5 日', 'core'),
+          access_count: 12,
+          importance: 0.87,
+          is_consolidated: true,
+        },
+      ],
+      important: [],
+      regular: [],
+    })
+    fireEvent.click(screen.getByText('记忆'))
+    const card = document.querySelector('.mem-card')!
+    expect(card.textContent).not.toMatch(/检索|已巩固|重要性|%/)
+    expect(card.textContent).toContain('妈妈生日是 10 月 5 日')
   })
 })
 

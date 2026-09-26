@@ -65,7 +65,11 @@ export default function ConversationList() {
 
       <div className="conv-list-items">
         {filtered.length === 0 ? (
-          <div className="conv-list-empty">暂无对话</div>
+          <div className="conv-list-empty">
+            {searchQuery
+              ? `没搜到「${searchQuery}」——这里只按标题搜，换个词或者清空搜索框就能看全部。`
+              : '还没有第二条对话。你说第一句之后就会出现在这儿，切回来接着聊就行。'}
+          </div>
         ) : (
           filtered.map((conv) => {
             const isActive = conv.id === currentConvId

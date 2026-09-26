@@ -199,7 +199,7 @@ export default function MemoryViewerModal({ onClose }: Props) {
         {/* Working Memory Summary */}
         {memoryData?.working_memory && memoryData.working_memory.summary && (
           <div className="mem-working-bar">
-            <div className="mem-working-label">工作记忆</div>
+            <div className="mem-working-label">最近还在聊的</div>
             <div className="mem-working-summary">{memoryData.working_memory.summary}</div>
             {openTopics.length > 0 && (
               <div className="mem-working-topics">
@@ -334,7 +334,11 @@ function ProfileView({
     coreMemories.length === 0
 
   if (isEmpty) {
-    return <div className="mem-empty">暂无档案信息，多聊聊就会自动建立</div>
+    return (
+      <div className="mem-empty">
+        档案还空着。聊到名字、工作、家人、喜好时它会自动填，不用你在这儿打字。
+      </div>
+    )
   }
 
   return (
@@ -545,12 +549,6 @@ function MemoryList({
                 ))}
               </div>
             )}
-
-            <div className="mem-card-meta">
-              {m.is_consolidated && <span className="mem-meta-badge">已巩固</span>}
-              <span className="mem-meta-count">检索 {m.access_count} 次</span>
-              <span className="mem-meta-count">重要性 {(m.importance * 100).toFixed(0)}%</span>
-            </div>
           </div>
         )
       })}

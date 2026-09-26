@@ -14,6 +14,8 @@ export default function ChatArea() {
   const retryLastMessage = useStore((s) => s.retryLastMessage)
   const memoryStats = useStore((s) => s.memoryStats)
   const bottomRef = useRef<HTMLDivElement>(null)
+  // 一条记忆都没有 = 第一次打开，该教一句怎么用
+  const firstTime = (memoryStats?.total ?? 0) === 0
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -42,8 +44,15 @@ export default function ChatArea() {
             </div>
             <h2 className="chat-welcome-title">我在这里，听你说</h2>
             <p className="chat-welcome-text">
-              无论是开心、难过，还是只是想找个人聊聊，moz 都在这里陪着你。
+              说什么都行：今天做了什么、烦什么、突然想起什么。
+              重要的事它自己会记下来，下次不用你重复。
             </p>
+            {firstTime && (
+              <p className="chat-welcome-text chat-welcome-text--hint">
+                想先试一下：发一句「记住，我妈生日是 10 月 5 日」，再点左边的「记忆」，
+                看它把它记成了什么样。
+              </p>
+            )}
           </div>
         )}
 
