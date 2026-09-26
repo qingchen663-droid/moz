@@ -20,29 +20,59 @@ export default function PromptDialog({ onClose }: Props) {
   const [saving, setSaving] = useState(false)
   const [avatarBusy, setAvatarBusy] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [attempt, setAttempt] = useState(0)
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'failed'>('loading')
   const avatarInputRef = useRef<HTMLInputElement>(null)
 
+  const persona = promptConfig?.prompt?.trim() ?? ''
+
   useEffect(() => {
-    loadPromptConfig()
-  }, [loadPromptConfig])
+    let alive = true
+    setLoadState('loading')
+    // 后端没起来或半启动时只会拿到 null / 空对象：界面不能永远写"加载中..."
+    Promise.resolve(loadPromptConfig()).finally(() => {
+      if (alive) setLoadState(useStore.getState().promptConfig?.prompt?.trim() ? 'ready' : 'failed')
+    })
+    return () => {
+      alive = false
+    }
+  }, [loadPromptConfig, attempt])
+
+  // 编辑过又没保存时，任何退出方式都得先问一句
+  const confirmDiscard = () =>
+    !editing ||
+    text === persona ||
+    window.confirm('这些改动还没保存，丢掉吗？')
+
+  const requestClose = () => {
+    if (confirmDiscard()) onClose()
+  }
+  const closeRef = useRef(requestClose)
+  closeRef.current = requestClose
 
   useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') closeRef.current()
     }
     window.addEventListener('keydown', handleEsc)
     return () => window.removeEventListener('keydown', handleEsc)
-  }, [onClose])
+  }, [])
 
   const handleStartEdit = () => {
-    setText(promptConfig?.prompt || '')
+    setText(persona)
     setEditing(true)
+    setMessage(null)
+  }
+
+  const handleCancelEdit = () => {
+    if (!confirmDiscard()) return
+    setEditing(false)
     setMessage(null)
   }
 
   const handleReset = () => {
     setText(promptConfig?.default_prompt || '')
-    setMessage(null)
+    setMessage({ type: 'success', text: '已填回默认人设，还没保存；点「保存并生效」才真的换掉' })
   }
 
   const handleAvatarPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -61,6 +91,8 @@ export default function PromptDialog({ onClose }: Props) {
   }
 
   const handleAvatarReset = async () => {
+    if (!window.confirm('换回默认头像？你上传的那张会被删掉（之前导出过快照的话，快照里还留着）。'))
+      return
     try {
       setAvatarBusy(true)
       await deleteAvatar()
@@ -93,8 +125,13 @@ export default function PromptDialog({ onClose }: Props) {
   const isCustom = promptConfig?.is_custom
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
-      <div className="dialog-content prompt-dialog" onClick={(e) => e.stopPropagation()}>
+    <div className="dialog-overlay" onClick={requestClose}>
+      <div
+        className="dialog-content prompt-dialog"
+        role="dialog"
+        aria-label="人设"
+        onClick={(e) => e.stopPropagation()}
+      >
         <h3 className="dialog-title">
           <svg
             width="20"
@@ -191,12 +228,28 @@ export default function PromptDialog({ onClose }: Props) {
               当前人设
               {isCustom && <span className="prompt-dialog-custom-tag">自定义</span>}
             </div>
-            <pre className="prompt-dialog-preview-text">{promptConfig?.prompt || '加载中...'}</pre>
+            {loadState === 'failed' && !persona ? (
+              <div className="prompt-dialog-load">
+                <div>读不到当前人设：后端可能没在跑（8000 端口），或者这一路超时了。</div>
+                <button
+                  className="dialog-btn dialog-btn--secondary"
+                  onClick={() => setAttempt((n) => n + 1)}
+                >
+                  再试一次
+                </button>
+              </div>
+            ) : (
+              <pre className="prompt-dialog-preview-text">{persona || '加载中...'}</pre>
+            )}
             <div className="prompt-dialog-actions">
-              <button className="dialog-btn dialog-btn--primary" onClick={handleStartEdit}>
+              <button
+                className="dialog-btn dialog-btn--primary"
+                onClick={handleStartEdit}
+                disabled={!persona}
+              >
                 {isCustom ? '修改人设' : '自定义人设'}
               </button>
-              <button className="dialog-btn dialog-btn--secondary" onClick={onClose}>
+              <button className="dialog-btn dialog-btn--secondary" onClick={requestClose}>
                 关闭
               </button>
             </div>
@@ -232,13 +285,7 @@ export default function PromptDialog({ onClose }: Props) {
               <button className="dialog-btn dialog-btn--secondary" onClick={handleReset}>
                 恢复默认
               </button>
-              <button
-                className="dialog-btn dialog-btn--secondary"
-                onClick={() => {
-                  setEditing(false)
-                  setMessage(null)
-                }}
-              >
+              <button className="dialog-btn dialog-btn--secondary" onClick={handleCancelEdit}>
                 取消
               </button>
             </div>

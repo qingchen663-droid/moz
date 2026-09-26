@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import App from '../App'
 import { useStore } from '../store'
@@ -129,21 +129,32 @@ describe('产品形态回归：单条长期陪伴流', () => {
 
 describe('一个东西只许有一个名字', () => {
   it('侧栏和弹窗不再出现"认知""人设提示词""AI 情感伴侣"', async () => {
-    render(<App />)
-    await waitFor(() => expect(railLabels()).toEqual(['人设', '记忆', '设置', '模型']))
-    expect(document.body.textContent).not.toContain('认知')
+    const base = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes('/config/prompt'))
+        return mockResponse({ prompt: '你是一个安静的听众', default_prompt: '默认人设', is_custom: false })
+      return base(input as RequestInfo)
+    }) as typeof fetch
+    try {
+      render(<App />)
+      await waitFor(() => expect(railLabels()).toEqual(['人设', '记忆', '设置', '模型']))
+      expect(document.body.textContent).not.toContain('认知')
 
-    fireEvent.click(screen.getByText('人设'))
-    await waitFor(() => expect(document.querySelector('.prompt-dialog')).toBeTruthy())
-    const view = document.querySelector('.prompt-dialog')!.textContent!
-    expect(view).not.toMatch(/情感伴侣|提示词/)
-    expect(view).toContain('人设')
+      fireEvent.click(screen.getByText('人设'))
+      await waitFor(() => expect(document.querySelector('.prompt-dialog-preview-text')?.textContent).toContain('安静的听众'))
+      const view = document.querySelector('.prompt-dialog')!.textContent!
+      expect(view).not.toMatch(/情感伴侣|提示词/)
+      expect(view).toContain('人设')
 
-    fireEvent.click(screen.getByText('自定义人设'))
-    await waitFor(() => expect(document.querySelector('.prompt-dialog-editor')).toBeTruthy())
-    const editor = document.querySelector('.prompt-dialog-editor')!.textContent!
-    expect(editor).toContain('编辑人设')
-    expect(editor).not.toMatch(/提示词|AI 伴侣/)
+      fireEvent.click(screen.getByText('自定义人设'))
+      await waitFor(() => expect(document.querySelector('.prompt-dialog-editor')).toBeTruthy())
+      const editor = document.querySelector('.prompt-dialog-editor')!.textContent!
+      expect(editor).toContain('编辑人设')
+      expect(editor).not.toMatch(/提示词|AI 伴侣/)
+    } finally {
+      globalThis.fetch = base
+    }
   })
 })
 
@@ -175,6 +186,51 @@ describe('冷启动：第一眼得知道下一步干什么', () => {
     render(<App />)
     await waitFor(() => expect(document.querySelector('.chat-welcome')).toBeTruthy())
     expect(welcome()).not.toContain('想先试一下')
+  })
+})
+
+describe('人设弹窗：读不到要说清楚，没保存要问一句', () => {
+  it('后端没给人设时不写"加载中..."，而是给原因和重试', async () => {
+    const { default: PromptDialog } = await import('../components/PromptDialog')
+    render(<PromptDialog onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('.prompt-dialog-load')).toBeTruthy())
+    const dialog = document.querySelector('.prompt-dialog')!
+    expect(dialog.textContent).not.toContain('加载中')
+    expect(document.querySelector('.prompt-dialog-load')!.textContent).toContain('再试一次')
+    expect(dialog.querySelector<HTMLButtonElement>('.prompt-dialog-actions .dialog-btn--primary')?.disabled).toBe(true)
+  })
+
+  it('改了人设没保存就点取消，会先问；说"不丢"就留在编辑里', async () => {
+    const base = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes('/config/prompt'))
+        return mockResponse({ prompt: '你是一个温柔的听众', default_prompt: '默认人设', is_custom: true })
+      return base(input as RequestInfo)
+    }) as typeof fetch
+    const asked: string[] = []
+    const confirmSpy = vi.spyOn(window, 'confirm').mockImplementation((msg) => {
+      asked.push(String(msg))
+      return asked.length > 1 // 第一次拒绝，第二次同意
+    })
+    try {
+      const { default: PromptDialog } = await import('../components/PromptDialog')
+      render(<PromptDialog onClose={() => {}} />)
+      await waitFor(() => expect(document.querySelector('.prompt-dialog-preview-text')?.textContent).toContain('温柔的听众'))
+      fireEvent.click(screen.getByText('修改人设'))
+      const ta = document.querySelector('.prompt-dialog-textarea') as HTMLTextAreaElement
+      fireEvent.change(ta, { target: { value: '你是一个温柔的听众，但少说教' } })
+      fireEvent.click(screen.getByText('取消'))
+      expect(asked).toHaveLength(1)
+      expect(asked[0]).toContain('还没保存')
+      expect(document.querySelector('.prompt-dialog-textarea')).toBeTruthy()
+      fireEvent.click(screen.getByText('取消'))
+      expect(asked).toHaveLength(2)
+      expect(document.querySelector('.prompt-dialog-textarea')).toBeFalsy()
+    } finally {
+      confirmSpy.mockRestore()
+      globalThis.fetch = base
+    }
   })
 })
 
