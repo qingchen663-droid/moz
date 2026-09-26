@@ -68,3 +68,6 @@ frontend/node_modules-old/
 *.tsbuildinfo
 backend/moz.db-wal
 backend/moz.db-shm
+
+# 模型配置含真实 API Key，不入版本控制（本地仍在磁盘生效）
+backend/runtime_model_config.json

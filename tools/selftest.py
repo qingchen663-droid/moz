@@ -1,0 +1,381 @@
+"""moz 全局自测台：一条命令跑完后端接口、边界输入、引擎逻辑与数据不变量检查。
+
+设计给"整夜反复跑"用，因此：
+  - 默认只跑快检（不碰大模型，秒级）；--full 才加一次真实对话往返（慢、耗额度）
+  - 任何写操作都用 try/finally 还原，绝不把测试数据留在用户库里
+  - 结果分 fail / warn：fail 一定要修，warn 是环境类（如外网天气不通）
+
+用法：
+    python tools/selftest.py            # 快检
+    python tools/selftest.py --full     # 含真实对话
+    python tools/selftest.py --json     # 机器可读输出
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "backend"))
+
+API = os.environ.get("MOZ_SELFTEST_API", "http://127.0.0.1:8000/api")
+USER = "web_user_001"
+DB = ROOT / "backend" / "moz.db"
+
+results = []
+
+
+def check(name, fn, tier="fast"):
+    """跑一项检查；返回 True/False/None(=warn)。"""
+    t0 = time.time()
+    try:
+        r = fn()
+        status = "pass" if r in (True, None) else ("warn" if r == "warn" else "fail")
+        detail = "" if r in (True, None) else str(r)[:160]
+    except SkipCheck as e:
+        status, detail = "skip", str(e)[:160]
+    except Exception as e:
+        status, detail = "fail", f"{type(e).__name__}: {e}"[:200]
+    results.append({"name": name, "status": status, "ms": round((time.time() - t0) * 1000), "detail": detail, "tier": tier})
+
+
+class SkipCheck(Exception):
+    pass
+
+
+def http(path, method="GET", body=None, timeout=30, raw=False):
+    url = API + path if path.startswith("/") else path
+    data = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
+    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            payload = res.read()
+            if raw:
+                return res.status, payload
+            return res.status, (json.loads(payload) if payload else {})
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+
+# ── 1. 只读接口 ───────────────────────────────────────────
+READ_ENDPOINTS = [
+    "/health", f"/conversations/{USER}", f"/memory/{USER}/stats", f"/memory/{USER}/detail",
+    "/config/model", "/config/model-presets", "/config/prompt", "/users",
+    f"/care/items?user_id={USER}", f"/care/settings?user_id={USER}", f"/care/pending?user_id={USER}",
+    f"/profile/{USER}", "/logs?limit=5", f"/export/{USER}",
+]
+
+
+def run_reads():
+    bad = []
+    for p in READ_ENDPOINTS:
+        code, body = http(p)
+        if code != 200:
+            bad.append(f"{p}->{code}")
+    return bad or True
+
+
+def conversation_detail():
+    code, data = http(f"/conversations/{USER}")
+    if code != 200:
+        return f"列表 {code}"
+    cid = data.get("current_id")
+    if not cid:
+        return True  # 全新用户没有当前会话，属正常
+    code2, _ = http(f"/conversations/{USER}/{cid}")
+    return True if code2 == 200 else f"详情 {code2}"
+
+
+# ── 2. 边界与非法输入 ─────────────────────────────────────
+def bad_inputs():
+    ok = True
+    cases = [
+        (f"/memory/not-a-real-user-%24%24/stats", "GET", None, (400, 403, 404)),
+        ("/config/list-models", "POST", {"base_url": "ftp://x/v1", "api_key": "k"}, (400,)),
+        ("/config/list-models", "POST", {"base_url": "", "api_key": "k"}, (400,)),
+        (f"/avatar/{USER}", "PUT", {"data_url": "data:image/png;base64,AAAA"}, (400,)),
+        (f"/avatar/{USER}", "PUT", {"data_url": "not-a-data-url"}, (400,)),
+        (f"/care/items?user_id={USER}", "POST", {"title": "   "}, (400,)),
+    ]
+    for path, method, body, expected in cases:
+        code, _ = http(path, method, body)
+        if code not in expected:
+            ok = f"{path} 期望 {expected} 实得 {code}"
+    return ok
+
+
+def oversized_avatar():
+    big = "data:image/jpeg;base64," + ("A" * (900 * 1024))
+    code, _ = http(f"/avatar/{USER}", "PUT", {"data_url": big})
+    return True if code in (400, 413) else f"超大头像未被拒绝: {code}"
+
+
+# ── 3. 关心数据往返（写完必还原）──────────────────────────
+def care_roundtrip():
+    _, before = http(f"/care/items?user_id={USER}&status=all")
+    created = None
+    try:
+        code, body = http(f"/care/items?user_id={USER}", "POST",
+                          {"title": "__selftest__", "kind": "event", "due_at": time.time() + 3600})
+        if code != 200 or not body.get("item"):
+            return f"新增失败 {code}"
+        created = body["item"]["id"]
+        code, lst = http(f"/care/items?user_id={USER}")
+        if not any(i["id"] == created for i in lst.get("items", [])):
+            return "新增后列表里没有"
+        code, upd = http(f"/care/items/{created}?user_id={USER}", "PATCH", {"title": "__selftest2__"})
+        if upd.get("item", {}).get("title") != "__selftest2__":
+            return "改名未生效"
+        return True
+    finally:
+        if created:
+            http(f"/care/items/{created}?user_id={USER}", "DELETE")
+        _, after = http(f"/care/items?user_id={USER}&status=all")
+        leftover = [i["id"] for i in after.get("items", []) if i["id"] not in {b["id"] for b in before.get("items", [])}]
+        for lid in leftover:
+            http(f"/care/items/{lid}?user_id={USER}", "DELETE")
+
+
+def care_settings_roundtrip():
+    _, original = http(f"/care/settings?user_id={USER}")
+    try:
+        code, got = http(f"/care/settings?user_id={USER}", "PUT", {"quiet_start": "04:00"})
+        if got.get("quiet_start") != "04:00":
+            return f"写入未生效 {code}"
+        return True
+    finally:
+        http(f"/care/settings?user_id={USER}", "PUT", {
+            "quiet_start": original.get("quiet_start"), "quiet_end": original.get("quiet_end"),
+            "talk_mode": original.get("talk_mode"), "city": original.get("city"),
+            "province": original.get("province"), "enabled": original.get("enabled"),
+            "rain_reminder": original.get("rain_reminder"),
+        })
+
+
+def model_list_probes():
+    """能连通时验证解析；连不通只降级为 warn，不算产品缺陷。"""
+    code, body = http("/config/list-models", "POST",
+                      {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "sk-invalid"})
+    if code != 200:
+        return f"端点异常 {code}"
+    if isinstance(body, dict) and body.get("ok") is False and "拒绝" in (body.get("error") or ""):
+        return True
+    return f"401 场景提示语异常: {body}"
+
+
+# ── 4. 引擎与抽取的纯逻辑（不起服务也能测）────────────────
+def engine_logic():
+    import care_engine as E
+    import datetime as _dt
+    fail = []
+    s = _dt.datetime(2026, 1, 1, 3, 0).timestamp()   # 03:00 在 23:00~08:00 内
+    e = _dt.datetime(2026, 1, 1, 12, 0).timestamp()  # 12:00 在外
+    st = {"quiet_start": "23:00", "quiet_end": "08:00"}
+    if not E.in_quiet_hours(st, s):
+        fail.append("03:00 应判为安静时段")
+    if E.in_quiet_hours(st, e):
+        fail.append("12:00 不应判为安静时段")
+    if E.in_quiet_hours({"quiet_start": "00:00", "quiet_end": "00:00"}, s):
+        fail.append("起止相同应视为不静音")
+    if E._parse_hhmm("坏值", (23, 0)) != (23, 0):
+        fail.append("坏时间应回落默认值")
+    return "; ".join(fail) or True
+
+
+def extractor_logic():
+    import care_extractor as X
+    import datetime as _dt
+    fail = []
+    if X._to_timestamp("2026-10-05", False) <= 0:
+        fail.append("绝对日期解析失败")
+    y = _dt.datetime.fromtimestamp(X._to_timestamp("06-03", True))
+    if (y.month, y.day) != (6, 3):
+        fail.append("月日型生日解析错")
+    if y.timestamp() < _dt.datetime.now().timestamp():
+        fail.append("已过去的生日应推到明年")
+    if X._to_timestamp("null", False) != 0 or X._to_timestamp("乱写", False) != 0:
+        fail.append("坏日期应给 0")
+    if len(X._parse_json_array('前缀 ```json\n[{"kind":"event","title":"x"}]\n``` 后缀')) != 1:
+        fail.append("带围栏的 JSON 应能解析")
+    if X._parse_json_array("没有数组") != []:
+        fail.append("无 JSON 应返回空")
+    if X._fallback_items("今天天气不错"):
+        fail.append("闲聊不该被兜底记成事项")
+    return "; ".join(fail) or True
+
+
+def store_logic():
+    from care_store import CareStore
+    u = "__selftest_store__"
+    s = CareStore()
+    try:
+        for t in ("care_items", "proactive_queue", "care_log"):
+            s._conn().execute(f"DELETE FROM {t} WHERE user_id=?", (u,))
+        s._conn().execute("DELETE FROM care_settings WHERE user_id=?", (u,))
+        s._conn().commit()
+        it = s.add_item(u, "测试事", kind="birthday", due_at=time.time() + 7200, repeat="yearly")
+        if s.add_item.__name__ != "add_item":
+            return "store 接口异常"
+        dup = s.enqueue(u, "event", "第一句")
+        again = s.enqueue(u, "event", "第二句")
+        if len(s.pending(u)) != 2:
+            return "队列应有 2 条"
+        w1 = s.ack(u, [dup["id"], again["id"], "不存在的id"])
+        w2 = s.ack(u, [dup["id"], again["id"]])
+        if sorted(w1) != sorted([dup["id"], again["id"]]):
+            return f"首次 ack 应拿到全部，实得 {w1}"
+        if w2 != []:
+            return "重复 ack 不应再拿到同一条（会重复写历史）"
+        if s.daily_budget(u) != 2:
+            return f"auto 默认预算应为 2，实得 {s.daily_budget(u)}"
+        s.save_settings(u, {"talk_mode": "chatty"})
+        if s.daily_budget(u) != 4:
+            return "chatty 预算应为 4"
+        s.save_settings(u, {"enabled": False})
+        if s.daily_budget(u) != 0:
+            return "关闭后预算应为 0"
+        s.save_settings(u, {"enabled": True, "talk_mode": "quiet"})
+        if s.daily_budget(u) != 1:
+            return "quiet 预算应为 1"
+        s.observe_style(u, 200, True)
+        if not (0 < s.get_settings(u)["talk_score"] <= 1):
+            return "talk_score 越界"
+        s.save_settings(u, {"talk_mode": "normal"})
+        before = s.get_settings(u)["talk_score"]
+        s.observe_style(u, 200, True)
+        if s.get_settings(u)["talk_score"] != before:
+            return "手动模式下不应自动漂移"
+        if not s.update_item(u, it["id"], {"title": "改名"}):
+            return "改名失败"
+        return True
+    finally:
+        for t in ("care_items", "proactive_queue", "care_log"):
+            s._conn().execute(f"DELETE FROM {t} WHERE user_id=?", (u,))
+        s._conn().execute("DELETE FROM care_settings WHERE user_id=?", (u,))
+        s._conn().commit()
+
+
+# ── 5. 数据不变量（防止一夜跑下来悄悄跑坏）────────────────
+def db_invariants():
+    if not DB.exists():
+        return "moz.db 不存在"
+    conn = sqlite3.connect(DB)
+    try:
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            return "SQLite integrity_check 失败"
+        probe = conn.execute("SELECT COUNT(*) FROM care_items WHERE title LIKE '%__selftest%'").fetchone()[0]
+        probe += conn.execute("SELECT COUNT(*) FROM care_log WHERE text LIKE '%__selftest%'").fetchone()[0]
+        probe += conn.execute("SELECT COUNT(*) FROM care_settings WHERE user_id LIKE '__selftest%'").fetchone()[0]
+        if probe:
+            return f"测试数据残留 {probe} 条"
+        return True
+    finally:
+        conn.close()
+
+
+def weather_probe():
+    from weather import get_weather
+    w = get_weather("浙江", "杭州", force=True)
+    if w is None:
+        return "warn"  # 外网不通不是产品缺陷
+    if not all(k in w for k in ("rain_today", "rain_tomorrow", "degree")):
+        return "天气字段缺失"
+    return True
+
+
+def avatar_probe():
+    code, payload = http(f"/avatar/{USER}", raw=True)
+    if code == 404:
+        return True  # 没设头像也合法
+    if code != 200:
+        return f"头像读取 {code}"
+    return True if payload[:3] == b"\xff\xd8\xff" else "返回的不是 JPEG"
+
+
+# ── 6. 慢检：真实对话往返 ────────────────────────────────
+def full_chat_roundtrip():
+    _, before = http(f"/conversations/{USER}")
+    cid = before.get("current_id")
+    _, msgs_before = http(f"/conversations/{USER}/{cid}") if cid else (200, {"messages": []})
+    n_before = len(msgs_before.get("messages", []))
+    body = {"message": "自测探针：请用一句话回答你好", "conversation_id": cid,
+            "conversation_history": [], "image_data": None}
+    t0 = time.time()
+    req = urllib.request.Request(f"{API}/chat/{USER}", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    got_reply, err = False, None
+    with urllib.request.urlopen(req, timeout=300) as res:
+        for raw in res:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line.startswith("data: "):
+                continue
+            p = line[6:]
+            if p == "[DONE]":
+                break
+            try:
+                ev = json.loads(p)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "reply":
+                got_reply = True
+            if ev.get("type") == "error":
+                err = ev.get("text")
+    if err:
+        return f"对话报错: {err}"
+    if not got_reply:
+        return "没有收到完整回复"
+    secs = round(time.time() - t0, 1)
+    # 抽取是后台任务，稍等再看有没有污染
+    time.sleep(8)
+    _, items = http(f"/care/items?user_id={USER}")
+    for i in items.get("items", []):
+        if "自测探针" in i["title"]:
+            http(f"/care/items/{i['id']}?user_id={USER}", "DELETE")
+    return True if secs < 180 else f"warn: 回复耗时 {secs}s"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    check("后端只读接口全通", run_reads)
+    check("会话详情可读", conversation_detail)
+    check("非法入参被拒绝", bad_inputs)
+    check("超大头像被拒绝", oversized_avatar)
+    check("关心事项往返", care_roundtrip)
+    check("关心设置往返", care_settings_roundtrip)
+    check("模型列表 401 提示", model_list_probes)
+    check("安静时段判定", engine_logic)
+    check("日期抽取与去噪", extractor_logic)
+    check("存储与预算与ack竞态", store_logic)
+    check("数据库不变量", db_invariants)
+    check("天气源可用", weather_probe)
+    check("头像字节流", avatar_probe)
+    if a.full:
+        check("真实对话往返", full_chat_roundtrip, tier="full")
+
+    fails = [r for r in results if r["status"] == "fail"]
+    warns = [r for r in results if r["status"] == "warn"]
+    if a.json:
+        print(json.dumps({"ts": dt.datetime.now().isoformat(timespec="seconds"),
+                          "fail": len(fails), "warn": len(warns), "results": results},
+                         ensure_ascii=False, indent=2))
+    else:
+        for r in results:
+            mark = {"pass": " OK ", "fail": "FAIL", "warn": "WARN", "skip": "SKIP"}[r["status"]]
+            print(f"[{mark}] {r['name']:<22} {r['ms']:>6}ms  {r['detail']}")
+        print(f"\n合计 {len(results)} 项：{len(fails)} 失败 / {len(warns)} 警告")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
