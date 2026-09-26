@@ -41,6 +41,8 @@ interface AppState {
   modelConfig: ModelConfig | null
   promptConfig: PromptConfig | null
   isLoading: boolean
+  /** 从发出到流结束：比 isLoading 长，isLoading 收到第一个字就false（打字指示条要让位给正文） */
+  streaming: boolean
   searchQuery: string
   statusText: string
   authRequired: boolean
@@ -95,6 +97,7 @@ export const useStore = create<AppState>((set, get) => ({
   modelConfig: null,
   promptConfig: null,
   isLoading: false,
+  streaming: false,
   searchQuery: '',
   statusText: '',
   authRequired: false,
@@ -303,7 +306,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   sendMessage: async function* (content, imageData) {
     const { userId, currentConvId, messages } = get()
-    set({ isLoading: true, statusText: '', error: null, lastFailedMessage: { content, imageData } })
+    set({ isLoading: true, streaming: true, statusText: '', error: null, lastFailedMessage: { content, imageData } })
 
     const userMsgId = nextMsgId()
     const userMsg: Message = { id: userMsgId, role: 'user', content, image: imageData || undefined }
@@ -368,12 +371,12 @@ export const useStore = create<AppState>((set, get) => ({
           get().loadMemoryStats()
           yield
         } else if (event.type === 'error') {
-          set({ isLoading: false, statusText: '' })
+          set({ isLoading: false, streaming: false, statusText: '' })
           throw new Error(event.text || 'Unknown error')
         }
       }
       // 中途点"停止"时流是正常结束的（没有抛错），这里必须收掉"正在回复"，否则输入框一直锁着
-      set({ isLoading: false, statusText: '' })
+      set({ isLoading: false, streaming: false, statusText: '' })
     } catch (e) {
       const errMsg: Message = {
         id: nextMsgId(),
@@ -381,7 +384,7 @@ export const useStore = create<AppState>((set, get) => ({
         content: chatErrorText(e),
       }
       if (!assistantAdded) {
-        set((s) => ({ messages: [...s.messages, errMsg], isLoading: false, statusText: '' }))
+        set((s) => ({ messages: [...s.messages, errMsg], isLoading: false, streaming: false, statusText: '' }))
       } else {
         set((s) => {
           const msgIndex = s.messages.findIndex((m) => m.id === assistantMsgId)
@@ -390,7 +393,7 @@ export const useStore = create<AppState>((set, get) => ({
           }
           const newMessages = [...s.messages]
           newMessages[msgIndex] = errMsg
-          return { messages: newMessages, isLoading: false, statusText: '' }
+          return { messages: newMessages, isLoading: false, streaming: false, statusText: '' }
         })
       }
     }

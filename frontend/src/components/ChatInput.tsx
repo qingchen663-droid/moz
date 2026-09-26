@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useStore } from '../store'
+import { stopGeneration } from '../api'
 import './ChatInput.css'
 
 interface ImageInfo {
@@ -24,9 +25,15 @@ export default function ChatInput() {
   const [imageData, setImageData] = useState<string | null>(null)
   const [imageInfo, setImageInfo] = useState<ImageInfo | null>(null)
   const [imageNotice, setImageNotice] = useState('')
-  const isLoading = useStore((s) => s.isLoading)
   const sendMessage = useStore((s) => s.sendMessage)
   const modelConfig = useStore((s) => s.modelConfig)
+  const streaming = useStore((s) => s.streaming)
+  const incoming = useStore((s) => {
+    for (let i = s.messages.length - 1; i >= 0; i--) {
+      if (s.messages[i].role === 'assistant') return s.messages[i].content.slice(-80)
+    }
+    return ''
+  })
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -51,7 +58,7 @@ export default function ChatInput() {
 
   const handleSubmit = useCallback(async () => {
     const trimmed = text.trim()
-    if ((!trimmed && !imageData) || isLoading) return
+    if (!trimmed && !imageData) return
     setText('')
     const payload = imageData || undefined
     clearImage()
@@ -59,7 +66,7 @@ export default function ChatInput() {
     for await (const _ of gen) {
       // consume
     }
-  }, [text, isLoading, imageData, sendMessage, clearImage])
+  }, [text, imageData, sendMessage, clearImage])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -135,6 +142,14 @@ export default function ChatInput() {
           </button>
         </div>
       )}
+      {streaming && (
+        <div className="chat-input-incoming">
+          <span className="chat-input-incoming-text">{incoming}</span>
+          <button className="chat-input-stop" onClick={stopGeneration} title="中断这次回复">
+            停止
+          </button>
+        </div>
+      )}
       <div className="chat-input-container">
         <textarea
           ref={textareaRef}
@@ -142,9 +157,8 @@ export default function ChatInput() {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="和我说说你的心事吧..."
+          placeholder={streaming ? '想到什么先发，moz 会接着回' : '和我说说你的心事吧...'}
           rows={1}
-          disabled={isLoading}
         />
         <div className="chat-input-actions">
           <button
@@ -179,7 +193,7 @@ export default function ChatInput() {
           <button
             className="chat-input-send"
             onClick={handleSubmit}
-            disabled={(!text.trim() && !imageData) || isLoading}
+            disabled={!text.trim() && !imageData}
             title="发送"
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">

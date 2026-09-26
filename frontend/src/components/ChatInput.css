@@ -173,3 +173,41 @@
   color: var(--color-text-muted);
   border-style: dashed;
 }
+
+/* 回复流过来时用户正在打字：把最新那句贴在输入框上方，并给一个真正的停止 */
+.chat-input-incoming {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 4px 6px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: rgba(120, 130, 160, 0.12);
+  color: var(--text-secondary, #6b7280);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.chat-input-incoming-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-input-stop {
+  flex: none;
+  padding: 3px 10px;
+  border: 1px solid rgba(120, 130, 160, 0.35);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-input-stop:hover {
+  border-color: var(--accent, #6366f1);
+  color: var(--accent, #6366f1);
+}

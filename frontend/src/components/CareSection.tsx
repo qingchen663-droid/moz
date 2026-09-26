@@ -37,15 +37,20 @@ export default function CareSection() {
   const [notice, setNotice] = useState('')
   const [dryRun, setDryRun] = useState('')
   const [busy, setBusy] = useState(false)
+  const [loadFailed, setLoadFailed] = useState(false)
 
   const reload = useCallback(async () => {
     const [s, i] = await Promise.all([api.getCareSettings(userId), api.getCareItems(userId)])
     setSettings(s)
     setItems(i.items)
+    setLoadFailed(false)
   }, [userId])
 
   useEffect(() => {
-    reload().catch(() => setNotice('读取关心设置失败，请确认后端在运行'))
+    reload().catch(() => {
+      setLoadFailed(true)
+      setNotice('读取关心设置失败，请确认后端在运行')
+    })
   }, [reload])
 
   const patch = (p: Partial<CareSettings>) => setSettings((cur) => (cur ? { ...cur, ...p } : cur))
@@ -65,9 +70,19 @@ export default function CareSection() {
     }
   }
 
-  const handleDelete = async (id: string) => {
-    await api.deleteCareItem(userId, id)
-    await reload()
+  const handleDelete = async (id: string, title: string) => {
+    if (!window.confirm(`确定不再提醒「${title}」？删掉后要重新让它记住。`)) return
+    setBusy(true)
+    setNotice('')
+    try {
+      await api.deleteCareItem(userId, id)
+      await reload()
+      setNotice(`已经不记着「${title}」了`)
+    } catch {
+      setNotice('删除失败，请确认后端在运行')
+    } finally {
+      setBusy(false)
+    }
   }
 
   const handleDryRun = async () => {
@@ -85,7 +100,14 @@ export default function CareSection() {
     }
   }
 
-  if (!settings) return <div className="care-loading">加载关心设置...</div>
+  if (!settings)
+    return (
+      <div className={loadFailed ? 'care-notice care-notice--fail' : 'care-loading'}>
+        {loadFailed
+          ? '读不到主动关心的设置：后端没在跑，或者这个接口挂了。下面的开关暂时点不动。'
+          : '加载关心设置...'}
+      </div>
+    )
 
   return (
     <div className="care-section">
@@ -199,7 +221,7 @@ export default function CareSection() {
                 </div>
                 <button
                   className="care-item-del"
-                  onClick={() => handleDelete(it.id)}
+                  onClick={() => handleDelete(it.id, it.title)}
                   title="忘掉这件事"
                 >
                   ✕
