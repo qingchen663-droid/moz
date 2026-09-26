@@ -216,6 +216,12 @@ def extractor_logic():
         fail.append("无 JSON 应返回空")
     if X._fallback_items("今天天气不错"):
         fail.append("闲聊不该被兜底记成事项")
+    got = X._fallback_items("我妈生日是10月5日，我下周三还有个面试")
+    birthday = next((g for g in got if g.get("kind") == "birthday"), None)
+    if not birthday:
+        fail.append("兜底认不出带空格的中文月日")
+    elif len(birthday["title"]) > 8 or "月" in birthday["title"]:
+        fail.append(f"兜底标题该只留事本身：{birthday['title']}")
     return "; ".join(fail) or True
 
 
@@ -448,6 +454,36 @@ def probe_cleaner_works():
     finally:
         conn.close()
         shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
+def care_extract_llm_probe():
+    """自动记事的主路径（大模型抽取）灵不灵：只问不写库，零污染。
+
+    中转经常整条回复是空的（这轮看图探针就撞上过一次），那属于环境问题报 warn；
+    只有"给了结果但是错了"才算缺陷。
+    """
+    sys.path.insert(0, str(ROOT / "backend"))
+    import care_extractor as X
+
+    try:
+        from llm_config import get_llm_client
+        client = get_llm_client(temperature=0.0, use_thinking=False)
+    except Exception as e:
+        return f"warn: 拿不到模型客户端（{type(e).__name__}）"
+
+    items = X.extract("我妈生日是10月5日，我下周三还有个面试", "好，我都记下了", client)
+    if not items:
+        return "warn: 模型那条没出可用结果，兜底也没接住（多半是空回复）"
+    if all(str(i.get("why", "")).startswith("规则兜底") for i in items):
+        return "warn: 只有规则兜底在撑着，模型那条是空的"
+    birthday = next((i for i in items if i.get("kind") == "birthday"), None)
+    if not birthday:
+        return f"生日没认出来：{items}"
+    if birthday.get("repeat") != "yearly" or not str(birthday.get("due_date") or "").endswith("10-05"):
+        return f"生日字段不对：{birthday}"
+    if X.extract("我最近睡不好，唉", "听起来挺难受的", client):
+        return "把情绪当成待办事项记下来了"
+    return True
 
 
 def css_uses_dvh():
@@ -755,6 +791,7 @@ def main():
         try:
             check("真实对话往返", full_chat_roundtrip, tier="full")
             check("中转看图能力", vision_probe, tier="full")
+            check("模型自动记事", care_extract_llm_probe, tier="full")
         finally:
             try:
                 print(f"[cleanup] 探针擦掉测试痕迹 {probe_cleanup()} 处")

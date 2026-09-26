@@ -105,7 +105,9 @@ def _fallback_items(user_msg: str) -> List[Dict[str, Any]]:
     if m:
         year_s, month, day = m.group(1), int(m.group(2)), int(m.group(3))
         yearly = bool(re.search(r"生日|过生|纪念日|忌日", user_msg))
-        title = re.sub(r"[的下在是]+$", "", _normalize_title(user_msg.replace(m.group(0), " "))) or clause
+        # 标题只取日期所在那半句，否则"我妈生日是10月5日，我下周三面试"会变成一长条
+        head = re.split(r"[，。,.!！?？;；]", user_msg.strip())[0]
+        title = re.sub(r"[的下在是]+$", "", _normalize_title(head.replace(m.group(0), " "))) or clause
         try:
             dt.datetime(2024, month, day)  # 先把"2 月 30 日"这种挡掉
             if yearly:
