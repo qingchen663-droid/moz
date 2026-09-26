@@ -125,7 +125,7 @@ export interface MemoryDetail {
 
 export interface WorkingMemory {
   summary: string
-  open_topics: string[]
+  open_topics: Array<string | { id?: string; topic?: string; status?: string; due_at?: number; created_at?: number }>
   current_emotion: string
   updated_at: number
 }

@@ -341,6 +341,109 @@ def full_chat_roundtrip():
     return True if secs < 180 else f"warn: 回复耗时 {secs}s"
 
 
+def vision_payload_contract():
+    """带图必 400 的回归：发给模型的图片必须是完整 data URL，且 text 不能是空串。"""
+    sys.path.insert(0, str(ROOT / "backend"))
+    import emotion_graph as eg
+    raw_b64 = "iVBORw0KGgoAAAANSUhEUg"  # 没前缀的裸 base64
+    msgs = eg._build_dialogue_messages({
+        "user_message": "", "image_data": "data:image/png;base64," + raw_b64,
+        "conversation_history": [], "memory_context": "", "emotion_analysis": None,
+        "emotion_summary": "", "working_memory_text": "", "profile_context": "",
+    })
+    blocks = msgs[-1].content
+    if not isinstance(blocks, list):
+        return "带图时不该退回纯文本"
+    url = blocks[0]["image_url"]["url"]
+    if not url.startswith("data:image/"):
+        return f"image_url 不是完整 data URL: {url[:30]}"
+    text = blocks[1]["text"]
+    if not text.strip():
+        return "纯图片时 text 为空，中转会判 Invalid chat format"
+    # 历史里的图片必须被剔掉，否则请求体会一路涨到中转拒收
+    hist = eg._sanitize_history([
+        {"role": "user", "content": "x" * 9000, "image": "data:image/png;base64," + raw_b64}
+    ] * 40)
+    if len(hist) > eg.HISTORY_MAX_MESSAGES:
+        return f"历史没截断：{len(hist)} 条"
+    if any(len(m["content"]) > eg.HISTORY_MAX_CHARS + 40 for m in hist):
+        return "历史单条没限长"
+    if any("data:image" in m["content"] for m in hist):
+        return "历史里还留着图片 data URL"
+    return True
+
+
+def model_capability_roundtrip():
+    """多模态声明要能读回来：否则用户勾了"能看图"，刷新就说不支持。"""
+    _, cfg = http("/config/model")
+    if "multimodal" not in cfg or "multimodal_declared" not in cfg:
+        return f"缺字段: {sorted(cfg)}"
+    if cfg["multimodal_declared"] and not isinstance(cfg["multimodal"], bool):
+        return "declared 为真但 multimodal 不是布尔"
+    return True
+
+
+def export_covers_care():
+    """导出必须带上关心那块，否则"备份"恢复出来生日和提醒是空的。"""
+    code, data = http(f"/export/{USER}")
+    if code != 200:
+        return f"导出 {code}"
+    care = data.get("care") or {}
+    if "items" not in care or "settings" not in care:
+        return f"导出缺 care: {sorted(data)}"
+    if data.get("version", 0) < 2:
+        return f"快照版本没升上来: {data.get('version')}"
+    return True
+
+
+def rate_limit_not_hostile():
+    """本地应用翻界面就会被限流打掉，是这夜实测到的：连打 80 次只读接口都得过。"""
+    bad = 0
+    for _ in range(80):
+        code, _r = http("/health", timeout=5)
+        if code == 429:
+            bad += 1
+    return True if bad == 0 else f"80 次里有 {bad} 次被 429"
+
+
+def vision_probe():
+    """中转的视觉稳不稳只报事实，不当失败：同一张图它确实会一会儿对一会儿白。"""
+    import base64 as b64
+    import io as _io
+    from PIL import Image
+
+    def png(color):
+        buf = _io.BytesIO()
+        Image.new("RGB", (200, 200), color).save(buf, format="PNG")
+        return "data:image/png;base64," + b64.b64encode(buf.getvalue()).decode()
+
+    def ask(img):
+        body = {"message": "这张图是什么颜色？只回颜色名", "conversation_history": [], "image_data": img}
+        req = urllib.request.Request(f"{API}/chat/{USER}", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        out = []
+        with urllib.request.urlopen(req, timeout=200) as res:
+            for raw in res:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    ev = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") == "token":
+                    out.append(ev.get("text", ""))
+                elif ev.get("type") in ("done", "error"):
+                    break
+        return "".join(out)
+
+    red = ask(png((220, 30, 30)))
+    green = ask(png((30, 120, 40)))
+    hits = ("红" in red) + ("绿" in green)
+    if hits == 2:
+        return True
+    return f"warn: 看图不稳（红→{red[:18] or '空回复'} / 绿→{green[:18] or '空回复'}）"
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
@@ -354,6 +457,10 @@ def main():
     check("关心事项往返", care_roundtrip)
     check("关心设置往返", care_settings_roundtrip)
     check("模型列表 401 提示", model_list_probes)
+    check("图片请求格式契约", vision_payload_contract)
+    check("多模态声明可读回", model_capability_roundtrip)
+    check("导出覆盖关心事项", export_covers_care)
+    check("限流不误伤本地", rate_limit_not_hostile)
     check("安静时段判定", engine_logic)
     check("日期抽取与去噪", extractor_logic)
     check("存储与预算与ack竞态", store_logic)
@@ -362,6 +469,7 @@ def main():
     check("头像字节流", avatar_probe)
     if a.full:
         check("真实对话往返", full_chat_roundtrip, tier="full")
+        check("中转看图能力", vision_probe, tier="full")
 
     fails = [r for r in results if r["status"] == "fail"]
     warns = [r for r in results if r["status"] == "warn"]

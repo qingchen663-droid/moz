@@ -179,6 +179,12 @@ export default function MemoryViewerModal({ onClose }: Props) {
     }
   }
 
+  // 后端的工作话题是结构化对象（带状态和到期时间），老数据可能是纯字符串；
+  // 直接当字符串渲染会让整个应用崩掉
+  const openTopics: string[] = (memoryData?.working_memory?.open_topics ?? [])
+    .map((t) => (typeof t === 'string' ? t : (t?.topic ?? '')))
+    .filter((t) => t && t !== 'null')
+
   return (
     <div className="mem-viewer-overlay" onClick={onClose}>
       <div className="mem-viewer-content" onClick={(e) => e.stopPropagation()}>
@@ -195,9 +201,9 @@ export default function MemoryViewerModal({ onClose }: Props) {
           <div className="mem-working-bar">
             <div className="mem-working-label">工作记忆</div>
             <div className="mem-working-summary">{memoryData.working_memory.summary}</div>
-            {memoryData.working_memory.open_topics.length > 0 && (
+            {openTopics.length > 0 && (
               <div className="mem-working-topics">
-                {memoryData.working_memory.open_topics.map((t, i) => (
+                {openTopics.map((t, i) => (
                   <span key={i} className="mem-topic-tag">
                     {t}
                   </span>
@@ -268,7 +274,7 @@ export default function MemoryViewerModal({ onClose }: Props) {
               <MemoryList
                 memories={visibleMemories}
                 total={allMemories.length}
-                filtered={Boolean(query.trim()) || layerFilter !== 'all'}
+                querying={Boolean(query.trim())}
                 onForget={forget}
                 onWrong={sayWrong}
               />
@@ -479,13 +485,13 @@ const LAYER_BADGES: Record<string, { label: string; cls: string }> = {
 function MemoryList({
   memories,
   total,
-  filtered,
+  querying,
   onForget,
   onWrong,
 }: {
   memories: (MemoryDetail & { layer: 'core' | 'important' | 'regular' })[]
   total: number
-  filtered: boolean
+  querying: boolean
   onForget: (m: MemoryDetail & { layer: 'core' | 'important' | 'regular' }) => void
   onWrong: (m: MemoryDetail) => void
 }) {
@@ -497,7 +503,11 @@ function MemoryList({
     )
   }
   if (memories.length === 0) {
-    return <div className="mem-empty">这堆里没有匹配的。换个词，或者点上面的"全部"。</div>
+    return (
+      <div className="mem-empty">
+        {querying ? '没搜到。换个词试试，或者点上面的"全部"。' : '这一层还没有东西，点上面的"全部"看别的。'}
+      </div>
+    )
   }
 
   return (

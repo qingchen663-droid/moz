@@ -464,6 +464,8 @@ def _build_dialogue_messages(state: AgentState) -> list:
         # 纯图片消息的 text 也不能是空串，同一个报错
         url = image_data if image_data.startswith("data:") else f"data:image/jpeg;base64,{image_data}"
         caption = (state.get("user_message") or "").strip() or "帮我看看这张图"
+        # 只补一句兜底。写过"看不清就别回答"，结果它对所有图都改口说看不清，功能等于废掉
+        caption += "\n\n（按你这次实际看到的回答，别参考以前说过的）"
         user_content = [
             {"type": "image_url", "image_url": {"url": url}},
             {"type": "text", "text": caption},

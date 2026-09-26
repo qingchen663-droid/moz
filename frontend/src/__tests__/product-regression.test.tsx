@@ -247,3 +247,31 @@ describe('危险操作先问再做', () => {
     expect(document.querySelector('.confirm-dialog')).toBeFalsy()
   })
 })
+
+describe('后端结构变化不能弄崩应用', () => {
+  it('工作话题是结构化对象时，认知界面照样打得开', async () => {
+    const { default: MemoryViewerModal } = await import('../components/MemoryViewerModal')
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : String(input)
+      if (url.includes('/detail'))
+        return mockResponse({
+          layers: { core: [], important: [], regular: [] },
+          working_memory: {
+            summary: '在换工作',
+            // 真实形状：OpenLoop 对象，不是字符串
+            open_topics: [
+              { id: 'a1', topic: '下周面试', status: 'waiting', due_at: 0, created_at: 0 },
+              '老数据：纯字符串',
+            ],
+          },
+        })
+      if (url.includes('/profile/')) return mockResponse({ profile: null })
+      return mockResponse({ summaries: [] })
+    }) as typeof fetch
+
+    render(<MemoryViewerModal onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('.mem-working-bar')).toBeTruthy())
+    const tags = [...document.querySelectorAll('.mem-topic-tag')].map((e) => e.textContent?.trim())
+    expect(tags).toEqual(['下周面试', '老数据：纯字符串'])
+  })
+})
