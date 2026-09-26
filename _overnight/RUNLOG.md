@@ -1,8 +1,8 @@
 # moz 整夜自测与产品审核运行日志
 
-开始：2026-09-26 23:00 左右　·　本页最后更新：2026-09-27 03:16（第三轮 + 追加两批）
+开始：2026-09-26 23:00 左右　·　本页最后更新：2026-09-27 03:45（第三轮 + 追加三批）
 执行方式：全局测试台 → 产品经理视角审核 → 逐条修复 → 复测 → 每修一条提交一次。
-**当前门禁：selftest 22 项（--full 26 项）+ vitest 48 条 + tsc 无输出。** 本轮记录在页尾"第三轮"。
+**当前门禁：selftest 22 项（--full 26 项）+ vitest 49 条 + tsc 无输出。** 本轮记录在页尾"第三轮"。
 
 ## 怎么跑（明天早上你自己验也是这两条）
 
@@ -14,7 +14,7 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py
 # 它跑完会自己擦掉写进库里的测试痕迹；两次全量之间隔 60s，否则会被自己的限流打掉
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py --full
 
-# 前端：类型检查 + 48 个结构回归
+# 前端：类型检查 + 49 个结构回归
 cd frontend && npx tsc -b && npx vitest run
 ```
 
@@ -192,8 +192,8 @@ cd frontend && npx tsc -b && npx vitest run
 
 ## 交接：下一轮从这里接
 
-门禁：`PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py`（21 项）
-+ `cd frontend && npx tsc -b && npx vitest run`（47 条）。工作树干净，HEAD 见 `git log`。
+门禁：`PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py`（22 项）
++ `cd frontend && npx tsc -b && npx vitest run`（49 条）。工作树干净，HEAD 见 `git log`。
 
 ### 02:50–03:16 又做了一批（同样每条一个提交）
 
@@ -233,6 +233,15 @@ selftest 新增 `聊到日子自己记下`（端到端跑 harvest()，临时用�
 
 **最新一次实测：`selftest --full` = 26 项 0 失败 / 1 警告（还是中转看图），
 跑完 web_user_001 仍然是 0 条记忆、2 句对话、0 件事项。**
+
+### 03:45 收尾：后端没开时该说什么
+
+本地陪伴应用最容易出的故障就是后端没跑，而界面上原来写的是
+「记忆统计加载失败」「模型配置加载失败」这种既看不出后果也给不了动作的话；
+`历史对话` 那条更糟 —— 请求直接抛出去没人接（未捕获异常）。
+现在四类读取失败统一成一句能照着做的：**「XX 读不到：后端像是没在跑。双击项目里的 moz-app.bat 重新打开就好。」**
+`loadConversations` 自己兜住，`loadUsers()`（界面上早就没有多用户入口了）失败也不再污染控制台。
+门禁：selftest 22 项、vitest 49 条、tsc 无输出，全绿。
 
 ### 还剩这些会让人皱眉
 
