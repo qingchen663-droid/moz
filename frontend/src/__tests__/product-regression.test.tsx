@@ -109,6 +109,28 @@ describe('图片上传入口', () => {
     await waitFor(() => expect(document.querySelector('.chat-input-attach')).toBeTruthy())
     expect(document.querySelector('.chat-input-attach')?.className).toContain('chat-input-attach--muted')
   })
+
+  it('勾了多模态也不承诺看得清：中转真的会丢图', async () => {
+    multimodalFlag = true
+    render(<App />)
+    await waitFor(() => expect(document.querySelector('.chat-input-attach')).toBeTruthy())
+    const btn = document.querySelector<HTMLElement>('.chat-input-attach')!
+    expect(btn.className).not.toContain('muted')
+    expect(btn.title).not.toContain('我会看图内容')
+    expect(btn.title).toContain('不一定准')
+  })
+
+  it('会话列表接口返回半截响应也不会弄崩应用', async () => {
+    const base = globalThis.fetch
+    globalThis.fetch = (async () => mockResponse({})) as typeof fetch
+    try {
+      await useStore.getState().loadConversations()
+    } finally {
+      globalThis.fetch = base
+    }
+    expect(useStore.getState().conversations).toEqual([])
+    expect(useStore.getState().currentConvId).toBeNull()
+  })
 })
 
 describe('主动消息接收', () => {

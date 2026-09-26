@@ -139,8 +139,9 @@ export const useStore = create<AppState>((set, get) => ({
     const { userId } = get()
     const data = await api.getConversations(userId)
     set({
-      conversations: data.conversations,
-      currentConvId: data.current_id,
+      // 后端半启动时这里可能拿到空对象，不兜住会让历史列表整块崩掉
+      conversations: Array.isArray(data.conversations) ? data.conversations : [],
+      currentConvId: data.current_id || null,
     })
   },
 

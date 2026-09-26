@@ -37,8 +37,13 @@ def check(name, fn, tier="fast"):
     t0 = time.time()
     try:
         r = fn()
-        status = "pass" if r in (True, None) else ("warn" if r == "warn" else "fail")
-        detail = "" if r in (True, None) else str(r)[:160]
+        if r in (True, None):
+            status, detail = "pass", ""
+        elif isinstance(r, str) and (r == "warn" or r.startswith("warn")):
+            # 环境类问题（外网不通、中转丢图、回复慢）不该算产品缺陷
+            status, detail = "warn", r[:160]
+        else:
+            status, detail = "fail", str(r)[:160]
     except SkipCheck as e:
         status, detail = "skip", str(e)[:160]
     except Exception as e:

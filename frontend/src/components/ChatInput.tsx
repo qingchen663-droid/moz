@@ -106,7 +106,9 @@ export default function ChatInput() {
             height: probe.naturalHeight,
           })
           setImageNotice(
-            modelConfig?.multimodal ? '' : '当前模型未标记为能看图，发送前请到「模型」勾选多模态'
+            modelConfig?.multimodal
+              ? '图会一起发过去。这条通道偶尔丢图，我说的不一定准'
+              : '当前模型未标记为能看图，发送前请到「模型」勾选多模态'
           )
           setImagePreview(result)
           setImageData(result)
@@ -166,8 +168,8 @@ export default function ChatInput() {
             onClick={() => fileRef.current?.click()}
             title={
               modelConfig?.multimodal
-                ? '上传图片，我会看图内容'
-                : '上传图片（当前模型未标记能看图，请到「模型」勾选多模态）'
+                ? '上传图片（这条通道偶尔丢图，我说的不一定准）'
+                : '上传图片（当前模型未标记能看图，请到「模型」勾选）'
             }
           >
             <svg

@@ -309,12 +309,12 @@ export default function ModelDialog({ onClose }: Props) {
                       checked={formMultimodal}
                       onChange={(e) => setFormMultimodal(e.target.checked)}
                     />
-                    <span>这个模型能看懂图片（多模态）</span>
+                    <span>这个模型支持发图（多模态）</span>
                   </label>
                   <div className="model-vision-hint">
                     {formMultimodal
-                      ? '已开启：聊天输入框会显示上传图片的按钮，发来的图片会交给模型识别。'
-                      : '未开启：模型名里没有视觉关键词时默认关闭。如果你的服务方其实支持图片，勾上它才能让我看懂你发的图。'}
+                      ? '已开启：输入框会出现上传按钮，图会跟着话一起发出去。这条中转有时会丢图，我说的不一定准。'
+                      : '未开启：模型名里没有视觉关键词时默认关闭。如果你的服务方其实支持图片，勾上才会显示上传按钮。'}
                   </div>
                 </div>
 
