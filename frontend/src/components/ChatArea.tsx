@@ -14,8 +14,8 @@ export default function ChatArea() {
   const retryLastMessage = useStore((s) => s.retryLastMessage)
   const memoryStats = useStore((s) => s.memoryStats)
   const bottomRef = useRef<HTMLDivElement>(null)
-  // 一条记忆都没有 = 第一次打开，该教一句怎么用
-  const firstTime = (memoryStats?.total ?? 0) === 0
+  // 统计还没读回来时别当人是新用户：那时光标一抖，老用户会看到"第一次怎么上手"
+  const firstTime = memoryStats !== null && memoryStats.total === 0
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -25,7 +25,9 @@ export default function ChatArea() {
     <div className="chat-area">
       <header className="chat-header">
         <h2 className="chat-header-title">moz</h2>
-        <span className="chat-header-subtitle">长期记忆 · {memoryStats?.total ?? 0} 条</span>
+        <span className="chat-header-subtitle">
+          {memoryStats ? `长期记忆 · ${memoryStats.total} 条` : '长期记忆'}
+        </span>
       </header>
 
       <div className="chat-messages">

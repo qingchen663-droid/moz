@@ -187,6 +187,25 @@ describe('冷启动：第一眼得知道下一步干什么', () => {
     await waitFor(() => expect(document.querySelector('.chat-welcome')).toBeTruthy())
     expect(welcome()).not.toContain('想先试一下')
   })
+
+  it('统计还没读回来时别先喊"0 条"、也别当成新用户', async () => {
+    const base = globalThis.fetch
+    // 让 /memory 一直不返回，模拟"刚打开、统计还在路上"
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes('/memory')) return new Promise(() => {})
+      return base(input as RequestInfo)
+    }) as typeof fetch
+    try {
+      useStore.setState({ messages: [], memoryStats: null })
+      render(<App />)
+      await waitFor(() => expect(document.querySelector('.chat-welcome')).toBeTruthy())
+      expect(document.querySelector('.chat-header-subtitle')?.textContent).toBe('长期记忆')
+      expect(welcome()).not.toContain('想先试一下')
+    } finally {
+      globalThis.fetch = base
+    }
+  })
 })
 
 describe('人设弹窗：读不到要说清楚，没保存要问一句', () => {
