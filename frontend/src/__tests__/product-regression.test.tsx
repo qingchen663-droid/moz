@@ -288,6 +288,36 @@ describe('弹窗基本规矩：认得出自己是什么，Esc 关得掉', () => 
   })
 })
 
+describe('崩了之后', () => {
+  it('要说清"数据不会丢"，按钮必须真的重新载入，不许写"联系开发者"', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const reload = vi.fn()
+    // jsdom 的 location.reload 改不动（unforgeable），只能整个换掉
+    vi.stubGlobal('location', { ...window.location, reload })
+    const Boom = () => {
+      throw new Error('渲染期崩溃')
+    }
+    try {
+      const { default: ErrorBoundary } = await import('../components/ErrorBoundary')
+      render(
+        <ErrorBoundary>
+          <Boom />
+        </ErrorBoundary>
+      )
+      const text = document.body.textContent || ''
+      expect(text).toContain('重新载入')
+      expect(text).toContain('不会')
+      expect(text).not.toContain('联系开发者')
+      fireEvent.click(screen.getByText('重新载入'))
+      expect(reload, '按钮没真的重新载入').toHaveBeenCalledTimes(1)
+    } finally {
+      vi.unstubAllGlobals()
+      errSpy.mockRestore()
+      cleanup()
+    }
+  })
+})
+
 describe('图片上传入口', () => {
   it('模型未声明能看图时上传按钮仍在（只是低调态）', async () => {
     render(<App />)

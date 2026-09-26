@@ -405,13 +405,17 @@ def probe_cleaner_works():
 
 
 def css_uses_dvh():
-    """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。"""
+    """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。
+
+    连 .tsx 里的内联 style 一起扫——崩溃页的 100vh 就写在内联样式里，只查 .css 会漏。
+    """
     bad = []
-    for f in sorted((ROOT / "frontend" / "src").rglob("*.css")):
+    src = ROOT / "frontend" / "src"
+    for f in sorted(list(src.rglob("*.css")) + list(src.rglob("*.tsx"))):
         text = f.read_text(encoding="utf-8", errors="replace")
         hits = re.findall(r"\b\d+(?:\.\d+)?vh\b", text)
         if hits:
-            bad.append(f"{f.name}:{len(hits)}")
+            bad.append(f"{f.name}×{len(hits)}")
     if bad:
         return "还在用 vh，改 dvh：" + " ".join(bad)
     return True

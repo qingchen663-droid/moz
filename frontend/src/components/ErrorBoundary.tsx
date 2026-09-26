@@ -20,7 +20,9 @@ export default class ErrorBoundary extends Component<Props, State> {
   }
 
   handleReload = () => {
-    this.setState({ hasError: false, error: null })
+    // 渲染期报错往往是确定性的：只在内存里清掉状态，下一帧会再崩一次。
+    // 对不懂技术的用户来说，"刷新一下"是唯一说得通、也真能自救的动作。
+    window.location.reload()
   }
 
   render() {
@@ -31,7 +33,7 @@ export default class ErrorBoundary extends Component<Props, State> {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            height: '100vh',
+            height: '100dvh',
             background: '#F9F6F2',
             fontFamily:
               "'Segoe UI', 'SF Pro Display', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif",
@@ -67,12 +69,13 @@ export default class ErrorBoundary extends Component<Props, State> {
             <h2
               style={{ color: '#2D2420', marginBottom: '8px', fontSize: '20px', fontWeight: 700 }}
             >
-              出了点问题
+              界面崩了一下
             </h2>
             <p
               style={{ color: '#7A6E64', fontSize: '14px', marginBottom: '24px', lineHeight: 1.7 }}
             >
-              应用遇到了一个意外错误。请尝试刷新页面，如果问题持续存在，请联系开发者。
+              界面刚才崩了一下。点「重新载入」就好——你说过的话和它记住的东西都存在这台电脑上，
+              不会因为这次崩溃丢掉。
             </p>
             <details style={{ marginBottom: '20px', textAlign: 'left' }}>
               <summary style={{ cursor: 'pointer', color: '#B0A59A', fontSize: '12px' }}>
@@ -116,7 +119,7 @@ export default class ErrorBoundary extends Component<Props, State> {
                 ;(e.target as HTMLElement).style.background = '#D4785C'
               }}
             >
-              重试
+              重新载入
             </button>
           </div>
         </div>
