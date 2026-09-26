@@ -21,8 +21,8 @@
   border-radius: var(--radius-xl);
   width: 720px;
   max-width: 92vw;
-  height: 82vh;
-  max-height: 92vh;
+  height: 82dvh;
+  max-height: 92dvh;
   display: flex;
   flex-direction: column;
   box-shadow: var(--shadow-lg);

@@ -1,7 +1,12 @@
 /* PromptDialog.css - 精致治愈系人设配置 */
 
 .prompt-dialog {
+  /* 没有 width 时，flex 居中的弹窗会缩到内容宽度；没有 max-height 时，
+     编辑态的长文本框会把"保存"按钮顶出矮窗口（PWA 里点不到） */
+  width: 92%;
   max-width: 620px;
+  max-height: 86dvh;
+  overflow-y: auto;
   background: #ffffff;
   border-radius: 20px;
   box-shadow:

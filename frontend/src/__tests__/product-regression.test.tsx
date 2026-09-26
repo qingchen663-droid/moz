@@ -322,6 +322,27 @@ describe('记忆可读可改：能筛选、能纠错', () => {
   })
 })
 
+describe('仓库杂物', () => {
+  // tsconfig 没装 @types/node；.tsx 能按文本 glob 到，.css 只能拿到文件名（Vite 会吞掉 ?raw）
+  const compFiles = import.meta.glob('../components/*', {
+    query: '?raw',
+    import: 'default',
+    eager: true,
+  }) as Record<string, string>
+
+  it('不留 .bak / .timestamp / 没人 import 的孤儿样式', () => {
+    const junk = Object.keys(compFiles).filter((f) => /\.bak$|\.timestamp$|\.new\.css$/.test(f))
+    expect(junk).toEqual([])
+    const tsx = Object.entries(compFiles).filter(([f]) => f.endsWith('.tsx'))
+    expect(tsx.length).toBeGreaterThan(5)
+    for (const file of Object.keys(compFiles)) {
+      if (!file.endsWith('.css')) continue
+      const name = file.split('/').pop()!
+      expect(tsx.some(([, src]) => src.includes(name)), `${name} 没人 import，是孤儿样式`).toBe(true)
+    }
+  })
+})
+
 describe('危险操作先问再做', () => {
   it('选完快照文件不立刻覆盖，确认之后才发 import 请求', async () => {
     const posts: string[] = []

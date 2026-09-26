@@ -23,7 +23,7 @@
   border-radius: 20px;
   width: 90%;
   max-width: 560px;
-  max-height: 88vh;
+  max-height: 88dvh;
   display: flex;
   flex-direction: column;
   box-shadow: 0 20px 40px rgba(45, 36, 32, 0.16), 0 0 0 1px rgba(212, 120, 92, 0.08);
@@ -552,9 +552,8 @@
 }
 
 /* ── 通用对话框基础件 ─────────────────────────────
-   ConfirmDialog / PromptDialog 依赖这些类，此前只存在于
-   未被 import 的 ModelDialog.new.css 里，导致弹窗裸奔。
-   PromptDialog.css 用的是更高优先级的作用域选择器，不受影响。 */
+   ConfirmDialog / PromptDialog 也用这些类：样式必须留在 ModelDialog.css
+   这个真被 import 的文件里，别挪回孤儿文件（曾经因此弹窗裸奔）。 */
 .dialog-title {
   font-size: 19px;
   font-weight: 700;

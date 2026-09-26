@@ -20,8 +20,8 @@
   border-radius: var(--radius-xl);
   width: 90vw;
   max-width: 96vw;
-  height: 85vh;
-  max-height: 94vh;
+  height: 85dvh;
+  max-height: 94dvh;
   min-width: 400px;
   min-height: 300px;
   display: flex;

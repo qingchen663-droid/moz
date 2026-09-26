@@ -15,6 +15,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -333,6 +334,31 @@ def care_switch_logic():
         s._conn().commit()
 
 
+def css_uses_dvh():
+    """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。"""
+    bad = []
+    for f in sorted((ROOT / "frontend" / "src").rglob("*.css")):
+        text = f.read_text(encoding="utf-8", errors="replace")
+        hits = re.findall(r"\b\d+(?:\.\d+)?vh\b", text)
+        if hits:
+            bad.append(f"{f.name}:{len(hits)}")
+    if bad:
+        return "还在用 vh，改 dvh：" + " ".join(bad)
+    return True
+
+
+def frontend_no_junk():
+    """孤儿样式/备份文件：曾经因为弹窗样式只在 ModelDialog.new.css 里而整块裸奔。"""
+    comp = ROOT / "frontend" / "src" / "components"
+    files = [p.name for p in comp.iterdir()]
+    junk = [f for f in files if f.endswith((".bak", ".timestamp")) or f.endswith(".new.css")]
+    if junk:
+        return f"杂物文件：{junk}"
+    tsx_text = "\n".join(p.read_text(encoding="utf-8") for p in comp.glob("*.tsx"))
+    orphans = [f for f in files if f.endswith(".css") and f not in tsx_text]
+    return True if not orphans else f"没人 import 的孤儿样式：{orphans}"
+
+
 # ── 5. 数据不变量（防止一夜跑下来悄悄跑坏）────────────────
 def db_invariants():
     if not DB.exists():
@@ -539,6 +565,8 @@ def main():
     check("数据库不变量", db_invariants)
     check("天气源可用", weather_probe)
     check("头像字节流", avatar_probe)
+    check("前端高度用dvh", css_uses_dvh)
+    check("前端无孤儿杂物", frontend_no_junk)
     if a.full:
         check("真实对话往返", full_chat_roundtrip, tier="full")
         check("中转看图能力", vision_probe, tier="full")
