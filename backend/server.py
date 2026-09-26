@@ -424,6 +424,7 @@ def _append_assistant_message(user_id: str, text: str) -> None:
             convs[current_id] = conv
         conv.setdefault("messages", []).append({"role": "assistant", "content": text})
         store.save(user_id, convs, current_id)
+    care_engine.note_bot_reply(user_id)  # 主动说出去的也算"moz 刚回过"
 
 
 # ================================================================
@@ -442,7 +443,10 @@ async def chat(user_id: str, req: ChatRequest):
     care_store: Optional[CareStore] = _app_state.get("care_store")
     if care_store:
         care_store.observe_style(
-            user_id, len(req.message or ""), user_initiated=gap_seconds > 1800 or gap_seconds == 0.0
+            user_id,
+            len(req.message or ""),
+            since_user_msg=gap_seconds,
+            since_bot_reply=care_engine.seconds_since_bot_reply(user_id),
         )
 
     store: ConversationStore = _app_state["conversation_store"]
@@ -511,6 +515,8 @@ async def chat(user_id: str, req: ChatRequest):
 
                 store.save(user_id, convs, active_cid)
 
+            if reply.strip():
+                care_engine.note_bot_reply(user_id)  # 用户接话快不快，从这里起算
             yield f"data: {json.dumps({'type': 'done', 'conversation_id': active_cid})}\n\n"
 
         except Exception as e:
@@ -987,13 +993,17 @@ async def remove_care_item(user_id: str, item_id: str):
 @app.get("/api/care/settings", dependencies=[Depends(verify_access_key)])
 async def get_care_settings(user_id: str):
     user_id = normalize_user_id(user_id)
-    return _app_state["care_store"].get_settings(user_id)
+    store: CareStore = _app_state["care_store"]
+    # 顺带给换算结果：界面要显示"一天最多主动找你几次"，而不是 talk_score 那种内部数字
+    return {**store.get_settings(user_id), "budget_today": store.daily_budget(user_id)}
 
 
 @app.put("/api/care/settings", dependencies=[Depends(verify_access_key)])
 async def update_care_settings(user_id: str, patch: dict):
     user_id = normalize_user_id(user_id)
-    return _app_state["care_store"].save_settings(user_id, patch or {})
+    store: CareStore = _app_state["care_store"]
+    saved = store.save_settings(user_id, patch or {})
+    return {**saved, "budget_today": store.daily_budget(user_id)}
 
 
 @app.get("/api/care/pending", dependencies=[Depends(verify_access_key)])

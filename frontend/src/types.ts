@@ -70,12 +70,18 @@ export interface CareItem {
 
 export interface CareSettings {
   enabled: boolean
+  /** 到点提醒记下的事：生日、面试、复诊 */
+  remind_events: boolean
+  /** 平时没来由地主动搭话：问候、追问上次没说完的话头 */
+  initiate_chat: boolean
   province: string
   city: string
   quiet_start: string
   quiet_end: string
   talk_mode: 'auto' | 'quiet' | 'normal' | 'chatty'
   talk_score: number
+  /** 后端换算结果：没来由的搭话一天最多几条 */
+  budget_today?: number
   rain_reminder: boolean
   user_id?: string
 }

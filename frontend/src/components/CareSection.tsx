@@ -15,10 +15,10 @@ const KIND_LABELS: Record<CareKind, string> = {
 }
 
 const TALK_LABELS: Record<CareSettings['talk_mode'], string> = {
-  auto: '自动（按你的习惯判断）',
-  quiet: '话少：每天最多 1 次',
-  normal: '适中：每天最多 2 次',
-  chatty: '话多：每天最多 4 次',
+  auto: '自动（按你的聊法判断）',
+  quiet: '偏安静：搭话每天最多 1 次',
+  normal: '适中：搭话每天最多 2 次',
+  chatty: '爱聊：搭话每天最多 4 次',
 }
 
 function fromEpoch(sec: number): string {
@@ -92,8 +92,8 @@ export default function CareSection() {
       const first = res.would_say[0]
       setDryRun(
         first
-          ? `「${first.text}」— 理由：${first.why}`
-          : '此刻没有够格开口的理由（可能正处安静时段，或今日配额已用完）'
+          ? `「${first.text}」— 为什么是现在：${first.why}`
+          : '此刻没有该说的：要么没到点的事，要么我今天的话已经说够了。'
       )
     } catch {
       setDryRun('判定失败，请确认后端在运行')
@@ -115,10 +115,18 @@ export default function CareSection() {
         <label className="care-switch">
           <input
             type="checkbox"
-            checked={settings.enabled}
-            onChange={(e) => patch({ enabled: e.target.checked })}
+            checked={settings.remind_events}
+            onChange={(e) => patch({ remind_events: e.target.checked })}
           />
-          <span>允许 moz 主动找我说话</span>
+          <span>到点提醒我：生日、面试、复诊这些我记着的事</span>
+        </label>
+        <label className="care-switch">
+          <input
+            type="checkbox"
+            checked={settings.initiate_chat}
+            onChange={(e) => patch({ initiate_chat: e.target.checked })}
+          />
+          <span>平时没来由地找我说话：问候一句、追上次没说完的</span>
         </label>
         <label className="care-switch">
           <input
@@ -128,6 +136,7 @@ export default function CareSection() {
           />
           <span>要下雨时提醒带伞</span>
         </label>
+        <div className="care-hint">前两个是分开的：只勾第一个，我不会没话找话。</div>
       </div>
 
       <div className="care-grid">
@@ -182,12 +191,12 @@ export default function CareSection() {
             </option>
           ))}
         </select>
-        {settings.talk_mode === 'auto' && (
-          <span className="care-hint">
-            当前自动判断值 {(settings.talk_score * 100).toFixed(0)}
-            %，会随你回复的长短和主动程度慢慢调
-          </span>
-        )}
+        <span className="care-hint">
+          {settings.talk_mode === 'auto'
+            ? `按你最近的聊法，没来由的搭话一天最多 ${settings.budget_today ?? 2} 条，会跟着你的习惯慢慢调。`
+            : `没来由的搭话一天最多 ${settings.budget_today ?? '—'} 条。`}
+          到点提醒不走这个名额。
+        </span>
       </label>
 
       <div className="care-actions">

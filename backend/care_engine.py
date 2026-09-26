@@ -24,8 +24,13 @@ USER_PRESENT_SECONDS = 20 * 60  # 用户刚聊过就别插话
 EVENT_LOOKBACK = 6 * 3600       # 过期超过 6 小时就不翻旧账
 RAIN_WINDOW = (7, 10)           # 带伞提醒只在早上这个时段说
 BIRTHDAY_AFTER_HOUR = 9
+MAX_PROACTIVE_PER_DAY = 8       # 硬上限：事项堆一起了也不能当通知轰炸机
+
+# 没来由地搭话：吃"话多话少"换算出来的当日名额，受「平时主动找我说话」开关管
+CHAT_KINDS = ("open_loop", "miss_you")
 
 _last_user_seen: Dict[str, float] = {}
+_last_bot_seen: Dict[str, float] = {}
 
 
 def note_user_activity(user_id: str) -> float:
@@ -34,6 +39,17 @@ def note_user_activity(user_id: str) -> float:
     now = time.time()
     _last_user_seen[user_id] = now
     return now - prev if prev else 0.0
+
+
+def note_bot_reply(user_id: str) -> None:
+    """moz 回完一句（包括主动关心说出去的）：用来判断用户接话快不快。"""
+    _last_bot_seen[user_id] = time.time()
+
+
+def seconds_since_bot_reply(user_id: str) -> float:
+    """0 表示后端刚重启、没有参照。"""
+    prev = _last_bot_seen.get(user_id, 0)
+    return time.time() - prev if prev else 0.0
 
 
 def _day_start(ts: float) -> float:
@@ -76,52 +92,59 @@ def _idle_threshold(score: float) -> float:
 
 
 def collect(store, wm_store, user_id: str, now: Optional[float] = None) -> List[Dict[str, Any]]:
-    """列出此刻够格主动开口的理由，按优先级排好。"""
+    """列出此刻够格主动开口的理由，按优先级排好。
+
+    两个开关各管一段：「到点提醒」管记下的事，「主动找我说话」管问候和追话头，
+    互不牵连；带伞提醒有自己的勾，不受这两个影响。
+    """
     now = now or time.time()
     cur = dt.datetime.fromtimestamp(now)
     settings = store.get_settings(user_id)
+    remind_on = bool(settings.get("remind_events", True))
+    chat_on = bool(settings.get("initiate_chat", True))
     out: List[Dict[str, Any]] = []
 
-    for it in store.list_items(user_id):
-        title = it["title"]
-        kind = it["kind"]
-        repeat = it["repeat"]
-        fired = it["last_fired_at"] or 0
+    if remind_on:
+        for it in store.list_items(user_id):
+            title = it["title"]
+            kind = it["kind"]
+            repeat = it["repeat"]
+            fired = it["last_fired_at"] or 0
 
-        if repeat == "yearly":
-            if not it["due_at"]:
-                continue
-            d = dt.datetime.fromtimestamp(it["due_at"])
-            if (d.month, d.day) != (cur.month, cur.day) or cur.hour < BIRTHDAY_AFTER_HOUR:
-                continue
-            if _same_day(fired, now):
-                continue
-            out.append({"priority": 0, "kind": kind, "ref_id": it["id"], "title": title,
-                        "why": f"今天是「{title}」（每年重复），该主动提起了"})
+            if repeat == "yearly":
+                if not it["due_at"]:
+                    continue
+                d = dt.datetime.fromtimestamp(it["due_at"])
+                if (d.month, d.day) != (cur.month, cur.day) or cur.hour < BIRTHDAY_AFTER_HOUR:
+                    continue
+                if _same_day(fired, now):
+                    continue
+                out.append({"priority": 0, "kind": kind, "ref_id": it["id"], "title": title,
+                            "why": f"今天是「{title}」（每年重复），该主动提起了"})
 
-        elif repeat == "daily":
-            due_h = dt.datetime.fromtimestamp(it["due_at"]).hour if it["due_at"] else 9
-            if cur.hour < due_h or _same_day(fired, now):
-                continue
-            out.append({"priority": 2, "kind": kind, "ref_id": it["id"], "title": title,
-                        "why": f"每天的事「{title}」到点了"})
+            elif repeat == "daily":
+                due_h = dt.datetime.fromtimestamp(it["due_at"]).hour if it["due_at"] else 9
+                if cur.hour < due_h or _same_day(fired, now):
+                    continue
+                out.append({"priority": 2, "kind": kind, "ref_id": it["id"], "title": title,
+                            "why": f"每天的事「{title}」到点了"})
 
-        elif repeat == "weekly":
-            if not it["due_at"] or now < it["due_at"]:
-                continue
-            if fired and now - fired < 7 * 86400:
-                continue
-            out.append({"priority": 2, "kind": kind, "ref_id": it["id"], "title": title,
-                        "why": f"每周的事「{title}」又到期了"})
+            elif repeat == "weekly":
+                if not it["due_at"] or now < it["due_at"]:
+                    continue
+                if fired and now - fired < 7 * 86400:
+                    continue
+                out.append({"priority": 2, "kind": kind, "ref_id": it["id"], "title": title,
+                            "why": f"每周的事「{title}」又到期了"})
 
-        else:  # 一次性
-            if not it["due_at"] or now < it["due_at"] or now - it["due_at"] > EVENT_LOOKBACK:
-                continue
-            if fired and fired >= it["due_at"]:
-                continue
-            soon = kind in ("promise", "checkin", "health")
-            out.append({"priority": 1, "kind": kind, "ref_id": it["id"], "title": title,
-                        "why": f"「{title}」就安排在今天，{'该问问进展' if soon else '该提醒一声'}"})
+            else:  # 一次性
+                if not it["due_at"] or now < it["due_at"] or now - it["due_at"] > EVENT_LOOKBACK:
+                    continue
+                if fired and fired >= it["due_at"]:
+                    continue
+                soon = kind in ("promise", "checkin", "health")
+                out.append({"priority": 1, "kind": kind, "ref_id": it["id"], "title": title,
+                            "why": f"「{title}」就安排在今天，{'该问问进展' if soon else '该提醒一声'}"})
 
     if settings.get("rain_reminder") and settings.get("city"):
         if RAIN_WINDOW[0] <= cur.hour < RAIN_WINDOW[1] and store.fired_since(user_id, _day_start(now), "rain") == 0:
@@ -131,23 +154,25 @@ def collect(store, wm_store, user_id: str, now: Optional[float] = None) -> List[
                             "why": f"{settings['city']}今天有雨（{w['today'].get('day')}/{w['today'].get('night')}，"
                                    f"{w['degree']}°，湿度{w['humidity']}）"})
 
-    followup = ""
-    if wm_store:
-        try:
-            followup = wm_store.get_followup_text(user_id)
-        except Exception as e:  # 开放话题坏了不该拖垮整个引擎
-            logger.warning("[主动关心] 读取开放话题失败: %s", e)
-    if followup and store.fired_since(user_id, _day_start(now), "open_loop") == 0:
-        out.append({"priority": 3, "kind": "open_loop", "ref_id": "", "title": followup,
-                    "why": f"用户之前留了个没说完的话头：{followup}"})
+    # 搭话类才吃"话多话少"的当日名额；到点提醒不该被闲聊名额挤掉
+    budget = store.daily_budget(user_id) if chat_on else 0
+    chat_used = sum(store.fired_since(user_id, _day_start(now), k) for k in CHAT_KINDS)
+    if chat_used < budget:
+        followup = ""
+        if wm_store:
+            try:
+                followup = wm_store.get_followup_text(user_id)
+            except Exception as e:  # 开放话题坏了不该拖垮整个引擎
+                logger.warning("[主动关心] 读取开放话题失败: %s", e)
+        if followup and store.fired_since(user_id, _day_start(now), "open_loop") == 0:
+            out.append({"priority": 3, "kind": "open_loop", "ref_id": "", "title": followup,
+                        "why": f"用户之前留了个没说完的话头：{followup}"})
 
-    budget = store.daily_budget(user_id)
-    used = store.fired_since(user_id, _day_start(now))
-    idle_hours = (now - _last_user_seen.get(user_id, 0)) / 3600 if _last_user_seen.get(user_id) else None
-    if used < budget and store.fired_since(user_id, _day_start(now), "miss_you") == 0:
-        if idle_hours is None or idle_hours >= _idle_threshold(settings.get("talk_score", 0.5)):
-            out.append({"priority": 4, "kind": "miss_you", "ref_id": "", "title": "",
-                        "why": f"已经大约{int(idle_hours or 0)}小时没聊了，主动问候一句"})
+        if store.fired_since(user_id, _day_start(now), "miss_you") == 0:
+            idle_hours = (now - _last_user_seen.get(user_id, 0)) / 3600 if _last_user_seen.get(user_id) else None
+            if idle_hours is None or idle_hours >= _idle_threshold(settings.get("talk_score", 0.5)):
+                out.append({"priority": 4, "kind": "miss_you", "ref_id": "", "title": "",
+                            "why": f"已经大约{int(idle_hours or 0)}小时没聊了，主动问候一句"})
 
     return sorted(out, key=lambda c: c["priority"])
 
@@ -204,8 +229,9 @@ def tick_once(store, wm_store, user_id: str, now: Optional[float] = None,
     if now - _last_user_seen.get(user_id, 0) < USER_PRESENT_SECONDS:
         return []
 
-    budget = store.daily_budget(user_id)
-    if store.fired_since(user_id, _day_start(now)) >= budget:
+    # "话多话少"换算的当日名额只限没来由的搭话（在 collect 里判），
+    # 到点提醒不该被闲聊名额挤掉，但事项堆一起时得有这条硬上限兜底
+    if store.fired_since(user_id, _day_start(now)) >= MAX_PROACTIVE_PER_DAY:
         return []
     if now - store.last_fired_at(user_id) < MIN_GAP_SECONDS:
         return []

@@ -17,14 +17,17 @@ ITEM_KINDS = ("birthday", "event", "promise", "checkin", "health", "person", "no
 REPEATS = ("none", "daily", "weekly", "yearly")
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "enabled": True,
+    # 两个独立开关。老版本只有一个 enabled，用户想"只要生日提醒、别没事找我说话"做不到。
+    "remind_events": True,   # 到点提醒记下的事：生日、面试、复诊
+    "initiate_chat": True,   # 平时没来由地主动搭话
+    "enabled": True,         # 总开关，由上面两个算出来（老代码和 daily_budget 还在看它）
     "province": "",
     "city": "",
     "quiet_start": "23:00",
     "quiet_end": "08:00",
-    # talk_mode: auto=按数据库判断话多话少；quiet/normal/chatty 为手动覆盖
+    # talk_mode: auto=按聊天习惯判断话多话少；quiet/normal/chatty 为手动覆盖
     "talk_mode": "auto",
-    # auto 时由历史行为算出的 0~1 倾向，越大越爱聊
+    # auto 时由聊天行为算出的 0~1 倾向，越大越爱聊（只给用户换算成"一天最多几次"）
     "talk_score": 0.5,
     "rain_reminder": True,
 }
@@ -249,11 +252,19 @@ class CareStore:
             "SELECT data FROM care_settings WHERE user_id = ?", (user_id,)
         ).fetchone()
         merged = dict(DEFAULT_SETTINGS)
+        raw: Dict[str, Any] = {}
         if row:
             try:
-                merged.update(json.loads(row[0]))
+                raw = json.loads(row[0]) or {}
             except (json.JSONDecodeError, TypeError):
-                pass
+                raw = {}
+            merged.update(raw)
+        if "remind_events" not in raw:
+            # 老记录里只有一个总开关：按它摊到两个开关上，别让界面和实际行为不一致
+            legacy = bool(raw.get("enabled", True))
+            merged["remind_events"] = legacy
+            merged["initiate_chat"] = legacy
+        merged["enabled"] = bool(merged["remind_events"] or merged["initiate_chat"])
         merged["user_id"] = user_id
         return merged
 
@@ -262,6 +273,7 @@ class CareStore:
         for key in DEFAULT_SETTINGS:
             if key in patch and patch[key] is not None:
                 current[key] = patch[key]
+        current["enabled"] = bool(current["remind_events"] or current["initiate_chat"])
         current.pop("user_id", None)
         self._conn().execute(
             "INSERT OR REPLACE INTO care_settings (user_id, data, updated_at) VALUES (?,?,?)",
@@ -282,7 +294,10 @@ class CareStore:
 
     # ── 话多话少 ─────────────────────────────────────────
     def daily_budget(self, user_id: str) -> int:
-        """当日可主动开口的条数：手动模式优先，否则按 talk_score 换算。"""
+        """当天"没来由地主动搭话"的名额：手动模式优先，否则按 talk_score 换算。
+
+        到点提醒记下的事（生日/面试/复诊）不吃这个名额，见 care_engine。
+        """
         s = self.get_settings(user_id)
         if not s.get("enabled", True):
             return 0
@@ -292,18 +307,35 @@ class CareStore:
         score = float(s.get("talk_score", 0.5) or 0.5)
         return max(0, min(TALK_BUDGET["chatty"], int(round(score * TALK_BUDGET["chatty"]))))
 
-    def observe_style(self, user_id: str, user_text_len: int, user_initiated: bool) -> None:
-        """把每次对话的行为折算进 talk_score（指数平滑，越聊越准）。"""
-        # 长回复 + 主动开口 = 爱聊；短促 + 被动 = 想安静
-        length_signal = min(1.0, user_text_len / 60.0)
-        signal = 0.5 * length_signal + 0.5 * (1.0 if user_initiated else 0.25)
+    def observe_style(self, user_id: str, user_text_len: int, *,
+                      since_user_msg: float = 0.0, since_bot_reply: float = 0.0) -> None:
+        """把刚收到的这句折算进 talk_score（指数平滑，越聊越准）。
+
+        只按"是不是主动开场 + 回复长短"判断，会把被问一句答一句的人判成话少 ——
+        老实答题本来就短。所以长度只占一小部分并且带下限，主要看接话的速度。
+        """
+        verbosity = max(0.35, min(1.0, user_text_len / 40.0))
+        if since_bot_reply <= 0:  # 后端刚重启，没有参照：算中性，不算冷淡
+            pacing = 0.5
+        elif since_bot_reply <= 120:
+            pacing = 1.0
+        elif since_bot_reply <= 900:
+            pacing = 0.7
+        elif since_bot_reply <= 3600:
+            pacing = 0.45
+        else:
+            pacing = 0.25
+        # 隔了一阵自己回来找 moz，是最强的"爱我聊"信号；顺着话往下说是中性
+        initiation = 1.0 if since_user_msg > 1800 else 0.5
+        signal = 0.25 * verbosity + 0.45 * pacing + 0.30 * initiation
         s = self.get_settings(user_id)
         if s.get("talk_mode", "auto") != "auto":
             return  # 手动覆盖时不再自动漂移
         old = float(s.get("talk_score", 0.5))
         s["talk_score"] = round(0.85 * old + 0.15 * signal, 3)
+        s.pop("user_id", None)
         self._conn().execute(
             "INSERT OR REPLACE INTO care_settings (user_id, data, updated_at) VALUES (?,?,?)",
-            (user_id, json.dumps({k: v for k, v in s.items() if k != "user_id"}, ensure_ascii=False), time.time()),
+            (user_id, json.dumps(s, ensure_ascii=False), time.time()),
         )
         self._conn().commit()

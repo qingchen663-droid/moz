@@ -14,16 +14,27 @@ function mockResponse(body: unknown, status = 200) {
 
 let multimodalFlag = false
 
+const careSettings = () => ({
+  enabled: true,
+  remind_events: true,
+  initiate_chat: true,
+  province: '',
+  city: '',
+  quiet_start: '23:00',
+  quiet_end: '08:00',
+  talk_mode: 'auto',
+  talk_score: 0.5,
+  budget_today: 2,
+  rain_reminder: true,
+})
+
 beforeAll(() => {
   Element.prototype.scrollIntoView = () => {}
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
     if (url.includes('/health')) return mockResponse({ status: 'ok', auth_required: false })
     if (url.includes('/care/pending')) return mockResponse({ items: [] })
-    if (url.includes('/care/settings')) return mockResponse({
-      enabled: true, province: '', city: '', quiet_start: '23:00', quiet_end: '08:00',
-      talk_mode: 'auto', talk_score: 0.5, rain_reminder: true,
-    })
+    if (url.includes('/care/settings')) return mockResponse(careSettings())
     if (url.includes('/care/items')) return mockResponse({ items: [] })
     if (url.includes('/users')) return mockResponse([])
     if (url.includes('/conversations')) return mockResponse({ conversations: [], current_id: '' })
@@ -100,6 +111,19 @@ describe('产品形态回归：单条长期陪伴流', () => {
     const btns = Array.from(card.querySelectorAll('button')).map((b) => b.className)
     expect(btns.some((c) => c.includes('dialog-btn--danger'))).toBe(true)
     expect(btns.some((c) => c.includes('dialog-btn--secondary'))).toBe(true)
+  })
+  it('到点提醒和平时搭话是两个独立开关，且不摆内部指标', async () => {
+    render(<App />)
+    await waitFor(() => expect(document.querySelector('.rail-item')).toBeTruthy())
+    fireEvent.click(screen.getByText('设置'))
+    await waitFor(() => expect(document.querySelector('.care-section')).toBeTruthy())
+    const text = document.querySelector('.care-section')!.textContent!
+    expect(text).toContain('到点提醒我')
+    expect(text).toContain('没来由地找我说话')
+    expect(document.querySelectorAll('.care-switch input').length).toBe(3)
+    // talk_score 百分比这种内部数字不该出现在界面上，用户看得懂的是"一天最多几条"
+    expect(text).not.toMatch(/自动判断值|%.*慢慢调/)
+    expect(text).toMatch(/一天最多 2 条/)
   })
 })
 
@@ -235,11 +259,7 @@ describe('危险操作先问再做', () => {
       const url = typeof input === 'string' ? input : String(input)
       posts.push(`${init?.method ?? 'GET'} ${url}`)
       if (url.includes('/import/')) return mockResponse({ status: 'ok', memories_imported: 2, care_items_imported: 1 })
-      if (url.includes('/care/settings'))
-        return mockResponse({
-          enabled: true, province: '', city: '', quiet_start: '23:00', quiet_end: '08:00',
-          talk_mode: 'auto', talk_score: 0.5, rain_reminder: true,
-        })
+      if (url.includes('/care/settings')) return mockResponse(careSettings())
       if (url.includes('/care/items')) return mockResponse({ items: [] })
       return mockResponse({})
     }) as typeof fetch

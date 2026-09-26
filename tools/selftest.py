@@ -154,14 +154,16 @@ def care_settings_roundtrip():
         code, got = http(f"/care/settings?user_id={USER}", "PUT", {"quiet_start": "04:00"})
         if got.get("quiet_start") != "04:00":
             return f"写入未生效 {code}"
+        # 两个开关必须独立：只关"没来由搭话"不该把到点提醒一起关掉
+        _, half = http(f"/care/settings?user_id={USER}", "PUT", {"initiate_chat": False})
+        if half.get("remind_events") is not True or half.get("enabled") is not True:
+            return f"关一个开关连带关掉了另一个: {half}"
+        if "budget_today" not in half:
+            return "设置接口没给换算出来的当日条数，界面只能显示内部数字"
         return True
     finally:
-        http(f"/care/settings?user_id={USER}", "PUT", {
-            "quiet_start": original.get("quiet_start"), "quiet_end": original.get("quiet_end"),
-            "talk_mode": original.get("talk_mode"), "city": original.get("city"),
-            "province": original.get("province"), "enabled": original.get("enabled"),
-            "rain_reminder": original.get("rain_reminder"),
-        })
+        # 整份写回，别靠手写键名清单——加字段时清单会漏，把用户设置清空
+        http(f"/care/settings?user_id={USER}", "PUT", original)
 
 
 def model_list_probes():
@@ -243,22 +245,86 @@ def store_logic():
         s.save_settings(u, {"talk_mode": "chatty"})
         if s.daily_budget(u) != 4:
             return "chatty 预算应为 4"
-        s.save_settings(u, {"enabled": False})
+        s.save_settings(u, {"remind_events": False, "initiate_chat": False})
         if s.daily_budget(u) != 0:
-            return "关闭后预算应为 0"
-        s.save_settings(u, {"enabled": True, "talk_mode": "quiet"})
+            return "两个开关都关后预算应为 0"
+        s.save_settings(u, {"remind_events": True, "talk_mode": "quiet"})
         if s.daily_budget(u) != 1:
             return "quiet 预算应为 1"
-        s.observe_style(u, 200, True)
+        s.save_settings(u, {"talk_mode": "auto", "talk_score": 0.5})
+        # 被问一句答一句不该判成话少：moz 刚回完就被短回答接上，得分要往上走
+        s.observe_style(u, 8, since_user_msg=30, since_bot_reply=25)
+        if s.get_settings(u)["talk_score"] <= 0.5:
+            return f"老实答题被判成话少: {s.get_settings(u)['talk_score']}"
+        s.observe_style(u, 200, since_user_msg=7200, since_bot_reply=0)
         if not (0 < s.get_settings(u)["talk_score"] <= 1):
             return "talk_score 越界"
         s.save_settings(u, {"talk_mode": "normal"})
         before = s.get_settings(u)["talk_score"]
-        s.observe_style(u, 200, True)
+        s.observe_style(u, 200, since_user_msg=7200, since_bot_reply=0)
         if s.get_settings(u)["talk_score"] != before:
             return "手动模式下不应自动漂移"
         if not s.update_item(u, it["id"], {"title": "改名"}):
             return "改名失败"
+        return True
+    finally:
+        for t in ("care_items", "proactive_queue", "care_log"):
+            s._conn().execute(f"DELETE FROM {t} WHERE user_id=?", (u,))
+        s._conn().execute("DELETE FROM care_settings WHERE user_id=?", (u,))
+        s._conn().commit()
+
+
+def care_switch_logic():
+    """两个开关必须真的独立，且闲聊名额不能挤掉到点提醒。"""
+    from care_store import CareStore
+    import care_engine as E
+    import json as _json
+    u = "__selftest_switches__"
+    s = CareStore()
+    now = time.time()
+    try:
+        for t in ("care_items", "proactive_queue", "care_log"):
+            s._conn().execute(f"DELETE FROM {t} WHERE user_id=?", (u,))
+        s._conn().execute("DELETE FROM care_settings WHERE user_id=?", (u,))
+        s._conn().commit()
+        s.add_item(u, "面试", kind="event", due_at=now - 60)
+
+        both = {c["kind"] for c in E.collect(s, None, u, now)}
+        if "event" not in both or "miss_you" not in both:
+            return f"默认两个开关都该有候选: {both}"
+
+        s.save_settings(u, {"initiate_chat": False})
+        only_remind = {c["kind"] for c in E.collect(s, None, u, now)}
+        if "event" not in only_remind or "miss_you" in only_remind:
+            return f"关掉搭话后只剩提醒才对: {only_remind}"
+
+        s.save_settings(u, {"initiate_chat": True, "remind_events": False})
+        only_chat = {c["kind"] for c in E.collect(s, None, u, now)}
+        if "event" in only_chat or "miss_you" not in only_chat:
+            return f"关掉到点提醒后只剩搭话才对: {only_chat}"
+
+        s.save_settings(u, {"initiate_chat": False, "remind_events": False})
+        if s.get_settings(u)["enabled"] is not False:
+            return "两个开关都关时总开关应自动为假"
+        if E.collect(s, None, u, now):
+            return "两个开关都关时不该还有任何主动消息"
+
+        # 名额：闲聊用完后，到点提醒照说；老记录（只有 enabled）要能摊开
+        s.save_settings(u, {"initiate_chat": True, "remind_events": True, "talk_mode": "quiet"})
+        s.enqueue(u, "miss_you", "随便问候一句")
+        after_quota = {c["kind"] for c in E.collect(s, None, u, now)}
+        if "event" not in after_quota:
+            return f"闲聊名额用完不该挡住到点提醒: {after_quota}"
+        if "miss_you" in after_quota:
+            return "闲聊名额用完不该再没来由搭话"
+
+        s._conn().execute(
+            "INSERT OR REPLACE INTO care_settings (user_id,data,updated_at) VALUES (?,?,?)",
+            (u, _json.dumps({"enabled": False, "city": "杭州"}), now),
+        )
+        legacy = s.get_settings(u)
+        if legacy["remind_events"] or legacy["initiate_chat"]:
+            return "老记录的总开关为假时，两个新开关也该是假"
         return True
     finally:
         for t in ("care_items", "proactive_queue", "care_log"):
@@ -469,6 +535,7 @@ def main():
     check("安静时段判定", engine_logic)
     check("日期抽取与去噪", extractor_logic)
     check("存储与预算与ack竞态", store_logic)
+    check("关心两开关独立", care_switch_logic)
     check("数据库不变量", db_invariants)
     check("天气源可用", weather_probe)
     check("头像字节流", avatar_probe)
