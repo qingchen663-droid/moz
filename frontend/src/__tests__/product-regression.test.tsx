@@ -143,3 +143,107 @@ describe('主动消息接收', () => {
     expect(useStore.getState().messages.length).toBe(before)
   })
 })
+
+describe('记忆可读可改：能筛选、能纠错', () => {
+  const memory = (id: string, content: string, layer: string) => ({
+    id,
+    content,
+    layer,
+    category: 'fact',
+    emotion: 'neutral',
+    emotion_emoji: '😐',
+    tags: ['工作'],
+    importance: 0.7,
+    access_count: 2,
+    is_consolidated: false,
+    created_at: 1760000000,
+    temporal_data: {},
+  })
+
+  async function openViewer(layers: Record<string, unknown[]>) {
+    const { default: MemoryViewerModal } = await import('../components/MemoryViewerModal')
+    const fetches: string[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : String(input)
+      fetches.push(url)
+      if (url.includes('/detail')) return mockResponse({ layers })
+      if (url.includes('/profile/')) return mockResponse({ profile: null })
+      if (url.includes('/summaries')) return mockResponse({ summaries: [] })
+      return mockResponse({})
+    }) as typeof fetch
+    render(<MemoryViewerModal onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('.mem-viewer-tabs')).toBeTruthy())
+    return fetches
+  }
+
+  it('三条分层记忆都有筛选、搜索和纠正入口', async () => {
+    await openViewer({
+      core: [memory('c1', '妈妈生日是 10 月 5 日', 'core')],
+      important: [memory('i1', '正在换工作，面试在下周', 'important')],
+      regular: [memory('r1', '喜欢喝美式', 'regular')],
+    })
+    fireEvent.click(screen.getByText('记忆'))
+    expect(document.querySelector('.mem-search')).toBeTruthy()
+    expect(document.querySelectorAll('.mem-filter').length).toBe(4)
+    expect(document.querySelectorAll('.mem-card').length).toBe(3)
+    // 记错了要能当场处理，而不是只能看着
+    expect(screen.getAllByText('忘掉').length).toBe(3)
+    expect(screen.getAllByText('不对').length).toBe(3)
+  })
+
+  it('搜索按内容过滤，筛完没命中时给的是可操作的话', async () => {
+    await openViewer({ core: [memory('c1', '妈妈生日是 10 月 5 日', 'core')], important: [], regular: [] })
+    fireEvent.click(screen.getByText('记忆'))
+    fireEvent.change(document.querySelector('.mem-search')!, { target: { value: '美式' } })
+    expect(document.querySelectorAll('.mem-card').length).toBe(0)
+    expect(document.querySelector('.mem-empty')?.textContent).toContain('换个词')
+  })
+
+  it('一条记忆都没有时，空态要告诉用户怎么让它记住', async () => {
+    await openViewer({ core: [], important: [], regular: [] })
+    fireEvent.click(screen.getByText('记忆'))
+    expect(document.querySelector('.mem-empty')?.textContent).toContain('记住')
+  })
+})
+
+describe('危险操作先问再做', () => {
+  it('选完快照文件不立刻覆盖，确认之后才发 import 请求', async () => {
+    const posts: string[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : String(input)
+      posts.push(`${init?.method ?? 'GET'} ${url}`)
+      if (url.includes('/import/')) return mockResponse({ status: 'ok', memories_imported: 2, care_items_imported: 1 })
+      if (url.includes('/care/settings'))
+        return mockResponse({
+          enabled: true, province: '', city: '', quiet_start: '23:00', quiet_end: '08:00',
+          talk_mode: 'auto', talk_score: 0.5, rain_reminder: true,
+        })
+      if (url.includes('/care/items')) return mockResponse({ items: [] })
+      return mockResponse({})
+    }) as typeof fetch
+
+    const { default: MePanel } = await import('../components/MePanel')
+    render(<MePanel onClose={() => {}} />)
+    const input = document.querySelector('input[type=file]')!
+    const file = new File([JSON.stringify({ conversations: { a: { messages: [] } }, memories: [] })], 'moz_export.json', {
+      type: 'application/json',
+    })
+    fireEvent.change(input, { target: { files: [file] } })
+
+    await waitFor(() => expect(document.querySelector('.confirm-dialog')).toBeTruthy())
+    expect(posts.filter((p) => p.includes('/import/'))).toHaveLength(0)
+    expect(document.querySelector('.dialog-message')?.textContent).toContain('会被替掉')
+
+    fireEvent.click(screen.getByText('覆盖恢复'))
+    await waitFor(() => expect(posts.some((p) => p.includes('/import/'))).toBe(true))
+  })
+
+  it('不像 moz 快照的文件直接被拦下，不弹覆盖确认', async () => {
+    const { default: MePanel } = await import('../components/MePanel')
+    render(<MePanel onClose={() => {}} />)
+    const input = document.querySelector('input[type=file]')!
+    fireEvent.change(input, { target: { files: [new File(['{"nope":1}'], 'other.json')] } })
+    await waitFor(() => expect(document.querySelector('.me-notice')?.textContent).toContain('不像 moz 的快照'))
+    expect(document.querySelector('.confirm-dialog')).toBeFalsy()
+  })
+})

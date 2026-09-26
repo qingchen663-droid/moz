@@ -42,7 +42,7 @@ export default function CareSection() {
   const reload = useCallback(async () => {
     const [s, i] = await Promise.all([api.getCareSettings(userId), api.getCareItems(userId)])
     setSettings(s)
-    setItems(i.items)
+    setItems(i?.items ?? [])
     setLoadFailed(false)
   }, [userId])
 

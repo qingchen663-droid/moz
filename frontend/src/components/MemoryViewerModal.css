@@ -521,3 +521,92 @@
   line-height: 1.5;
   color: var(--color-text-secondary, #555);
 }
+
+/* 记忆检索条 + 每条的纠正动作 */
+.mem-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 0 0 10px;
+}
+
+.mem-search {
+  flex: 1 1 180px;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--color-border, #e2e4ea);
+  border-radius: 8px;
+  background: var(--color-bg-secondary, #fff);
+  color: var(--color-text-primary, #222);
+  font-size: 13px;
+}
+
+.mem-search:focus {
+  outline: none;
+  border-color: var(--color-accent, #6366f1);
+}
+
+.mem-filters {
+  display: flex;
+  gap: 6px;
+}
+
+.mem-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border: 1px solid var(--color-border, #e2e4ea);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-secondary, #555);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.mem-filter--on {
+  border-color: var(--color-accent, #6366f1);
+  background: var(--color-accent-soft, rgba(99, 102, 241, 0.1));
+  color: var(--color-accent, #6366f1);
+}
+
+.mem-filter-count {
+  font-size: 11px;
+  color: var(--color-text-tertiary, #999);
+}
+
+.mem-action-msg {
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  background: var(--color-accent-soft, rgba(99, 102, 241, 0.08));
+  color: var(--color-text-secondary, #555);
+  font-size: 12px;
+}
+
+.mem-card-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 6px;
+}
+
+.mem-act {
+  padding: 2px 8px;
+  border: 1px solid var(--color-border, #e2e4ea);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-tertiary, #999);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.mem-act:hover {
+  color: var(--color-text-primary, #222);
+  border-color: var(--color-text-quaternary, #bbb);
+}
+
+.mem-act--danger:hover {
+  color: var(--color-danger, #d0453e);
+  border-color: var(--color-danger, #d0453e);
+}

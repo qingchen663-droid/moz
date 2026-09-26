@@ -139,6 +139,21 @@ export const api = {
     return request(`/memory/${userId}`, { method: 'DELETE' })
   },
 
+  deleteMemory(userId: string, memoryId: string) {
+    return request(`/memory/${userId}/${memoryId}`, { method: 'DELETE' })
+  },
+
+  feedbackMemory(
+    userId: string,
+    memoryId: string,
+    feedback: 'helpful' | 'irrelevant' | 'wrong' | 'outdated'
+  ) {
+    return request(`/memory/${userId}/${memoryId}/feedback`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    })
+  },
+
   getModelConfig(): Promise<ModelConfig> {
     return request('/config/model')
   },
@@ -225,7 +240,7 @@ export const api = {
   importUserData(
     userId: string,
     data: Record<string, unknown>
-  ): Promise<{ status: string; memories_imported: number }> {
+  ): Promise<{ status: string; memories_imported: number; care_items_imported?: number }> {
     return request(`/import/${userId}`, { method: 'POST', body: JSON.stringify(data) })
   },
 

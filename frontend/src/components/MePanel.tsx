@@ -17,6 +17,9 @@ export default function MePanel({ onClose }: { onClose: () => void }) {
 
   const [showLogs, setShowLogs] = useState(false)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
+  const [pendingImport, setPendingImport] = useState<{ data: Record<string, unknown>; name: string } | null>(
+    null
+  )
   const [notice, setNotice] = useState('')
   const importInputRef = useRef<HTMLInputElement>(null)
 
@@ -24,7 +27,7 @@ export default function MePanel({ onClose }: { onClose: () => void }) {
     loadPromptConfig()
   }, [loadPromptConfig])
 
-  const modalOpen = showLogs || showClearConfirm
+  const modalOpen = showLogs || showClearConfirm || pendingImport !== null
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -35,9 +38,13 @@ export default function MePanel({ onClose }: { onClose: () => void }) {
   }, [onClose, modalOpen])
 
   const handleClearMemories = async () => {
-    await clearMemories()
     setShowClearConfirm(false)
-    setNotice('长期记忆已清除')
+    try {
+      await clearMemories()
+      setNotice('长期记忆、档案卡、要记的事都清了；对话记录还在')
+    } catch {
+      setNotice('没能清空：后端没应答，东西还都在，再试一次')
+    }
   }
 
   const handleExport = async () => {
@@ -59,19 +66,38 @@ export default function MePanel({ onClose }: { onClose: () => void }) {
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
+    e.target.value = ''
     if (!file) return
+    let data: unknown
     try {
-      const data = JSON.parse(await file.text())
+      data = JSON.parse(await file.text())
+    } catch {
+      setNotice('这个文件读不出 JSON，换一份「导出数据」生成的快照试试')
+      return
+    }
+    const obj = data as Record<string, unknown> | null
+    if (!obj || typeof obj !== 'object' || (!obj.conversations && !obj.memories)) {
+      setNotice('不像 moz 的快照：里面既没有对话也没有记忆。别用别的 JSON 文件')
+      return
+    }
+    // 导入是覆盖式的，先让用户看清后果再动手
+    setPendingImport({ data: obj, name: file.name })
+  }
+
+  const runImport = async () => {
+    if (!pendingImport) return
+    const { data } = pendingImport
+    setPendingImport(null)
+    try {
       const res = await api.importUserData(userId, data)
-      setNotice(`已恢复 ${res.memories_imported} 条记忆`)
       await useStore.getState().loadConversations()
       await useStore.getState().loadMemoryStats()
       await useStore.getState().loadAvatar()
+      setNotice(
+        `已恢复到这份快照：${res.memories_imported} 条记忆、${res.care_items_imported ?? 0} 件要记的事`
+      )
     } catch (err) {
-      console.error('import failed:', err)
-      setNotice('导入失败，请检查是否为有效的导出 JSON')
-    } finally {
-      e.target.value = ''
+      setNotice(`导入没成：${err instanceof Error ? err.message : '未知错误'}。现在的数据没动`)
     }
   }
 
@@ -264,10 +290,19 @@ export default function MePanel({ onClose }: { onClose: () => void }) {
       {showClearConfirm && (
         <ConfirmDialog
           title="清空记忆与档案"
-          message="将删除：记忆条目、总结、工作记忆、档案卡。对话记录不在其中，可在下方「历史对话」单独删除。此操作不可撤销。"
+          message="将删除：记忆条目、总结、工作记忆、档案卡、以及它记下的生日/面试/复诊等提醒。对话记录不在其中，可在下方「历史对话」单独删除。清之前建议先点「导出数据」留一份。此操作不可撤销。"
           confirmText="全部清空"
           onConfirm={handleClearMemories}
           onCancel={() => setShowClearConfirm(false)}
+        />
+      )}
+      {pendingImport && (
+        <ConfirmDialog
+          title="用快照覆盖现在的数据？"
+          message={`导入「${pendingImport.name}」会把当前的对话、记忆、档案和要记的事整个换成快照里的内容，现在这些会被替掉。不确定就先点「导出数据」把现在的存一份。`}
+          confirmText="覆盖恢复"
+          onConfirm={runImport}
+          onCancel={() => setPendingImport(null)}
         />
       )}
     </>

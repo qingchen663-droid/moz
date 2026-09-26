@@ -67,6 +67,9 @@ export default function MemoryViewerModal({ onClose }: Props) {
   const [memoryData, setMemoryData] = useState<MemoryDetailResponse | null>(null)
   const [profile, setProfile] = useState<UserProfileData | null>(null)
   const [error, setError] = useState('')
+  const [query, setQuery] = useState('')
+  const [layerFilter, setLayerFilter] = useState<'all' | 'core' | 'important' | 'regular'>('all')
+  const [actionMsg, setActionMsg] = useState('')
   const [summaries, setSummaries] = useState<
     Array<{
       id: number
@@ -100,6 +103,14 @@ export default function MemoryViewerModal({ onClose }: Props) {
     load()
   }, [])
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
   const tabs: TabKey[] = ['profile', 'memories', 'summaries']
 
   const totalMemories = memoryData
@@ -124,12 +135,56 @@ export default function MemoryViewerModal({ onClose }: Props) {
     allMemories.sort((a, b) => b.created_at - a.created_at)
   }
 
+  const keyword = query.trim().toLowerCase()
+  const visibleMemories = allMemories.filter((m) => {
+    if (layerFilter !== 'all' && m.layer !== layerFilter) return false
+    if (!keyword) return true
+    const haystack = [
+      m.content,
+      m.category,
+      CATEGORY_LABELS[m.category] ?? '',
+      m.emotion,
+      EMOTION_LABELS[m.emotion] ?? '',
+      ...(m.tags ?? []),
+    ]
+      .join(' ')
+      .toLowerCase()
+    return haystack.includes(keyword)
+  })
+
+  const forget = async (m: MemoryDetail & { layer: string }) => {
+    if (!window.confirm(`忘掉这条？\n\n「${m.content}」`)) return
+    try {
+      await api.deleteMemory(useStore.getState().userId, m.id)
+      setMemoryData((cur) => {
+        if (!cur) return cur
+        const layers = { ...cur.layers }
+        for (const key of ['core', 'important', 'regular'] as const) {
+          layers[key] = (layers[key] ?? []).filter((x) => x.id !== m.id)
+        }
+        return { ...cur, layers }
+      })
+      setActionMsg('已经忘掉了。要是记错了别的，直接对它说"你记错了，……"')
+    } catch {
+      setActionMsg('没忘成：后端没应答，这条还留着')
+    }
+  }
+
+  const sayWrong = async (m: MemoryDetail) => {
+    try {
+      await api.feedbackMemory(useStore.getState().userId, m.id, 'wrong')
+      setActionMsg('好的，这条以后少提。想让它记对的，补一句"你记错了，……"')
+    } catch {
+      setActionMsg('反馈没送出去，后端没应答')
+    }
+  }
+
   return (
     <div className="mem-viewer-overlay" onClick={onClose}>
       <div className="mem-viewer-content" onClick={(e) => e.stopPropagation()}>
         {/* Header */}
         <div className="mem-viewer-header">
-          <span className="mem-viewer-title">记忆查看器</span>
+          <span className="mem-viewer-title">moz 记得什么</span>
           <button className="mem-viewer-close" onClick={onClose}>
             &times;
           </button>
@@ -177,12 +232,53 @@ export default function MemoryViewerModal({ onClose }: Props) {
           {!loading && !error && activeTab === 'profile' && profile && (
             <ProfileView profile={profile} coreMemories={memoryData?.layers.core ?? []} />
           )}
-          {!loading && !error && activeTab === 'memories' && <MemoryList memories={allMemories} />}
+          {!loading && !error && activeTab === 'profile' && !profile && (
+            <div className="mem-empty">
+              还没形成档案。它会在你聊到姓名、工作、家人、喜好的时候自动记下来。
+            </div>
+          )}
+
+          {!loading && !error && activeTab === 'memories' && (
+            <>
+              <div className="mem-toolbar">
+                <input
+                  className="mem-search"
+                  value={query}
+                  placeholder="搜内容、标签、情绪…"
+                  onChange={(e) => setQuery(e.target.value)}
+                />
+                <div className="mem-filters">
+                  {(['all', 'core', 'important', 'regular'] as const).map((key) => (
+                    <button
+                      key={key}
+                      className={`mem-filter ${layerFilter === key ? 'mem-filter--on' : ''}`}
+                      onClick={() => setLayerFilter(key)}
+                    >
+                      {key === 'all' ? '全部' : LAYER_BADGES[key].label}
+                      <span className="mem-filter-count">
+                        {key === 'all'
+                          ? allMemories.length
+                          : allMemories.filter((m) => m.layer === key).length}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {actionMsg && <div className="mem-action-msg">{actionMsg}</div>}
+              <MemoryList
+                memories={visibleMemories}
+                total={allMemories.length}
+                filtered={Boolean(query.trim()) || layerFilter !== 'all'}
+                onForget={forget}
+                onWrong={sayWrong}
+              />
+            </>
+          )}
 
           {!loading && !error && activeTab === 'summaries' && (
             <div className="mem-summaries-list">
               {summaries.length === 0 ? (
-                <div className="mem-empty">暂无总结</div>
+                <div className="mem-empty">还没有总结。聊够一段它才会回头归纳，不用你做什么。</div>
               ) : (
                 summaries.map((s) => (
                   <div key={s.id} className="mem-summary-card">
@@ -382,11 +478,26 @@ const LAYER_BADGES: Record<string, { label: string; cls: string }> = {
 
 function MemoryList({
   memories,
+  total,
+  filtered,
+  onForget,
+  onWrong,
 }: {
   memories: (MemoryDetail & { layer: 'core' | 'important' | 'regular' })[]
+  total: number
+  filtered: boolean
+  onForget: (m: MemoryDetail & { layer: 'core' | 'important' | 'regular' }) => void
+  onWrong: (m: MemoryDetail) => void
 }) {
+  if (total === 0) {
+    return (
+      <div className="mem-empty">
+        还没有存下任何一条。聊到重要的事时它会自己记，你也可以直接说"记住，……"。
+      </div>
+    )
+  }
   if (memories.length === 0) {
-    return <div className="mem-empty">暂无记忆</div>
+    return <div className="mem-empty">这堆里没有匹配的。换个词，或者点上面的"全部"。</div>
   }
 
   return (
@@ -402,6 +513,14 @@ function MemoryList({
               <span className="mem-card-emotion">{EMOTION_LABELS[m.emotion] || m.emotion}</span>
               <span className="mem-card-category">{CATEGORY_LABELS[m.category] || m.category}</span>
               <span className="mem-card-time">{formatTime(m.created_at)}</span>
+              <span className="mem-card-actions">
+                <button className="mem-act" onClick={() => onWrong(m)} title="这条不对，以后少提">
+                  不对
+                </button>
+                <button className="mem-act mem-act--danger" onClick={() => onForget(m)} title="彻底忘掉这条">
+                  忘掉
+                </button>
+              </span>
             </div>
 
             <div className="mem-card-content">{m.content}</div>
