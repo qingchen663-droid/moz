@@ -25,6 +25,9 @@ TRIGGER_WORDS = ("生日", "过生", "纪念日", "面试", "考试", "答辩", 
                  "手术", "搬家", "截止", "deadline", "约定", "周三", "周四", "周五", "下周",
                  "后天", "明天", "月初", "月底")
 
+# 中文写法常带空格："10 月 5 日"、"8月2号"、"2026 年 3 月 15 日"
+_CN_DATE = re.compile(r"(?:(\d{2,4})\s*[年\-/])?\s*(\d{1,2})\s*[月\-/]\s*(\d{1,2})\s*[日号]?")
+
 PROMPT = """你在帮一个 AI 朋友挑出"以后该主动惦记的事"。今天是 {today}（{weekday}）。
 
 只挑这几类：生日/纪念日、明确的约定或截止时间、复诊体检、正在推进的事（面试/考试/答辩/项目/搬家）、重要的人。
@@ -89,21 +92,46 @@ def _parse_json_array(text: str) -> List[Dict[str, Any]]:
 
 
 def _fallback_items(user_msg: str) -> List[Dict[str, Any]]:
-    """模型不可用时的保守兜底：强信号词 + 相对日期解析。"""
+    """模型不可用时的保守兜底：强信号词 +（具体日期 或 相对日期）。
+
+    以前只认"下周/明天"这类相对说法，结果"我妈生日是 10 月 5 日"这种最该记住的
+    一句话什么都没记下——而中转挂了时走的就是这条路。
+    """
     if not user_msg or not any(w in user_msg for w in TRIGGER_WORDS):
         return []
+    clause = _normalize_title(re.split(r"[，。,.!！?？]", user_msg.strip())[0])
+
+    m = _CN_DATE.search(user_msg)
+    if m:
+        year_s, month, day = m.group(1), int(m.group(2)), int(m.group(3))
+        yearly = bool(re.search(r"生日|过生|纪念日|忌日", user_msg))
+        title = re.sub(r"[的下在是]+$", "", _normalize_title(user_msg.replace(m.group(0), " "))) or clause
+        try:
+            dt.datetime(2024, month, day)  # 先把"2 月 30 日"这种挡掉
+            if yearly:
+                due = f"{month:02d}-{day:02d}"
+            else:
+                now = dt.datetime.now()
+                year = int(year_s) if year_s else now.year
+                cand = dt.datetime(year, month, day, 9, 0)
+                if not year_s and cand.timestamp() < now.timestamp():
+                    cand = dt.datetime(year + 1, month, day, 9, 0)
+                due = f"{cand.year}-{month:02d}-{day:02d}"
+        except ValueError:
+            return []
+        return [{"kind": "birthday" if yearly else "event", "title": title or clause,
+                 "due_date": due, "repeat": "yearly" if yearly else "none",
+                 "why": f"规则兜底：句子里有具体日期 {m.group(0).strip()}"}]
+
     try:
         from temporal_metadata import TemporalExtractor
         temporal = TemporalExtractor.extract_from_text(user_msg)
     except Exception:
         return []
     ts = (temporal.event_time or {}).get("timestamp")
-    if not ts:
+    if not ts or not clause:
         return []
-    title = _normalize_title(re.split(r"[，。,.!！?？]", user_msg.strip())[0])
-    if not title:
-        return []
-    return [{"kind": "event", "title": title, "due_date": None, "repeat": "none",
+    return [{"kind": "event", "title": clause, "due_date": None, "repeat": "none",
              "why": f"规则兜底：{temporal.event_time.get('description', '')}提到过"}]
 
 

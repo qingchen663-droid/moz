@@ -275,6 +275,52 @@ def store_logic():
         s._conn().commit()
 
 
+def care_harvest_roundtrip():
+    """"不用你填表，聊到生日面试它自己记下"——这条卖点的最短链路（规则兜底，不碰大模型）。
+
+    大模型挂了或没配 Key 时走的就是这条路，所以它必须自己能记下事、不重复、不乱记。
+    """
+    from care_store import CareStore
+    import care_extractor as X
+
+    u = "__selftest_harvest__"
+    s = CareStore()
+    try:
+        for t in ("care_items", "proactive_queue", "care_log"):
+            s._conn().execute(f"DELETE FROM {t} WHERE user_id=?", (u,))
+        s._conn().execute("DELETE FROM care_settings WHERE user_id=?", (u,))
+        s._conn().commit()
+
+        X.harvest(s, u, "我妈生日是 10 月 5 日", "")
+        items = s.list_items(u)
+        if not items:
+            return "说了一句带日子的话，什么都没记下来"
+        got = items[0]
+        if got["kind"] != "birthday" or got["repeat"] != "yearly":
+            return f"生日没被认成每年重复：{got['kind']}/{got['repeat']}"
+        if not got["due_at"] or got["due_at"] < time.time():
+            return f"生日日期没折成未来的时间点：{got['due_at']}"
+        if "10 月" in got["title"] or "10月" in got["title"]:
+            return f"标题里还带着日期，读起来像半句话：{got['title']}"
+        n0 = len(items)
+        X.harvest(s, u, "我妈生日是 10 月 5 日", "")
+        after = len(s.list_items(u))
+        if after != n0:
+            return f"同一件事说了两遍被记成 {after - n0} 条新的（该去重）"
+        X.harvest(s, u, "今天天气不错", "")
+        X.harvest(s, u, "你好", "")
+        X.harvest(s, u, "我生日是 2 月 30 日", "")
+        after = len(s.list_items(u))
+        if after != n0:
+            return f"闲聊/坏日期被记成了事项（多了 {after - n0} 条）"
+        return True
+    finally:
+        for t in ("care_items", "proactive_queue", "care_log"):
+            s._conn().execute(f"DELETE FROM {t} WHERE user_id=?", (u,))
+        s._conn().execute("DELETE FROM care_settings WHERE user_id=?", (u,))
+        s._conn().commit()
+
+
 def care_switch_logic():
     """两个开关必须真的独立，且闲聊名额不能挤掉到点提醒。"""
     from care_store import CareStore
@@ -694,6 +740,7 @@ def main():
     check("限流不误伤本地", rate_limit_not_hostile)
     check("安静时段判定", engine_logic)
     check("日期抽取与去噪", extractor_logic)
+    check("聊到日子自己记下", care_harvest_roundtrip)
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)
     check("数据库不变量", db_invariants)
