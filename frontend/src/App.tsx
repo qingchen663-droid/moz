@@ -86,7 +86,8 @@ export default function App() {
   useEffect(() => {
     if (!isAuthenticated) return
     loadConversations()
-    loadUsers()
+    // 多用户入口早就从界面上拿掉了，这里只是同步一下内部状态：挂了不该打扰用户
+    loadUsers().catch(() => {})
     loadMemoryStats()
     loadModelConfig()
     loadAvatar()

@@ -318,6 +318,27 @@ describe('崩了之后', () => {
   })
 })
 
+describe('后端没开的时候', () => {
+  it('第一屏要说清"怎么重新打开"，并且不许甩未捕获的异常', async () => {
+    const base = globalThis.fetch
+    globalThis.fetch = (async () => {
+      throw new TypeError('Failed to fetch')
+    }) as typeof fetch
+    try {
+      render(<App />)
+      await waitFor(() => expect(document.querySelector('.chat-error-banner')).toBeTruthy())
+      const text = document.querySelector('.chat-error-banner')!.textContent || ''
+      expect(text).toContain('moz-app.bat')
+      expect(text).not.toMatch(/undefined|\[object/)
+      // 等一轮主动消息轮询，确认挂掉的请求都各自兜住了
+      await useStore.getState().pullProactive()
+      await useStore.getState().loadUsers().catch(() => {})
+    } finally {
+      globalThis.fetch = base
+    }
+  })
+})
+
 describe('图片上传入口', () => {
   it('模型未声明能看图时上传按钮仍在（只是低调态）', async () => {
     render(<App />)

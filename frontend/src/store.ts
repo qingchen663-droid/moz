@@ -30,6 +30,11 @@ function chatErrorText(e: unknown): string {
   return raw || '这条没发出去，再试一次。'
 }
 
+/** 本地应用最常见的故障就是后端没开：报错要说"怎么办"，不是"某某加载失败"。 */
+function backendDownText(what: string): string {
+  return `${what}读不到：后端像是没在跑。双击项目里的 moz-app.bat 重新打开就好。`
+}
+
 interface AppState {
   userId: string
   avatar: string | null
@@ -137,12 +142,17 @@ export const useStore = create<AppState>((set, get) => ({
 
   loadConversations: async () => {
     const { userId } = get()
-    const data = await api.getConversations(userId)
-    set({
-      // 后端半启动时这里可能拿到空对象，不兜住会让历史列表整块崩掉
-      conversations: Array.isArray(data.conversations) ? data.conversations : [],
-      currentConvId: data.current_id || null,
-    })
+    try {
+      const data = await api.getConversations(userId)
+      set({
+        // 后端半启动时这里可能拿到空对象，不兜住会让历史列表整块崩掉
+        conversations: Array.isArray(data.conversations) ? data.conversations : [],
+        currentConvId: data.current_id || null,
+      })
+    } catch {
+      // 历史对话是打开应用第一眼看到的东西：说清"后端没跑"，别甩个未捕获异常
+      set({ conversations: [], currentConvId: null, error: backendDownText('历史对话') })
+    }
   },
 
   loadConversation: async (convId) => {
@@ -216,7 +226,7 @@ export const useStore = create<AppState>((set, get) => ({
       const stats = await api.getMemoryStats(userId)
       set({ memoryStats: stats, error: null })
     } catch (e) {
-      set({ statusText: '记忆统计加载失败', error: '记忆统计加载失败' })
+      set({ error: backendDownText('记忆数量') })
     }
   },
 
@@ -253,7 +263,7 @@ export const useStore = create<AppState>((set, get) => ({
       const config = await api.getModelConfig()
       set({ modelConfig: config, error: null })
     } catch (e) {
-      set({ statusText: '模型配置加载失败', error: '模型配置加载失败' })
+      set({ error: backendDownText('模型配置') })
     }
   },
 
@@ -262,7 +272,7 @@ export const useStore = create<AppState>((set, get) => ({
       const config = await api.getPromptConfig()
       set({ promptConfig: config, error: null })
     } catch (e) {
-      set({ statusText: '人设配置加载失败', error: '人设配置加载失败' })
+      set({ error: backendDownText('人设') })
     }
   },
 
