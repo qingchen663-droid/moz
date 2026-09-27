@@ -212,6 +212,7 @@ async def lifespan(app: FastAPI):
     # 一轮后台落库要跑几分钟模型调用；改成持久化队列，后端重启不再"聊完白聊"
     _app_state["save_queue"] = SaveQueue(db_path)
     replayed = _app_state["save_queue"].recover()
+    _app_state["save_queue"].prune()
     if replayed:
         logger.info("发现 %d 轮上次没落完的对话，正在补记", replayed)
     save_deps = SaveDeps(

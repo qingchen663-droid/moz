@@ -289,6 +289,10 @@ export const api = {
     return request(`/care/graph?user_id=${encodeURIComponent(userId)}`)
   },
 
+  getSaveQueue(userId: string): Promise<{ pending: number; running: number; pending_for_user: number }> {
+    return request(`/care/save-queue?user_id=${encodeURIComponent(userId)}`)
+  },
+
   deleteCareItem(userId: string, itemId: string): Promise<{ ok: boolean }> {
     return request(`/care/items/${itemId}?user_id=${encodeURIComponent(userId)}`, {
       method: 'DELETE',

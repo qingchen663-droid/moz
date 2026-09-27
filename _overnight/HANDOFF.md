@@ -1,7 +1,8 @@
 # moz 交接文档
 
-写于 2026-09-27 20:30 前后　·　接手时最新提交：`675e01c`（事件先后链），工作区干净
-这是"冷启动读这一份"用的地图；每一轮的来龙去脉、实测数字和踩坑细节都在 **`_overnight/RUNLOG.md`**（页尾最新，当前到第七轮）。
+写于 2026-09-27 20:30，第八轮后更新到 23:25　·　最新提交见 `git log`（第八轮：`b9691d9` 落库队列 /
+`046007e` 记忆质量 / `5dd8fb8` 关联上界面），工作区干净
+这是"冷启动读这一份"用的地图；每一轮的来龙去脉、实测数字和踩坑细节都在 **`_overnight/RUNLOG.md`**（页尾最新，当前到第八轮）。
 
 ---
 
@@ -27,9 +28,9 @@
 ## 2. 门禁：四条命令，全绿才提交
 
 ```bash
-# ① 后端全局自测（27 项快检，秒级，不碰大模型、不写用户数据）
+# ① 后端全局自测（29 项快检，秒级，不碰大模型、不写用户数据）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py
-# 想连真实对话/中转看图一起验：--full（31 项，慢、耗额度；跑完自己擦痕迹）
+# 想连真实对话/中转看图一起验：--full（33 项，慢、耗额度；跑完自己擦痕迹）
 # ② 后端单元测试（122 条）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m pytest backend/tests -q
 # ③④ 前端
@@ -40,7 +41,9 @@ cd frontend && npx tsc -b && npx vitest run
 - **必须用 `.venv/Scripts/python.exe`**。用系统 python 会报一堆假的 `ModuleNotFoundError: langchain`。
 - 两次自测之间**隔 60 秒以上**，否则会被自己的限流打掉（`限流不误伤本地` 那项自己就连发 80 次）。
 - pytest 是这一轮才补进门禁的：它之前一直不在门里，结果藏着一条从几轮前就失效的断言（429 文案）。
-- 当前基线：27 项 **0 失败 / 1 警告**、122 passed、50 passed、tsc 无输出。唯一那条 warn 见 §8 第 4 条。
+- 当前基线：29 项 **0 失败 / 1 警告**、122 passed、51 passed、tsc 无输出。唯一那条 warn 见 §8 第 1 条。
+- **写库的自测必须同时给 `storage_path` 和 `db_path`**：`MemoryManager(storage_path=tmp)` 的 SQLite
+  默认仍然指向 `backend/moz.db`，第八轮就这么往用户真实库写过 8 条探针行（快照后按 user_id 删干净了）。
 
 ## 3. 六条铁律（用户当面交代过，违反＝返工）
 
@@ -56,14 +59,17 @@ cd frontend && npx tsc -b && npx vitest run
    别给视觉请求加"看不清就别回答"这类约束——实测加了之后它对所有图都改口说看不清，功能等于废掉。
 6. 全程不要问用户"能不能/要不要"这类执行细节——他要的是你把事情做完并且合格（见 §9）。
 
-## 4. 代码地图（后端 24 个 py，按职责分三组）
+## 4. 代码地图（后端 25 个 py，按职责分三组）
 
 **长期记忆**
 - `memory_manager.py`（近 2400 行，核心）：`add_memory` / `search_memories`（多路改写 → 语义+关键词 → RRF → rerank）/
   容量策略（`MAX_ACTIVE_MEMORIES=5000`、归档默认永不硬删）/ 遗忘曲线。
   检索缓存两件套：`_keyword_derived`（每条记忆的分词/词频/清洗正文）+ `_search_index_cache`（向量矩阵），
   作废统一走 `_invalidate_search_cache()`——**任何改记忆状态/重要度/情感的地方都必须调它**（第五轮踩过）。
-- `memory_governance.py`：归一化、Grade/Degree 打分、频率分。`memory_layer.py`：层级与遗忘强度。
+- `memory_governance.py`：归一化、Grade/Degree 打分、频率分。第八轮起还管记忆质量：
+  `normalized_content` 会折掉句首 `用户/我/我们` 和虚词"的"（重复就是这么来的，第三人称不折）、
+  `is_near_duplicate`（判据是"多出来的部分全是虚词"，不是重合比例）、`is_question_shaped`。
+- `memory_layer.py`：层级与遗忘强度。
 - `memory_consolidation.py`：合并碎片（会调模型）。`temporal_metadata.py`：相对时间解析（**能力弱**，只认词表，
   解不了"一周后"）。`memory_evaluation.py`：确定性离线评测（沙箱做法的范本：临时库 + embedding 打桩）。
 
@@ -83,8 +89,12 @@ cd frontend && npx tsc -b && npx vitest run
 
 **对话与配置**
 - `server.py`（1.5k 行）：所有接口。`/api/care/dry-run` 是"看它此刻会说什么"的演练口（不写库、不调模型）。
-- `emotion_graph.py`：LangGraph 工作流。注意 `_background_save()` 是**串行 4 次模型调用**（工作记忆→长期记忆→档案卡→关心抽取），
-  实测一轮要 3~7 分钟——§8 第 1 条就是这个。
+- `emotion_graph.py`：LangGraph 工作流。一轮对话的落库在 `run_save_job()`，**四步并行**
+  （工作记忆 / 长期记忆→时间标签 / 档案卡 / 关心抽取），实测 38.7 秒（旧串行写法 3~7 分钟）。
+  时间标签必须紧跟长期记忆——它靠"刚创建 10 秒内"认领记忆，并行会认领不到。
+- `save_queue.py`：**后台落库的持久化队列**（`save_jobs` 表 + `SaveWorker` 单飞）。一句话先登记再干活，
+  后端重启由 `recover()` 把 running 遗骸捡回来续跑，所以不再"聊完白聊"；重试上限 `MAX_ATTEMPTS=3`，
+  `prune()` 只删已完成的历史行。只读状态：`GET /api/care/save-queue?user_id=`。
 - `llm_config.py` / `model_config.py` / `model_presets.py` / `llm_errors.py`：模型链路、"我存的模型"、错误翻译。
 - 其它：`conversation_store.py`、`summary_service.py`、`user_profile.py`、`file_processor.py`、`tray_app.py`。
   托盘在 Windows 上**一次启动会有两个 pythonw 进程**（父进程跑逻辑，子进程托管图标），不是重复轮询，别去"修"。
@@ -100,6 +110,7 @@ cd frontend && npx tsc -b && npx vitest run
 | 五 | 检索提速：**先分段量才发现大头是向量服务 401 风暴（每轮 338ms）不是算法** → 失败冷却 + 关键词索引按用户缓存；400 条一轮 470ms→7ms，5000 条 440ms→134ms；**排序一个字符没改**（两道等价性证明） | `649524f` |
 | 六 | 事件关联图：到点提醒不再孤零零，措辞带上下文（"关于妈妈：用户的妈妈喜欢养花"） | `8e3fda6` |
 | 七 | 事件先后链：`答辩 → 7 天 → 出结果`，到点会问"上次那事儿后来怎么样了"；规则兜底 + 模型字段两条路 | `675e01c` |
+| 八 | **P0 后台落库不再怕重启**（`save_jobs` 队列 + 四步并行：3~7 分钟 → 38.7 秒，沙箱硬杀验过补记）；记忆质量两条（同一件事不再攒三条、提问和 moz 自己的话不冒充事实）；关联与先后链上界面（"这件事还连着"）；限流检查挪到最后；头像不再回 404 | `b9691d9` `046007e` `5dd8fb8` |
 
 ## 6. 数据现状（别被空库吓到）
 
@@ -108,8 +119,10 @@ cd frontend && npx tsc -b && npx vitest run
 `[对话摘要] 用户说：只说颜色名…` 这类自测探针垃圾——**历次清理没删掉用户任何东西**。
 从这一刻起写进去的记忆才是真的开始攒。
 
-新表 `care_links` / `care_graph_state` 由 `CareGraph._init_db()` + `_migrate()` 自动建/加列，不需要人工迁移。
+新表 `care_links` / `care_graph_state` / `save_jobs` 由各自的 `_init_db()` + `_migrate()` 自动建/加列，不需要人工迁移。
 快照目录在**仓库外**：`项目/机器人/_overnight_backup/`；`tools/snapshot_data.py --label 名字` 手动存一份。
+第八轮把自己的一次污染清掉了：临时自测误用真实库写过 8 条 `user_id='t'` 的行，已存快照后按 user_id 删除，
+复查 `memories` 回到 0 行、`web_user_001` 的 28 条 grade_events 完好。
 
 ## 7. 复现过的坑（下次别再怀疑代码）
 
@@ -122,29 +135,35 @@ cd frontend && npx tsc -b && npx vitest run
 7. ctypes：`GetCurrentProcess.restype` 必须是 HANDLE；psapi 要声明 `argtypes`，否则 RSS 永远 -1。
 8. 子进程日志默认**块缓冲**，`terminate()` 会丢尾部 → 沙箱工具现在带 `PYTHONUNBUFFERED=1`。
 9. `async with`/`python - <<'PY'` 在这里会挂；临时脚本一律用 Write 工具落文件，路径用正斜杠绝对路径。
+10. **临时脚本里的字符串别嵌半角引号**：Markdown 正文里的 `"冷启动读这一份"` 这类引号塞进 python 双引号
+    字符串会直接把脚本炸掉（第八轮改这份文档时就炸了一次）。要么用三引号，要么直接用 Edit 工具改文档。
+11. **全角标点会被写成半角**：判 `？` 的字面量落到文件里成了 `?`，于是"用户说：…？"一律判不出来、
+    测试还一片绿。中文文案里的全角符号进代码一律用码位（`ord(ch) in (0x3F, 0xFF1F)`）。
+12. **别用"看起来合理"的阈值**：近义去重先用二元组重合比例卡 0.82，实测同一件事 0.80、相邻两件事 0.75，
+    等于在噪声上盖房子；换成"多出来的部分全是虚词 + 短条按序嵌进长条"才讲得通。第五轮的老教训复述一遍：
+    **先量分布再定判据**。
+13. **快检门禁不许碰模型**：`extract_and_store_facts` 会走中转（那一项跑了 156 秒、白烧额度）。
+    自测里把 `m._extract_facts` 钉成返回空数组，既落到 `[对话摘要]` 回落分支又回到 44 毫秒。
+14. 内置浏览器面板没开时，`evaluate_script`/`take_snapshot` 能用但**视口是 0×0**，量出来的宽高全是假的；
+    Computer Use 又会被 URL 校验策略拦停。界面像素级布局只能请用户本人看一眼。
 
-## 8. 没做完的事（按优先级，每条给了从哪下手）
+## 8. 还没做完的事（第八轮之后，按要不要你表态排序）
 
-1. **P0｜后台落库要 3~7 分钟，这期间重启就"聊完白聊"**。`emotion_graph._background_save()` 串行 4 次模型调用，
-   `--reload` 一重启，这轮的记事和链全丢。要么并行化四步，要么落一个持久化队列（重启后续跑）。
-   验收：说完一句带生日的话 → 立刻改 `.py` 触发重启 → 重启后仍然记下了事、建出了链。
-2. **P1｜记忆质量两条**（RUNLOG 第四轮 §4 有实例）：同一件事存成 2~3 条近义重复（这台机器没有 embedding，去重只剩字面归一化）；
-   **用户的提问原文和模型自己的回答也被当成长期记忆**（以后可能把"我问过团子叫什么"当成用户的事实，甚至套娃引用自己的回答）。
-   最小做法：`[对话摘要] 用户说：…？` 这类以问号结尾的条目不该进长期记忆；检索时对"提问形状"的记忆降权。
-3. **P1｜关联和链在界面上看不见**。后端接口已备好：`GET /api/care/related?user_id=&type=item&id=`、
-   `GET /api/care/graph`、`POST /api/care/graph/sync`、`POST /api/care/dry-run`（会回显 `context`/`chain`）。
-   落点是 `frontend/src/components/CareSection.tsx` 的每条事项下面加一行"这件事还连着…"。
-4. **P2｜遗忘曲线的归档分支是死的（等用户拍板）**：`decay_importance` 的地板正好等于 `prune_memories` 的阈值 0.1，
-   判据是严格小于 → 永远不成立，所以"不重要的事会慢慢淡忘"这句对外说法，实现上只会降到地板不会真忘。
-   两种改法：地板降到 0.05，或阈值提到 0.12。selftest 以 warn 记着，**别顺手改**。
-5. **P2｜自动滚动的"动的那半"没人真验过**：moz 回话那 20~135 秒里用户正在打字时，新回复会不会被顶出屏幕。
-   静态布局在真视口看过没问题；这条**必须真人试一次**才算数。
-6. **P2｜`限流不误伤本地` 会污染紧接着跑的检查**（自己连发 80 次打满 IP 桶）。挪到全部检查最后，或改成查 `/api/metrics`。
-7. **P3｜头像 404 噪音**：没设头像时 404 是正常回落，看着多是 dev 模式 StrictMode 双挂载。
-   要收敛就 404 时直接回 `{"avatar": null}`，前端不用 catch。
-8. **P3｜仓库根目录有 11 张截图 + 2 个日志被 git 跟踪**（`final_*.png`、`screenshot_*.png`、`frontend-*.log`）。
-   要不要清**先问用户**——他可能正拿这些做参赛材料。
-9. **明确不做过、需要有决定才动的**：真倒排索引（能把打分循环从 O(全部记忆) 拿掉，但**必须改排序**）；
+1. **要你拍板的三件**（有分歧先报告再动手，见 §9）：
+   - ① 遗忘曲线的归档分支是死的：`decay_importance` 的地板正好等于 `prune_memories` 的阈值 0.1，
+     判据是严格小于 → 永远不成立。对外说会慢慢淡忘，实现上只会降到地板不会真忘。
+     两种改法：地板降到 0.05，或阈值提到 0.12。**别顺手改**，selftest 以 warn 记着。
+   - ② 农历生日记不下来（第八轮新发现）：说我妈生日是农历十月初五，模型路径和 `TemporalExtractor`
+     规则兜底**都不记**，只记下同一句里的答辩。修它要加农历换算（引依赖或自己写表）。
+     README 对外没承诺农历，但长辈生日走农历的不少，算不算必须补的短板你定。
+   - ③ 仓库根目录 11 张截图 + 2 个日志仍被 git 跟踪（`final_*.png`、`screenshot_*.png`、`frontend-*.log`）——
+     删不删看你还要不要拿它们做参赛材料。
+2. **必须真人试一次**：moz 回话那 20~135 秒里你正在打字时，新回复会不会被顶出屏幕。
+   第八轮新加的这件事还连着同样**只验到文字、没验到像素**（原因见 §7 第 14 条）。
+   想看真实数据的效果（全程不碰 `backend/moz.db`）：
+   `PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/seed_ui_sandbox.py <沙箱backend目录>` 种数据，
+   再 `cd frontend && MOZ_API_PORT=<沙箱端口> npx vite --port 3100` 开界面。
+3. **明确不做过、需要有决定才动的**：真倒排索引（能把打分循环从 O(全部记忆) 拿掉，但**必须改排序**）；
    事件之间的因果/条件边（"如果 A 就 B"）；把关联图画成前端图。
 
 ## 9. 和这位用户协作的方式
@@ -155,12 +174,13 @@ cd frontend && npx tsc -b && npx vitest run
 - 他还有另一条交付线：**专利与竞赛材料**（docx，用 WPS 肉眼验收），和代码门禁是两套东西。
 - 有分歧时优先保守：产品对外说法（"会慢慢淡忘""能看图"）和代码行为不一致时，**先报告再动手**，别偷偷改行为。
 
-## 10. 接手后先跑这三条（1 分钟）
+## 10. 接手后先跑这四条（1 分钟）
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health                                 # 后端活着（注意是 /api/health，根路径 404）
-PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py   # 27 项门禁应 0 失败
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py   # 29 项门禁应 0 失败
 curl -X POST "http://127.0.0.1:8000/api/care/dry-run?user_id=web_user_001"   # 看它此刻会主动说什么
+curl -s  "http://127.0.0.1:8000/api/care/save-queue?user_id=web_user_001"    # 还有几轮没落库（第八轮新增）
 ```
 
-然后读 `_overnight/RUNLOG.md` 的第七轮。有问题先查 RUNLOG 再查代码——这一夜踩的坑大多已经写在那里了。
+然后读 `_overnight/RUNLOG.md` 的第八轮。有问题先查 RUNLOG 再查代码——这一夜踩的坑大多已经写在那里了。

@@ -37,6 +37,11 @@ function viaNote(via: string): string {
   return `和「${hub}」有关`
 }
 
+/** 记忆条目的正文带着抽取器的 [关于用户] 这类前缀，是内部标记，别给用户看 */
+function plainLabel(label: string): string {
+  return label.replace(/^\[[^\]]*\]\s*/, '').replace(/^用户(?:说|提到|表示)[：:]\s*/, '')
+}
+
 /** 先后链：src 是晚发生的那件，dst 是早的那件。挂在事项后面显示给用户的就一句话。 */
 function chainNotes(items: CareItem[], edges: CareEdge[]): Record<string, string> {
   const titles = new Map(items.map((i) => [i.id, i.title]))
@@ -44,10 +49,10 @@ function chainNotes(items: CareItem[], edges: CareEdge[]): Record<string, string
   for (const e of edges) {
     if (e.rel !== 'after') continue
     const days = Math.max(1, Math.round(e.offset_days || 0))
-    const later = titles.get(e.src_id) || e.label
+    const later = titles.get(e.src_id) || plainLabel(e.label)
     const earlier = titles.get(e.dst_id)
-    if (earlier && !out[e.dst_id]) out[e.dst_id] = `${days} 天后 ${later} 有下文`
-    if (later && !out[e.src_id]) out[e.src_id] = `来自 ${earlier || '前面那件事'}之后`
+    if (earlier && !out[e.dst_id]) out[e.dst_id] = `${days} 天后：${later}`
+    if (later && !out[e.src_id]) out[e.src_id] = `晚于「${earlier || plainLabel(e.label)}」${days} 天`
   }
   return out
 }
@@ -58,6 +63,7 @@ export default function CareSection() {
   const [items, setItems] = useState<CareItem[]>([])
   const [links, setLinks] = useState<Record<string, CareRelatedNode[]>>({})
   const [chains, setChains] = useState<Record<string, string>>({})
+  const [pendingRounds, setPendingRounds] = useState(0)
   const [notice, setNotice] = useState('')
   const [dryRun, setDryRun] = useState('')
   const [busy, setBusy] = useState(false)
@@ -72,6 +78,8 @@ export default function CareSection() {
 
     const graph = await api.getCareGraph(userId).catch(() => null)
     setChains(chainNotes(list, graph?.edges ?? []))
+    const queue = await api.getSaveQueue(userId).catch(() => null)
+    setPendingRounds(queue?.pending_for_user ?? 0)
     const pairs = await Promise.all(
       list.slice(0, 24).map(async (it) => {
         const res = await api.getCareRelated(userId, it.id).catch(() => ({ related: [] }))
@@ -267,7 +275,7 @@ export default function CareSection() {
                       <span className="care-links-label">这件事还连着</span>
                       {(links[it.id] ?? []).map((r) => (
                         <em key={`${r.via}-${r.id}`} className="care-link-chip">
-                          {viaNote(r.via)} · {r.label}
+                          {viaNote(r.via)} · {plainLabel(r.label)}
                         </em>
                       ))}
                       {chains[it.id] && (
@@ -288,6 +296,9 @@ export default function CareSection() {
           </>
         )}
       </div>
+      {pendingRounds > 0 && (
+        <div className="care-notice">刚说完的那 {pendingRounds} 轮还在往长期记忆里存，不用重说一遍。</div>
+      )}
       {notice && <div className="care-notice">{notice}</div>}
     </div>
   )

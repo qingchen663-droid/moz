@@ -50,7 +50,7 @@ beforeAll(() => {
     if (url.includes('/care/related'))
       return json({
         related: [
-          { type: 'memory', id: 'm-9', label: '用户的妈妈喜欢养花', kind: 'fact', via: 'person:妈妈', score: 0.61 },
+          { type: 'memory', id: 'm-9', label: '[关于用户] 用户的妈妈喜欢养花', kind: 'fact', via: 'person:妈妈', score: 0.61 },
         ],
       })
     if (url.includes('/care/graph'))
@@ -82,6 +82,6 @@ describe('关心事项上的"这件事还连着"', () => {
     await waitFor(() => expect(screen.getByText('项目答辩')).toBeTruthy())
     expect(screen.getByText('这件事还连着')).toBeTruthy()
     expect(await screen.findByText(/关于妈妈 · 用户的妈妈喜欢养花/)).toBeTruthy()
-    expect(await screen.findByText(/7 天后 答辩出结果 有下文/)).toBeTruthy()
+    expect(await screen.findByText(/7 天后：答辩出结果/)).toBeTruthy()
   })
 })
