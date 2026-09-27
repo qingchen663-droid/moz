@@ -830,3 +830,28 @@ describe('档案卡上能把记错的划掉', () => {
     cleanupFetch()
   })
 })
+
+describe('关心面板读不到设置时说的话', () => {
+  it('后端回了 403 就念 403 的原因，别一口咬定"后端没在跑"', async () => {
+    const { default: CareSection } = await import('../components/CareSection')
+    const base = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : String(input)
+      if (url.includes('/care/settings'))
+        return mockResponse({ detail: '用户不在允许列表中' }, 403)
+      return mockResponse({}, 200)
+    }) as typeof fetch
+    try {
+      render(<CareSection />)
+      await waitFor(() =>
+        expect(document.body.textContent).toContain('读不到主动关心的设置')
+      )
+      const body = document.body.textContent || ''
+      expect(body).toContain('用户不在允许列表中')
+      expect(body).not.toContain('后端没在跑')
+    } finally {
+      globalThis.fetch = base
+      cleanup()
+    }
+  })
+})

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useStore } from '../store'
-import { api } from '../api'
+import { api, whyFailed } from '../api'
 import type { CareEdge, CareItem, CareKind, CareRelatedNode, CareSettings } from '../types'
 import { stripInternal } from '../memoryText'
 import './CareSection.css'
@@ -132,6 +132,7 @@ export default function CareSection() {
   const [dryRun, setDryRun] = useState('')
   const [busy, setBusy] = useState(false)
   const [loadFailed, setLoadFailed] = useState(false)
+  const [loadReason, setLoadReason] = useState('后端没在跑')
 
   const reload = useCallback(async () => {
     const [s, i] = await Promise.all([api.getCareSettings(userId), api.getCareItems(userId)])
@@ -154,9 +155,11 @@ export default function CareSection() {
   }, [userId])
 
   useEffect(() => {
-    reload().catch(() => {
+    reload().catch((e) => {
+      const why = whyFailed(e)
       setLoadFailed(true)
-      setNotice('读取关心设置失败，请确认后端在运行')
+      setLoadReason(why)
+      setNotice(`读取关心设置失败：${why}`)
     })
   }, [reload])
 
@@ -170,8 +173,8 @@ export default function CareSection() {
       const saved = await api.saveCareSettings(userId, settings)
       setSettings(saved)
       setNotice('设置已保存')
-    } catch {
-      setNotice('保存失败，请确认后端在运行')
+    } catch (e) {
+      setNotice(`保存失败：${whyFailed(e)}`)
     } finally {
       setBusy(false)
     }
@@ -185,8 +188,8 @@ export default function CareSection() {
       await api.deleteCareItem(userId, id)
       await reload()
       setNotice(`已经不记着「${title}」了`)
-    } catch {
-      setNotice('删除失败，请确认后端在运行')
+    } catch (e) {
+      setNotice(`删除失败：${whyFailed(e)}`)
     } finally {
       setBusy(false)
     }
@@ -202,8 +205,8 @@ export default function CareSection() {
           ? `「${first.text}」— 为什么是现在：${first.why}`
           : '此刻没有该说的：要么没到点的事，要么我今天的话已经说够了。'
       )
-    } catch {
-      setDryRun('判定失败，请确认后端在运行')
+    } catch (e) {
+      setDryRun(`判定失败：${whyFailed(e)}`)
     }
   }
 
@@ -211,7 +214,7 @@ export default function CareSection() {
     return (
       <div className={loadFailed ? 'care-notice care-notice--fail' : 'care-loading'}>
         {loadFailed
-          ? '读不到主动关心的设置：后端没在跑，或者这个接口挂了。下面的开关暂时点不动。'
+          ? `读不到主动关心的设置：${loadReason}。下面的开关暂时点不动。`
           : '加载关心设置...'}
       </div>
     )
