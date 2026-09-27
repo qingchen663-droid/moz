@@ -43,6 +43,7 @@ from memory_governance import (
     normalized_content,
     is_near_duplicate,
     is_question_shaped,
+    drop_redundant_prefix_facts,
 )
 from llm_errors import looks_like_system_copy
 
@@ -2257,7 +2258,10 @@ class MemoryManager:
         extracted_facts = self._extract_facts(user_msg, assistant_msg)
 
         if extracted_facts:
-            for fact in [f for f in extracted_facts if not is_question_shaped(f)]:
+            # 同一句话抽出"一窄一宽"两条时，窄的那条整段藏在宽的那条开头，不必各存一份
+            fresh = drop_redundant_prefix_facts(
+                [f for f in extracted_facts if not is_question_shaped(f)])
+            for fact in fresh:
                 supersedes = self._resolve_fact_conflicts(user_id, fact, category)
                 self.add_memory(
                     user_id=user_id,

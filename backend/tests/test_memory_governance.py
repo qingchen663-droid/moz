@@ -171,3 +171,30 @@ def test_manual_grade_is_locked_and_audited():
         assert memory.locked is True
         events = manager.get_grade_history("user", memory.id)
         assert any(event["event_type"] == "manual" and event["new_grade"] == 4 for event in events)
+
+
+def test_same_turn_narrow_fact_merges_into_wide():
+    """同一句话抽出"一窄一宽"两条时只留宽的（第十五轮沙箱实测）。
+
+    「我讨厌吃香菜，以后别推荐我带香菜的东西」会同时给出
+    「用户讨厌吃香菜，不希望被推荐带香菜的食物」和「我讨厌吃香菜」，
+    归一后窄的那条整段是宽的那条的**前缀**。
+    """
+    from memory_governance import drop_redundant_prefix_facts as drop
+
+    wide = "用户讨厌吃香菜，不希望被推荐带香菜的食物"
+    assert drop([wide, "我讨厌吃香菜"]) == [wide]
+    assert drop(["我讨厌吃香菜", wide]) == [wide]      # 顺序反过来也留宽的
+    assert drop([wide, wide]) == [wide]                 # 连字都一样
+    assert drop(["用户在滨江工作", "用户在滨江工作压力大"]) == ["用户在滨江工作压力大"]
+
+
+def test_prefix_rule_does_not_merge_different_people_or_events():
+    """反例：窄的是宽的**后缀**时差的是主语，必须各留一条。"""
+    from memory_governance import drop_redundant_prefix_facts as drop
+
+    assert len(drop(["用户的妈妈喜欢养花", "用户喜欢养花"])) == 2
+    assert len(drop(["用户的猫叫团子", "用户的猫今年五岁", "用户的猫是只橘猫"])) == 3
+    assert len(drop(["我喜欢猫", "他喜欢猫"])) == 2
+    # 短的片段（"喜欢"）不拿去当前缀比对
+    assert len(drop(["我喜欢养花", "喜欢"])) == 2

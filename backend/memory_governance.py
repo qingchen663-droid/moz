@@ -118,6 +118,38 @@ def _negated(text: str) -> bool:
     return any(ch in text for ch in "不没别")
 
 
+_MIN_PREFIX_LEN = 4      # 两三个字的片段（"喜欢"）别拿去当前缀比对
+
+
+def drop_redundant_prefix_facts(facts: List[str]) -> List[str]:
+    """同一句话里抽出"一窄一宽"两条时，只留宽的那条。
+
+    第十五轮实测：「我讨厌吃香菜，以后别推荐我带香菜的东西」落库两条，
+    归一后是 `讨厌吃香菜` 和 `讨厌吃香菜不希望被推荐带香菜食物`——窄的那条**整段**
+    就藏在宽的那条开头，多出来的一截仍然说的是同一件事，存两条只是让
+    「moz 记得什么」多一行重复、检索多一个占位。
+
+    只认**前缀**，不认任意包含：反例「用户的妈妈喜欢养花」（归一 `妈喜欢养花`）和
+    「用户喜欢养花」（归一 `喜欢养花`）是后缀关系，差的是一整个主语，必须各留一条。
+    """
+    texts = [normalized_content(f) for f in facts]
+    drop = set()
+    seen = set()
+    for i, text in enumerate(texts):
+        if not text:
+            continue
+        if text in seen:
+            drop.add(i)              # 同一批里连字都一样，留前面那条
+            continue
+        seen.add(text)
+        if len(text) >= _MIN_PREFIX_LEN and any(
+            j != i and texts[j].startswith(text) and len(texts[j]) > len(text)
+            for j in range(len(texts))
+        ):
+            drop.add(i)
+    return [f for i, f in enumerate(facts) if i not in drop]
+
+
 def is_near_duplicate(a: str, b: str) -> bool:
     """两条已归一化的正文是不是同一件事的两种写法。
 

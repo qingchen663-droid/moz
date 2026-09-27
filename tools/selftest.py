@@ -1510,6 +1510,51 @@ def system_copy_not_memory():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def same_turn_no_duplicate_facts():
+    """同一句话抽出的"一窄一宽"两条事实，不许各占一行记忆。
+
+    第十五轮实测（沙箱第 5 句「我讨厌吃香菜，以后别推荐我带香菜的东西」）落了两条：
+      [关于用户] 用户讨厌吃香菜，不希望被推荐带香菜的食物
+      [关于用户] 我讨厌吃香菜
+    归一后窄的那条**整段**是宽的那条的前缀。反例必须各留：
+      「用户的妈妈喜欢养花」(归一 妈喜欢养花) 与「用户喜欢养花」(归一 喜欢养花) 是**后缀**关系，
+      差的是一个人——所以判据只认前缀，不认任意包含。
+    """
+    import shutil
+    import tempfile
+
+    from memory_governance import drop_redundant_prefix_facts as drop
+
+    bad = []
+    if drop(["用户讨厌吃香菜，不希望被推荐带香菜的食物", "我讨厌吃香菜"]) != [
+            "用户讨厌吃香菜，不希望被推荐带香菜的食物"]:
+        bad.append("同句一窄一宽没合成一条")
+    keep = drop(["用户的妈妈喜欢养花", "用户喜欢养花"])
+    if len(keep) != 2:
+        bad.append(f"差一个人的两条被误合：{keep}")
+    if len(drop(["用户的猫叫团子", "用户的猫今年五岁", "用户的猫是只橘猫"])) != 3:
+        bad.append("三件不同的事被并了")
+    if drop(["我喜欢猫", "我喜欢猫"]) != ["我喜欢猫"]:
+        bad.append("一模一样的两条没去掉")
+
+    d = tempfile.mkdtemp(prefix="moz-selftest-facts-")
+    try:
+        import memory_manager as MM
+        m = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "f.db"))
+        m.embedding_service.get_embedding = lambda text: None
+        m._extract_facts = lambda *a, **k: [
+            "用户讨厌吃香菜，不希望被推荐带香菜的食物", "我讨厌吃香菜"]
+        m.extract_and_store_facts("dupe", "我讨厌吃香菜，以后别推荐我带香菜的东西", "好",
+                                  category=MM.MemoryCategory.FACT)
+        stored = [x.content for x in m._get_user_memories("dupe").values()]
+        if len(stored) != 1:
+            bad.append(f"整条路径落库 {len(stored)} 条：{stored}")
+        return "; ".join(bad) or True
+    finally:
+        close_db_conn(m)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def question_answer_not_memory():
     """用户问一句、她答一句，那句回答不配单独占一条"关于用户的事实"。
 
@@ -2078,6 +2123,7 @@ def main():
     check("记忆质量底线", memory_quality_floor)
     check("系统文案不进长期记忆", system_copy_not_memory)
     check("提问的回答不单独存成事实", question_answer_not_memory)
+    check("同一句话不存两条重复事实", same_turn_no_duplicate_facts)
     check("事件关联成图", care_link_graph_check)
     check("事件先后链", care_chain_link_check)
     check("探针清理器不错杀", probe_cleaner_works)
