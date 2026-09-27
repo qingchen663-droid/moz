@@ -1,9 +1,27 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import MessageBubble from './MessageBubble'
 import { stopGeneration } from '../api'
 import ChatInput from './ChatInput'
 import './ChatArea.css'
+
+/** 等了多久才开始解释——中转发度时一句 25~35 秒是常态，太早开口反而像出错了。 */
+export const WAIT_NOTICE_AFTER = 40
+
+export function waitedLabel(sec: number): string {
+  if (sec < 60) return `${sec} 秒`
+  return `${Math.floor(sec / 60)} 分 ${sec % 60} 秒`
+}
+
+/** 这句话她想了多久还没吐第一个字。第十五轮实测过 376 秒才回完一整句，
+ *  那之前界面上只有一个转圈的点，用户不知道该等还是该走。 */
+export function waitNotice(sec: number): string {
+  if (sec >= 180)
+    return `这句她已经想了 ${waitedLabel(sec)}，多半是中转卡住了。`
+      + '再等下去不如点下面的「停止生成」，停下来重发一句通常就通。'
+  return `这句她还在想（已经 ${waitedLabel(sec)}）。今天中转特别慢，`
+    + '不是她没听懂；不想等可以点下面的「停止生成」。'
+}
 
 export default function ChatArea() {
   const messages = useStore((s) => s.messages)
@@ -20,6 +38,18 @@ export default function ChatArea() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, statusText])
+
+  // 这一句等了多久： isLoading 一真就起表，第一个字到手/结束自然归零
+  const [waited, setWaited] = useState(0)
+  useEffect(() => {
+    if (!isLoading) {
+      setWaited(0)
+      return
+    }
+    const t0 = Date.now()
+    const id = setInterval(() => setWaited(Math.floor((Date.now() - t0) / 1000)), 1000)
+    return () => clearInterval(id)
+  }, [isLoading])
 
   return (
     <div className="chat-area">
@@ -78,6 +108,11 @@ export default function ChatArea() {
             <button className="chat-stop-btn" onClick={stopGeneration}>
               停止生成
             </button>
+            {waited >= WAIT_NOTICE_AFTER && !statusText && (
+              <div className="chat-waiting-note" role="status">
+                {waitNotice(waited)}
+              </div>
+            )}
           </>
         )}
 
