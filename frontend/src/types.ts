@@ -37,6 +37,18 @@ export interface ModelConfig {
   use_thinking?: boolean
 }
 
+/** 用户自己存的模型配置：后端不返回密钥，只返回 has_key */
+export interface SavedModel {
+  name: string
+  model: string
+  base_url: string
+  use_thinking: boolean
+  multimodal: boolean | null
+  has_key: boolean
+  saved_at: number
+  is_active: boolean
+}
+
 export interface ModelPreset {
   model: string
   base_url: string

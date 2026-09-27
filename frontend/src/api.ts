@@ -3,6 +3,7 @@ import type {
   UserInfo,
   MemoryStats,
   ModelConfig,
+  SavedModel,
   Message,
   LogEntry,
   PromptConfig,
@@ -183,6 +184,29 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
     })
+  },
+
+  // ── 我存的模型（密钥留在后端，前端只拿到 has_key）──
+  getSavedModels(): Promise<{ items: SavedModel[]; max: number }> {
+    return request('/config/saved-models')
+  },
+
+  saveModelAs(name: string): Promise<{ ok: boolean; saved: string; items: SavedModel[]; max: number }> {
+    return request('/config/saved-models', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    })
+  },
+
+  useSavedModel(name: string): Promise<{ ok: boolean; model: string; items: SavedModel[]; max: number }> {
+    return request('/config/saved-models/use', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    })
+  },
+
+  deleteSavedModel(name: string): Promise<{ ok: boolean; items: SavedModel[]; max: number }> {
+    return request(`/config/saved-models/${encodeURIComponent(name)}`, { method: 'DELETE' })
   },
 
   getPromptConfig(): Promise<PromptConfig> {

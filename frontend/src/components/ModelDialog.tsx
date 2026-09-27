@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { api } from '../api'
-import type { ModelPresets } from '../types'
+import type { ModelPresets, SavedModel } from '../types'
 import './ModelDialog.css'
 
 interface Props {
@@ -31,6 +31,12 @@ export default function ModelDialog({ onClose }: Props) {
   const [modelsLoading, setModelsLoading] = useState(false)
   const [modelsError, setModelsError] = useState<string | null>(null)
 
+  // 我存的模型
+  const [saved, setSaved] = useState<SavedModel[]>([])
+  const [savedMax, setSavedMax] = useState(12)
+  const [saveAsName, setSaveAsName] = useState('')
+  const [savedBusy, setSavedBusy] = useState(false)
+
   useEffect(() => {
     loadModelConfig()
     api
@@ -42,6 +48,15 @@ export default function ModelDialog({ onClose }: Props) {
       .catch((err) => {
         console.error('加载模型预设失败:', err)
         setLoading(false)
+      })
+    api
+      .getSavedModels()
+      .then((r) => {
+        setSaved(r.items ?? [])
+        setSavedMax(r.max ?? 12)
+      })
+      .catch(() => {
+        /* 后端没起来时这块就是空的，不额外打扰用户 */
       })
   }, [])
 
@@ -89,6 +104,57 @@ export default function ModelDialog({ onClose }: Props) {
       setModelsError(err instanceof Error ? err.message : '请求失败，请确认后端在运行')
     } finally {
       setModelsLoading(false)
+    }
+  }
+
+  const errText = (e: unknown) => (e instanceof Error ? e.message : '后端没应答')
+
+  const handleSaveCurrentAs = async () => {
+    const name = saveAsName.trim()
+    if (!name) {
+      setSaveMessage({ type: 'error', text: '先给这套配置起个名字，比如「中转 deepseek」。' })
+      return
+    }
+    setSavedBusy(true)
+    setSaveMessage(null)
+    try {
+      const r = await api.saveModelAs(name)
+      setSaved(r.items ?? [])
+      setSavedMax(r.max ?? savedMax)
+      setSaveAsName('')
+      setSaveMessage({ type: 'success', text: `已存成「${r.saved}」，以后点一下就换回来。` })
+    } catch (e) {
+      setSaveMessage({ type: 'error', text: `没存上：${errText(e)}` })
+    } finally {
+      setSavedBusy(false)
+    }
+  }
+
+  const handleUseSaved = async (name: string) => {
+    setSavedBusy(true)
+    setSaveMessage(null)
+    try {
+      const r = await api.useSavedModel(name)
+      setSaved(r.items ?? [])
+      await loadModelConfig()
+      setSaveMessage({ type: 'success', text: `已切到「${name}」，下一条消息就用它。` })
+    } catch (e) {
+      setSaveMessage({ type: 'error', text: `没换成：${errText(e)}` })
+    } finally {
+      setSavedBusy(false)
+    }
+  }
+
+  const handleDeleteSaved = async (name: string) => {
+    if (!window.confirm(`不再要「${name}」这套配置？现在正在用的模型不受影响。`)) return
+    setSavedBusy(true)
+    try {
+      const r = await api.deleteSavedModel(name)
+      setSaved(r.items ?? [])
+    } catch (e) {
+      setSaveMessage({ type: 'error', text: `没删掉：${errText(e)}` })
+    } finally {
+      setSavedBusy(false)
     }
   }
 
@@ -169,6 +235,76 @@ export default function ModelDialog({ onClose }: Props) {
               {modelConfig?.multimodal && <span className="model-badge">多模态</span>}
             </div>
             <div className="current-model-url">{modelConfig?.base_url || ''}</div>
+          </div>
+
+          {/* 我存的模型：同一套中转/密钥下想切来切去的几份配置 */}
+          <div className="saved-models-section">
+            <h3>我存的模型</h3>
+            {saved.length === 0 ? (
+              <div className="saved-models-empty">
+                还没存过。调好一套之后在下面起个名字存起来，以后点一下就切回来。
+              </div>
+            ) : (
+              <div className="saved-models-list">
+                {saved.map((m) => (
+                  <div key={m.name} className={`saved-model ${m.is_active ? 'saved-model--active' : ''}`}>
+                    <div className="saved-model-main">
+                      <div className="saved-model-name">
+                        {m.name}
+                        {m.is_active && <span className="saved-model-now">使用中</span>}
+                      </div>
+                      <div className="saved-model-meta">
+                        {m.model} · {(m.base_url || '').replace(/^https?:\/\//, '').slice(0, 24)}
+                        {m.use_thinking ? ' · 深度思考' : ''}
+                        {m.multimodal ? ' · 能发图' : ''}
+                        {m.has_key ? '' : ' · 没带密钥'}
+                      </div>
+                    </div>
+                    {!m.is_active && (
+                      <button
+                        className="saved-model-btn"
+                        onClick={() => handleUseSaved(m.name)}
+                        disabled={savedBusy}
+                      >
+                        用这个
+                      </button>
+                    )}
+                    <button
+                      className="saved-model-del"
+                      onClick={() => handleDeleteSaved(m.name)}
+                      title={`删掉「${m.name}」这套配置`}
+                      disabled={savedBusy}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="saved-model-save">
+              <input
+                className="form-input"
+                value={saveAsName}
+                maxLength={20}
+                placeholder="把当前这套存成…（如：中转 deepseek）"
+                onChange={(e) => setSaveAsName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleSaveCurrentAs()
+                }}
+              />
+              <button
+                type="button"
+                className="model-fetch-btn"
+                onClick={handleSaveCurrentAs}
+                disabled={savedBusy}
+                title="把正在用的这套模型、地址、密钥存成一个可点回来的名字"
+              >
+                存起来
+              </button>
+            </div>
+            {saved.length >= savedMax && (
+              <div className="saved-models-hint">最多存 {savedMax} 套，先删一套再存新的。</div>
+            )}
           </div>
 
           {!selectedPreset ? (

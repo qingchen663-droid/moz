@@ -339,6 +339,47 @@ describe('后端没开的时候', () => {
   })
 })
 
+describe('我存的模型', () => {
+  it('列得出来、点得回去，界面上不出现密钥', async () => {
+    const base = globalThis.fetch
+    const posts: string[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      posts.push(`${init?.method ?? 'GET'} ${url}`)
+      if (url.includes('/config/saved-models'))
+        return mockResponse({
+          max: 12,
+          items: [
+            {
+              name: '中转 deepseek', model: 'deepseek-v4.1-flash', base_url: 'https://x.example/v1',
+              use_thinking: true, multimodal: true, has_key: true, saved_at: 1, is_active: false,
+            },
+            {
+              name: '现在这套', model: 'glm-5.1', base_url: 'https://y.example/v1',
+              use_thinking: false, multimodal: null, has_key: true, saved_at: 2, is_active: true,
+            },
+          ],
+        })
+      return base(input as RequestInfo)
+    }) as typeof fetch
+    try {
+      const { default: ModelDialog } = await import('../components/ModelDialog')
+      render(<ModelDialog onClose={() => {}} />)
+      await waitFor(() => expect(document.querySelectorAll('.saved-model').length).toBe(2))
+      const body = document.querySelector('.model-dialog')!.textContent!
+      expect(body).toContain('中转 deepseek')
+      expect(body).toContain('使用中')
+      expect(body).not.toMatch(/sk-[A-Za-z0-9]|\*{4,}/)
+      // 正在用的那套不该再给"用这个"
+      expect(document.querySelectorAll('.saved-model-btn').length).toBe(1)
+      fireEvent.click(document.querySelector('.saved-model-btn')!)
+      await waitFor(() => expect(posts.some((p) => p.includes('saved-models/use'))).toBe(true))
+    } finally {
+      globalThis.fetch = base
+    }
+  })
+})
+
 describe('图片上传入口', () => {
   it('模型未声明能看图时上传按钮仍在（只是低调态）', async () => {
     render(<App />)

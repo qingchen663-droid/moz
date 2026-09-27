@@ -151,6 +151,133 @@
   font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
 }
 
+/* 我存的模型 */
+.saved-models-section {
+  margin: 18px 0 4px 0;
+}
+
+.saved-models-section h3 {
+  font-size: 14px;
+  font-weight: 700;
+  color: #2D2420;
+  margin-bottom: 10px;
+}
+
+.saved-models-empty {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #7A6E64;
+  padding: 12px 14px;
+  border: 1px dashed #E0CFC2;
+  border-radius: 12px;
+  background: #FDFAF7;
+}
+
+.saved-models-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.saved-model {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid #ECE3D8;
+  border-radius: 12px;
+  background: #FFFFFF;
+}
+
+.saved-model--active {
+  border-color: #F0C8B6;
+  background: #FFF9F5;
+}
+
+.saved-model-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.saved-model-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #2D2420;
+}
+
+.saved-model-now {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #D4785C;
+  border: 1px solid #F0C8B6;
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.saved-model-meta {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: #9A8E84;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.saved-model-btn {
+  flex: none;
+  height: 30px;
+  padding: 0 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #FFFFFF;
+  background: #D4785C;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.saved-model-btn:hover:not(:disabled) {
+  background: #C0684C;
+}
+
+.saved-model-del {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  font-size: 12px;
+  color: #B0A59A;
+  background: transparent;
+  border: 1px solid #E8E0D6;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.saved-model-del:hover:not(:disabled) {
+  color: #DC2626;
+  border-color: #FECACA;
+}
+
+.saved-model-save {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.saved-model-save .form-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.saved-models-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #B0794C;
+}
+
 /* 预设模型区域 */
 .presets-section h3,
 .help-section h3 {

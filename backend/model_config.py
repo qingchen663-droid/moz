@@ -7,13 +7,16 @@
 
 import os
 import json
-from typing import Optional
+import time
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "runtime_model_config.json")
+_SAVED_PATH = os.path.join(os.path.dirname(__file__), "saved_models.json")
+SAVED_MAX = 12
 
 # 默认配置
 DEFAULT_CHAT_MODEL = "deepseek-v4-flash"
@@ -56,6 +59,80 @@ def save_active_config(model: str, base_url: str, api_key: str = "", use_thinkin
 
 def get_current_model() -> str:
     return load_active_config()["model"]
+
+
+# ================================================================
+# 我存的模型：同一套地址/密钥下想切来切去的几份配置
+# ================================================================
+
+def load_saved_models() -> List[Dict[str, Any]]:
+    """里面带 API Key，所以 saved_models.json 和 runtime_model_config.json 一样不入版本库。"""
+    if not os.path.exists(_SAVED_PATH):
+        return []
+    try:
+        with open(_SAVED_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [d for d in data if isinstance(d, dict) and str(d.get("name") or "").strip()]
+
+
+def _write_saved_models(items: List[Dict[str, Any]]) -> None:
+    tmp = _SAVED_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _SAVED_PATH)  # 原子替换，别留半截 JSON
+
+
+def save_current_as(name: str) -> Dict[str, Any]:
+    """把"当前生效的那套"存成一个可点回来的名字。
+
+    Key 由后端自己从生效配置里读，绝不从浏览器传上来——界面上不该出现密钥。
+    """
+    label = (name or "").strip()[:20]
+    if not label:
+        raise ValueError("给这套配置起个名字，比如「中转 deepseek」")
+    cfg = load_active_config()
+    entry = {
+        "name": label,
+        "model": cfg["model"],
+        "base_url": cfg["base_url"],
+        "api_key": cfg.get("api_key") or "",
+        "use_thinking": bool(cfg.get("use_thinking")),
+        "multimodal": cfg.get("multimodal"),
+        "saved_at": time.time(),
+    }
+    items = [i for i in load_saved_models() if i["name"] != label]
+    items.append(entry)
+    _write_saved_models(items[-SAVED_MAX:])
+    return entry
+
+
+def delete_saved_model(name: str) -> bool:
+    items = load_saved_models()
+    left = [i for i in items if i["name"] != (name or "").strip()[:20]]
+    if len(left) == len(items):
+        return False
+    _write_saved_models(left)
+    return True
+
+
+def apply_saved_model(name: str) -> Dict[str, Any]:
+    label = (name or "").strip()[:20]
+    entry = next((i for i in load_saved_models() if i["name"] == label), None)
+    if not entry:
+        raise KeyError(label)
+    save_active_config(
+        model=entry.get("model", ""),
+        base_url=entry.get("base_url", ""),
+        api_key=entry.get("api_key", "") or "",
+        use_thinking=bool(entry.get("use_thinking")),
+        multimodal=entry.get("multimodal"),
+    )
+    return entry
+
 
 def get_current_base_url() -> str:
     return load_active_config()["base_url"]

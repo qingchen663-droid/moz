@@ -73,7 +73,7 @@ def http(path, method="GET", body=None, timeout=30, raw=False):
 # ── 1. 只读接口 ───────────────────────────────────────────
 READ_ENDPOINTS = [
     "/health", f"/conversations/{USER}", f"/memory/{USER}/stats", f"/memory/{USER}/detail",
-    "/config/model", "/config/model-presets", "/config/prompt", "/users",
+    "/config/model", "/config/model-presets", "/config/saved-models", "/config/prompt", "/users",
     f"/care/items?user_id={USER}", f"/care/settings?user_id={USER}", f"/care/pending?user_id={USER}",
     f"/profile/{USER}", "/logs?limit=5", f"/export/{USER}",
 ]
@@ -486,6 +486,59 @@ def care_extract_llm_probe():
     return True
 
 
+def saved_models_roundtrip():
+    """"我存的模型"的存/切/删/上限：全程只碰临时文件。
+
+    真实的 runtime_model_config.json 里是用户的真 Key，绝不能在自测里被覆盖，
+    所以这里把 model_config 的两个路径临时挪到 tmp 目录。
+    """
+    import shutil
+    import tempfile
+
+    sys.path.insert(0, str(ROOT / "backend"))
+    import model_config as M
+
+    tmp = Path(tempfile.mkdtemp())
+    real_cfg, real_saved = M._CONFIG_PATH, M._SAVED_PATH
+    try:
+        M._CONFIG_PATH = str(tmp / "runtime.json")
+        M._SAVED_PATH = str(tmp / "saved.json")
+
+        M.save_active_config(model="a-model", base_url="https://a/v1", api_key="sk-A",
+                             use_thinking=True, multimodal=False)
+        M.save_current_as("A 家")
+        M.save_active_config(model="b-model", base_url="https://b/v1", api_key="sk-B")
+        M.save_current_as("B 家")
+        items = M.load_saved_models()
+        bad = []
+        if [i["name"] for i in items] != ["A 家", "B 家"]:
+            bad.append(f"列表不对：{[i['name'] for i in items]}")
+        if not any(i.get("api_key") == "sk-A" for i in items):
+            bad.append("密钥没跟着存下来，切回去会 401")
+        M.apply_saved_model("A 家")
+        cfg = M.load_active_config()
+        if cfg["model"] != "a-model" or cfg["api_key"] != "sk-A" or not cfg["use_thinking"]:
+            bad.append(f"切回去没还原全套：{ {k: v for k, v in cfg.items() if k != 'api_key'} }")
+        M.save_current_as("A 家")
+        if len(M.load_saved_models()) != 2:
+            bad.append("同名存两次变成了两条")
+        if not M.delete_saved_model("B 家") or M.delete_saved_model("没这个名字"):
+            bad.append("删除结果不对")
+        for n in range(M.SAVED_MAX + 3):
+            M.save_current_as(f"p{n}")
+        if len(M.load_saved_models()) > M.SAVED_MAX:
+            bad.append(f"超过上限还在存：{len(M.load_saved_models())}")
+        try:
+            M.apply_saved_model("没这个名字")
+            bad.append("切到不存在的名字该报错")
+        except KeyError:
+            pass
+        return "; ".join(bad) or True
+    finally:
+        M._CONFIG_PATH, M._SAVED_PATH = real_cfg, real_saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def css_uses_dvh():
     """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。
 
@@ -772,6 +825,7 @@ def main():
     check("模型列表 401 提示", model_list_probes)
     check("图片请求格式契约", vision_payload_contract)
     check("多模态声明可读回", model_capability_roundtrip)
+    check("我存的模型可切换", saved_models_roundtrip)
     check("导出覆盖关心事项", export_covers_care)
     check("限流不误伤本地", rate_limit_not_hostile)
     check("安静时段判定", engine_logic)

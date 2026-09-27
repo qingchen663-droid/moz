@@ -1335,6 +1335,73 @@ async def get_model_presets():
     return PRESET_MODELS
 
 
+# ================================================================
+# API: 我存的模型（同一套中转/密钥下想切来切去的几份配置）
+# ================================================================
+
+class SavedModelName(BaseModel):
+    name: str = Field(..., min_length=1, max_length=20)
+
+
+def _saved_models_payload():
+    from model_config import SAVED_MAX, load_active_config, load_saved_models
+
+    active = load_active_config()
+    items = []
+    for it in load_saved_models():
+        items.append({
+            "name": it["name"],
+            "model": it.get("model", ""),
+            "base_url": it.get("base_url", ""),
+            "use_thinking": bool(it.get("use_thinking")),
+            "multimodal": it.get("multimodal"),
+            # 密钥不出后端：界面只知道"这套带没带 Key"
+            "has_key": bool(it.get("api_key")),
+            "saved_at": it.get("saved_at", 0),
+            "is_active": it.get("model") == active.get("model")
+                         and it.get("base_url") == active.get("base_url"),
+        })
+    return {"items": items, "max": SAVED_MAX}
+
+
+@app.get("/api/config/saved-models", dependencies=[Depends(verify_access_key)])
+async def list_saved_models():
+    return _saved_models_payload()
+
+
+@app.post("/api/config/saved-models", dependencies=[Depends(verify_access_key)])
+async def save_model_as(req: SavedModelName):
+    """把当前生效的那套存成一个可点回来的名字。"""
+    from model_config import save_current_as
+
+    try:
+        entry = save_current_as(req.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, **_saved_models_payload(), "saved": entry["name"]}
+
+
+@app.post("/api/config/saved-models/use", dependencies=[Depends(verify_access_key)])
+async def use_saved_model(req: SavedModelName):
+    from model_config import apply_saved_model
+
+    try:
+        entry = apply_saved_model(req.name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="没有这套配置，可能被删掉了")
+    # 换模型后必须重算，否则"能否看图"会停在旧值上（和 POST /config/model 一致）
+    _app_state["multimodal"] = is_multimodal_model()
+    _health_cache["result"] = None
+    return {"ok": True, "model": entry.get("model", ""), **_saved_models_payload()}
+
+
+@app.delete("/api/config/saved-models/{name}", dependencies=[Depends(verify_access_key)])
+async def remove_saved_model(name: str):
+    from model_config import delete_saved_model
+
+    return {"ok": delete_saved_model(name), **_saved_models_payload()}
+
+
 @app.post("/api/config/list-models", dependencies=[Depends(verify_access_key)])
 async def list_provider_models(req: dict):
     """用填入的 Base URL + Key 去服务方拉可用模型列表；Key 留空则按 base_url 找 .env 里的匹配 key。"""
