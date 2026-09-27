@@ -43,6 +43,7 @@ from memory_governance import (
     is_near_duplicate,
     is_question_shaped,
 )
+from llm_errors import looks_like_system_copy
 
 load_dotenv()
 
@@ -2270,7 +2271,9 @@ class MemoryManager:
                     emotion_intensity=emotion_intensity,
                     conversation_id=conversation_id,
                 )
-            if len(ai_summary) >= 4 and not is_question_shaped(ai_summary):
+            if len(ai_summary) >= 4 and not looks_like_system_copy(ai_summary):
+                # 她自己的"抱歉，我暂时无法回复"和报错文案不是用户的事实，
+                # 存下来只会变成一条以后会被回忆起来的垃圾
                 self.add_memory(
                     user_id=user_id,
                     content=f"[对话摘要] AI回复要点：{ai_summary}",

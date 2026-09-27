@@ -10,14 +10,20 @@ import re
 _KEY_RE = re.compile(r"sk-[A-Za-z0-9_\-]{6,}")
 _STATUS_RE = re.compile(r"error code:\s*(\d{3})|status(?:_code)?[\"']?\s*[:=]\s*(\d{3})")
 _RELAY_MSG_RE = re.compile(r"\"error\"\s*:\s*\"([^\"]{4,})\"")
+# openai-python 把异常 str 成 `Error code: 500 - {'error': {'message': '…'}}`：
+# 键值是单引号的**字典**，不是字符串。只认 `"error": "..."` 的话，用户气泡里就会出现字典字面量。
+_NESTED_MSG_RE = re.compile(r"['\"](?:message|msg|detail)['\"]\s*:\s*['\"]([^'\"]{4,})['\"]")
+_REQUEST_ID_RE = re.compile(r"\s*[（(]\s*request id[^）)]*[）)]", re.I)
+_RETRY_RE = re.compile(r"\s*[（(]retry[）)]", re.I)
 
 
 def _short(raw: str, limit: int = 100) -> str:
     text = _KEY_RE.sub("***", " ".join(raw.split()))
-    relay = _RELAY_MSG_RE.search(text)
+    relay = _RELAY_MSG_RE.search(text) or _NESTED_MSG_RE.search(text)
     if relay:
-        # 中转常常把真正的原因放在 {"error": "..."} 里，剥掉 JSON 外壳更好读
+        # 中转常常把真正的原因放在 error/message 里，剥掉 JSON 外壳更好读
         text = relay.group(1)
+    text = _RETRY_RE.sub("", _REQUEST_ID_RE.sub("", text)).strip()
     return text if len(text) <= limit else text[:limit] + "…"
 
 
@@ -50,6 +56,13 @@ def friendly_llm_error(error, has_image: bool = False) -> str:
     if status == 404 or "does not exist" in low or "invalid model" in low:
         return "模型名在中转上不存在。打开「模型」设置，点「获取模型列表」，从列表里选一个。"
 
+    if "no available channel" in low or "model_not_found" in low \
+            or "可用渠道不存在" in raw or "渠道不存在" in raw:
+        # 同一个毛病（这个名字现在用不了），但中转一会儿 404、一会儿 500/503，
+        # 落进通用 500 分支就只剩"出了点问题"，用户不知道下一步点哪里
+        return ("这个模型名在中转那边暂时没有可用的渠道——可能名字写错了，也可能那个渠道刚下线。"
+                "等十几秒再发一次；一直不行的话打开「模型」设置，点「获取模型列表」换一个。")
+
     if status == 429 or "rate limit" in low or "too many requests" in low:
         return "中转限流了。等十几秒再发一次就好。"
 
@@ -60,12 +73,38 @@ def friendly_llm_error(error, has_image: bool = False) -> str:
             "稍等几秒再把这句话发一次。"
         )
 
-    if isinstance(error, TimeoutError) or "timeout" in low or "timed out" in low \
-            or "取消原因" in raw or "cancel" in low:
+    if isinstance(error, TimeoutError):
         return "这次想得太久了（超过两分钟），答案没出来。把问题拆短一点再发一次。"
+    if "timeout" in low or "timed out" in low or "取消原因" in raw or "cancel" in low:
+        # 504/openai 的超时不一定是"我们那两分钟"，也别断言是谁超时——说不成立的细节比不说更糟
+        return "这一轮等模型回话等超时了。稍等几秒再把这句话发一次；经常这样的话，把问题拆短一点或换个模型。"
 
     if status >= 500 or "渠道" in raw:
         return f"中转那边出了点问题（{_short(raw)}）。稍等几秒再发一次，一直不行的话就换个模型。"
 
     detail = _short(raw)
     return f"回复没生成出来（{detail}）。可以先重试一次，不行就到「模型」设置里换个模型。"
+
+
+# 这些句子是她自己的兜底/报错文案，不是用户的事实。要是存进长期记忆，
+# moz 以后会把"这个模型名在中转那边没有可用的渠道"当成一条关于用户的事来回忆。
+SYSTEM_COPY_MARKS = (
+    "抱歉，我暂时无法回复",
+    "这个模型名在中转",
+    "模型名在中转上不存在",
+    "中转那边出了点问题",
+    "模型密钥被中转拒绝",
+    "连不上模型中转",
+    "中转限流了",
+    "这次想得太久",
+    "回复没生成出来",
+    "这句我没接住",
+)
+
+
+def looks_like_system_copy(text: str) -> bool:
+    """空回复、以及上面这些文案，都不配占用一条长期记忆。"""
+    t = (text or "").strip()
+    if len(t) < 2:
+        return True
+    return any(mark in t for mark in SYSTEM_COPY_MARKS)

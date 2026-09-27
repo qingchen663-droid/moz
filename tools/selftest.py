@@ -1418,6 +1418,57 @@ def memory_quality_floor():
     return "; ".join(bad) or True
 
 
+def system_copy_not_memory():
+    """她自己那句"抱歉，我暂时无法回复"不配占用一条关于用户的长期记忆。
+
+    实测（第十一轮）：模型那条空的时候，4 句对话会存下 7 条记忆，其中两条是
+    「抱歉，我暂时无法回复。」和「这个模型名在中转那边没有可用的渠道…」——
+    后者以后会被检索当成"用户的事"回忆出来，等于让她复述自己的报错。
+    """
+    import shutil
+    import tempfile
+
+    import memory_manager as MM
+    from llm_errors import looks_like_system_copy
+
+    bad = []
+    for text in ["", "  ", "抱歉，我暂时无法回复。",
+                 "这个模型名在中转那边暂时没有可用的渠道——可能名字写错了。等十几秒再发一次。",
+                 "这句我没接住：后台出了点意外（AttributeError）。再发一次试试。"]:
+        if not looks_like_system_copy(text):
+            bad.append(f"系统文案没被认出来：{text}")
+    for text in ["好的，我记下了：你下周三要答辩", "团子呀，今年五岁了，还是只橘猫呢"]:
+        if looks_like_system_copy(text):
+            bad.append(f"正常回复被误判成系统文案：{text}")
+
+    d = tempfile.mkdtemp()
+    try:
+        m = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "copy.db"))
+        m.embedding_service.get_embedding = lambda text: None
+        m._extract_facts = lambda *a, **k: []      # 快检门禁不许碰大模型
+        u = "copycheck"
+        turns = [("我下周三下午两点要去做项目答辩", "抱歉，我暂时无法回复。"),
+                 ("我讨厌吃香菜", "这个模型名在中转那边暂时没有可用的渠道——等十几秒再发一次。"),
+                 ("我家猫叫团子，今年五岁", "好的，我记下了：你家有只五岁的橘猫")]
+        for user_msg, reply in turns:
+            m.extract_and_store_facts(u, user_msg, reply, category=MM.MemoryCategory.FACT)
+        stored = [x.content for x in m._get_user_memories(u).values()]
+        leaked = [c for c in stored if "无法回复" in c or "可用的渠道" in c or "再发一次" in c]
+        if leaked:
+            bad.append(f"系统文案进了长期记忆：{leaked}")
+        for word in ("答辩", "香菜", "团子"):
+            if not any(word in c for c in stored):
+                bad.append(f"用户自己的话反而没记下（缺{word}）：{stored}")
+        # 数字（3 句落几条）写在 RUNLOG 里；门禁约定只有 True 才算过（§7 第 15 条）
+        return "; ".join(bad) or True
+    finally:
+        try:
+            m._conn().close()
+        except Exception:
+            pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def frontend_no_junk():
     """孤儿样式/备份文件：曾经因为弹窗样式只在 ModelDialog.new.css 里而整块裸奔。"""
     comp = ROOT / "frontend" / "src" / "components"
@@ -1707,6 +1758,7 @@ def main():
     check("检索提速不改排序", keyword_parity_check)
     check("落库队列重启不丢", save_queue_survives_restart)
     check("记忆质量底线", memory_quality_floor)
+    check("系统文案不进长期记忆", system_copy_not_memory)
     check("事件关联成图", care_link_graph_check)
     check("事件先后链", care_chain_link_check)
     check("探针清理器不错杀", probe_cleaner_works)

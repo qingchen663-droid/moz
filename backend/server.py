@@ -556,7 +556,12 @@ async def chat(user_id: str, req: ChatRequest):
 
         except Exception as e:
             logger.error(f"对话处理失败: {e}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'text': '对话处理失败，请稍后重试'})}\n\n"
+            detail = str(e)
+            # 后台自己的意外别伪装成"模型报错"，但也得说人话：带上异常类名好报障
+            text = (friendly_llm_error(e) if "error code" in detail.lower()
+                    else f"这句我没接住：后台出了点意外（{type(e).__name__}）。再发一次试试，"
+                         f"一直不行的话重启一下 moz。")
+            yield f"data: {json.dumps({'type': 'error', 'text': text})}\n\n"
         finally:
             lock.release()
 
