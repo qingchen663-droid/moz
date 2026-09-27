@@ -555,9 +555,10 @@ def capacity_policy_check():
 
     sys.path.insert(0, str(ROOT / "backend"))
     import memory_manager as MM
+    from memory_manager import EbbinghausCurve as MM_Ebbinghaus
 
     cls = MM.MemoryManager
-    bad, soft = [], []
+    bad = []
     if cls.MAX_ACTIVE_MEMORIES < 2000:
         bad.append(f"活跃上限只有 {cls.MAX_ACTIVE_MEMORIES}：每天聊几句的人几周就撞顶，之后旧记忆静默归档")
     if cls.ARCHIVE_DELETE_AFTER != 0:
@@ -565,6 +566,8 @@ def capacity_policy_check():
     if cls.CONSOLIDATION_TRIGGER > cls.MAX_ACTIVE_MEMORIES:
         bad.append("巩固触发点高于活跃上限，等于永远不跑")
 
+    # 用户 2026-09-27 拍板：不遗忘，不重要的事只是权重降到最低。
+    # 所以这里钉的是：衰减到头停在地板上、状态一个都不变、地板权重真的排在后面。
     d = tempfile.mkdtemp()
     try:
         m = cls(storage_path=d, db_path=os.path.join(d, "cap.db"))
@@ -575,15 +578,30 @@ def capacity_policy_check():
         item.last_accessed = old
         item.access_count = 0
         item.importance = 0.12
-        archived = m.prune_memories("cap-user")
+        hit_floor = m.prune_memories("cap-user")
         after = m.memories["cap-user"][item.id].importance
-        if not archived:
-            soft.append(f"warn: 遗忘曲线的归档分支跑不到（衰减后 importance={after:.3f} 正好等于阈值 0.1，"
-                        "判据是严格小于）——文档里说会'慢慢淡忘'，实际只会降到地板")
+        state = m.memories["cap-user"][item.id].status
+        if item.id not in hit_floor:
+            bad.append(f"400 天没提的事没降到权重地板（importance={after:.3f}，地板 "
+                       f"{MM_Ebbinghaus.MIN_IMPORTANCE}）")
+        if after < MM_Ebbinghaus.MIN_IMPORTANCE - 1e-9:
+            bad.append(f"权重掉到地板以下了（{after:.3f}）：那不是淡忘，是丢")
+        if state != MM.MemoryStatus.ACTIVE:
+            bad.append(f"衰减把记忆转成了 {state}——用户要的是不遗忘，只降权")
+
+        # 同样命中关键词的两条，只有权重差：低权重必须明显排在后面
+        hi = m.add_memory("cap-user", "用户习惯周六早上去滨江那家馆子吃饭", confidence=0.9)
+        lo = m.add_memory("cap-user", "用户随口说过滨江那家馆子还去过一次", confidence=0.6)
+        hi.importance, lo.importance = 0.9, MM_Ebbinghaus.MIN_IMPORTANCE
+        s_hi = m._match_score(hi, "滨江那家馆子")
+        s_lo = m._match_score(lo, "滨江那家馆子")
+        if not s_hi > s_lo * 1.8:
+            bad.append(f"最低权重的记忆没被压到后面（{s_lo:.3f} vs {s_hi:.3f}）——"
+                       "对外说的只是权重降到最低，实现上必须真的想不起来")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
-    return "; ".join(bad) or (soft[0] if soft else True)
+    return "; ".join(bad) or True
 
 
 def keyword_parity_check():
@@ -599,30 +617,34 @@ def keyword_parity_check():
     import memory_manager as MM
 
     st = MM.MemoryManager._search_tokens
+    from memory_governance import is_question_shaped
 
     def ref_match(memory, query):
         query_lower = query.lower()
         content_lower = memory.content.lower()
         clean_query = "".join(c for c in query_lower if c.isalnum())
         clean_content = "".join(c for c in content_lower if c.isalnum())
+        w = (0.45 if is_question_shaped(memory.content)
+             else 0.6 if memory.source_type == "ai_reply" else 1.0)
+        f = (0.30 + memory.importance * 0.70) * w
         if len(clean_query) >= 2 and clean_query in clean_content:
-            return 0.8
+            return 0.8 * f
         if len(clean_content) >= 2 and clean_content in clean_query:
-            return 0.8
+            return 0.8 * f
         common_count = 0
         for word_len in range(2, min(5, len(clean_query) + 1)):
             for i in range(len(clean_query) - word_len + 1):
                 if clean_query[i:i + word_len] in clean_content:
                     common_count += 1
         if common_count > 0:
-            return common_count / max(len(clean_query), 1) * (0.6 + memory.importance * 0.4)
+            return common_count / max(len(clean_query), 1) * f
         qw = set(query_lower.replace("，", " ").replace("。", " ")
                  .replace("！", " ").replace("？", " ").split())
         cw = set(content_lower.replace("，", " ").replace("。", " ")
                  .replace("！", " ").replace("？", " ").split())
         common = qw & cw
         if common:
-            return len(common) / len(qw | cw) * (0.6 + memory.importance * 0.4)
+            return len(common) / len(qw | cw) * f
         return 0.0
 
     def ref_search(memories, query, emotion_filter, min_importance):
@@ -1457,7 +1479,7 @@ def main():
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)
     check("数据库不变量", db_invariants)
-    check("记忆容量不悄悄删", capacity_policy_check)
+    check("不遗忘只降到最低权重", capacity_policy_check)
     check("检索提速不改排序", keyword_parity_check)
     check("落库队列重启不丢", save_queue_survives_restart)
     check("记忆质量底线", memory_quality_floor)

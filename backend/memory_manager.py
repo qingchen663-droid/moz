@@ -293,20 +293,25 @@ class EbbinghausCurve:
         )
         return retention < threshold
 
-    @staticmethod
-    def decay_importance(memory: MemoryItem) -> float:
+    # 权重地板。用户 2026-09-27 拍板：**不遗忘**，不重要的事只是权重降到最低，
+    # 不归档、不删除。旧写法 importance*retention*0.8+0.1 的地板正好等于归档阈值 0.1，
+    # 于是"衰减归档"那条分支永远跑不到——对外说的"会慢慢淡忘"其实什么都没发生。
+    MIN_IMPORTANCE = 0.05
+
+    @classmethod
+    def decay_importance(cls, memory: MemoryItem) -> float:
         """
         根据遗忘曲线衰减记忆的重要性。
-        
-        被频繁访问的记忆重要性会提升，长期未被访问的记忆重要性会下降。
+
+        被频繁访问的记忆重要性会提升，长期未被访问的会一路降到 MIN_IMPORTANCE 为止；
+        到底之后不再变化，也不会被忘掉。
         """
         retention = EbbinghausCurve.retention_rate(
             memory.created_at, memory.last_accessed,
             memory.importance, memory.access_count
         )
-        # 新的重要性 = 原重要性 * 保留率 + 基础值
-        new_importance = memory.importance * retention * 0.8 + 0.1
-        return max(0.0, min(1.0, new_importance))
+        new_importance = memory.importance * retention * 0.8
+        return max(cls.MIN_IMPORTANCE, min(1.0, new_importance))
 
 
 # ================================================================
@@ -1755,12 +1760,15 @@ class MemoryManager:
         # 提问形状的记忆、以及 moz 自己说过的话，不该和用户说定的事实平起平坐
         weight = 0.45 if is_question_shaped(memory.content) else (
             0.6 if memory.source_type == "ai_reply" else 1.0)
+        # 权重降到最低的记忆要"几乎想不起来"，所以 importance 的杠杆从 0.4 拉到 0.7：
+        # 地板 0.05 → 0.335 倍，满权重 → 1.0 倍。
+        factor = (0.30 + memory.importance * 0.70) * weight
 
         # 1. 查询中的连续关键词在内容中出现（中文字符级子串匹配，优先级最高）
         if len(clean_query) >= 2 and clean_query in clean_content:
-            return 0.8 * weight
+            return 0.8 * factor
         if len(clean_content) >= 2 and clean_content in clean_query:
-            return 0.8 * weight
+            return 0.8 * factor
 
         # 2. 提取查询中的中文词（2-4字组合）进行匹配
         common_count = 0
@@ -1770,7 +1778,7 @@ class MemoryManager:
 
         if common_count > 0:
             ratio = common_count / max(len(clean_query), 1)
-            return ratio * (0.6 + memory.importance * 0.4) * weight
+            return ratio * factor
 
         # 3. 英文词匹配（回退）
         content_words = MemoryManager._split_words(memory.content.lower())
@@ -1778,7 +1786,7 @@ class MemoryManager:
         if common:
             union = prepared["query_words"] | content_words
             jaccard = len(common) / len(union)
-            return jaccard * (0.6 + memory.importance * 0.4) * weight
+            return jaccard * factor
 
         return 0.0
 
@@ -1808,21 +1816,20 @@ class MemoryManager:
         return False
 
     @_synchronized
-    def prune_memories(self, user_id: str, threshold: float = 0.1) -> List[str]:
+    def prune_memories(self, user_id: str) -> List[str]:
+        """按遗忘曲线降权，返回已经落到权重地板的记忆 id。
+
+        这里不归档也不删除：陪伴产品的底线是"你说过的话不会凭空消失"。
+        唯一还会转归档状态的是超容量保护（Tier 2），那是性能阀门，行仍留在库里永不物理删。
+        """
         user_memories = self._get_user_memories(user_id)
         to_archive = []
 
         for mid, memory in user_memories.items():
             if memory.status not in {MemoryStatus.ACTIVE, MemoryStatus.CANDIDATE}:
                 continue
-            new_importance = EbbinghausCurve.decay_importance(memory)
-            memory.importance = new_importance
-
-            if new_importance < threshold and not memory.is_consolidated:
-                memory.status = MemoryStatus.ARCHIVED
-                memory.version += 1
-                memory.updated_at = time.time()
-                memory.regrade_reason = "archived_by_decay"
+            memory.importance = EbbinghausCurve.decay_importance(memory)
+            if memory.importance <= EbbinghausCurve.MIN_IMPORTANCE + 1e-9:
                 to_archive.append(mid)
 
         self._dirty.update((user_id, mid) for mid in to_archive)
