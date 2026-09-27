@@ -35,7 +35,7 @@ def _status_code(raw: str) -> int:
     return 0
 
 
-def friendly_llm_error(error, has_image: bool = False) -> str:
+def friendly_llm_error(error, has_image: bool = False, waited: float | None = None) -> str:
     raw = str(error)
     low = raw.lower()
     status = _status_code(raw)
@@ -74,6 +74,11 @@ def friendly_llm_error(error, has_image: bool = False) -> str:
         )
 
     if isinstance(error, TimeoutError):
+        # 守卫是"120 秒没吐出一个字"，不是总时长上限：第十四轮实测一句探针对话
+        # 拖到 383 秒才走到这里。只说"超过两分钟"就把用户等到的时间报小了 3 倍。
+        if waited is not None and waited >= 1:
+            return (f"这次想得太久了——等了 {int(waited)} 秒还没想完（中间两分钟没吐出一个字），"
+                    "答案没出来。把问题拆短一点再发一次，或者稍等几秒重发。")
         return "这次想得太久了（超过两分钟），答案没出来。把问题拆短一点再发一次。"
     if "timeout" in low or "timed out" in low or "取消原因" in raw or "cancel" in low:
         # 504/openai 的超时不一定是"我们那两分钟"，也别断言是谁超时——说不成立的细节比不说更糟

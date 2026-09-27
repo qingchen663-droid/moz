@@ -936,9 +936,11 @@ def run_emotion_workflow_streaming(
             logger.info(f"📊 流式工作流完成 (总耗时: {total_time:.2f}s)")
 
         except asyncio.TimeoutError:
-            logger.error("流式工作流超时")
+            waited = time.time() - (state.get("workflow_start_time") or time.time())
+            logger.error(f"流式工作流超时（这轮等了 {waited:.0f}s）")
             _register_turn("")      # 她没答上来，但用户那句话还是得记住
-            yield {'type': 'error', 'text': friendly_llm_error(TimeoutError(), bool(state.get("image_data")))}
+            yield {'type': 'error', 'text': friendly_llm_error(
+                TimeoutError(), bool(state.get("image_data")), waited)}
         except Exception as e:
             logger.error(f"流式工作流失败: {e}", exc_info=True)
             _register_turn("")

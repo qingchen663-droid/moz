@@ -86,6 +86,18 @@ def test_our_own_timeout_keeps_the_number():
     assert "两分钟" in f(TimeoutError())
 
 
+def test_timeout_says_how_long_we_actually_waited():
+    """第十四轮实测：守卫是"120 秒没吐字"，不是总时长上限，一句对话拖到 383 秒才报超时。
+    只说"超过两分钟"会把用户实际等到的时间报小 3 倍。"""
+    from llm_errors import friendly_llm_error as f
+
+    text = f(TimeoutError(), waited=383.4)
+    assert "383 秒" in text, text
+    assert "超过两分钟" not in text, text
+    # 没给 waited 时保持旧那句（别的调用方还在用）
+    assert "两分钟" in f(TimeoutError())
+
+
 def test_system_copy_never_becomes_a_memory():
     """她自己的兜底句和报错文案不许被当成"关于用户的事实"存进长期记忆。
 
