@@ -85,6 +85,16 @@ export function readableError(raw: string, status = 0): string {
   return detail.length > 160 ? detail.slice(0, 160) + '…' : detail
 }
 
+/**
+ * 后端答了话就别赖它"没应答"——把能读的原因念出来。
+ * 第十四轮在同类接口上实测到 403「用户不在允许列表中」，
+ * 而界面上原来一律显示"后端没应答"，照着这句话去重启后端就是白工。
+ */
+export function whyFailed(e: unknown): string {
+  const msg = e instanceof Error ? e.message.trim() : ''
+  return msg && msg !== 'Failed to fetch' ? msg : '后端没应答，稍后再试一次'
+}
+
 // Module-level abort controller for stopping generation
 let _activeController: AbortController | null = null
 

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
-import { api } from '../api'
+import { api, whyFailed } from '../api'
 import ConversationList from './ConversationList'
 import CareSection from './CareSection'
 import LogViewerModal from './LogViewerModal'
@@ -42,8 +42,8 @@ export default function MePanel({ onClose }: { onClose: () => void }) {
     try {
       await clearMemories()
       setNotice('长期记忆、档案卡、要记的事都清了；对话记录还在')
-    } catch {
-      setNotice('没能清空：后端没应答，东西还都在，再试一次')
+    } catch (e) {
+      setNotice(`没能清空：${whyFailed(e)}，东西还都在`)
     }
   }
 

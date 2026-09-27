@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api'
+import { api, whyFailed } from '../api'
 import type { MemoryDetail, MemoryDetailResponse, UserProfileData } from '../types'
 import { humanMemory } from '../memoryText'
 import './MemoryViewerModal.css'
@@ -187,8 +187,8 @@ export default function MemoryViewerModal({ onClose }: Props) {
       await api.updateProfile(useStore.getState().userId, section, bucket)
       setProfile({ ...profile, [section]: bucket })
       setActionMsg('划掉了。她要是哪天又自己想起来，直接说"你记错了，……"')
-    } catch {
-      setActionMsg('没划掉：后端没应答')
+    } catch (e) {
+      setActionMsg(`没划掉：${whyFailed(e)}，这条还在`)
     }
   }
 
@@ -205,8 +205,8 @@ export default function MemoryViewerModal({ onClose }: Props) {
         return { ...cur, layers }
       })
       setActionMsg('已经忘掉了。要是记错了别的，直接对它说"你记错了，……"')
-    } catch {
-      setActionMsg('没忘成：后端没应答，这条还留着')
+    } catch (e) {
+      setActionMsg(`没忘成：${whyFailed(e)}，这条还留着`)
     }
   }
 
@@ -214,8 +214,8 @@ export default function MemoryViewerModal({ onClose }: Props) {
     try {
       await api.feedbackMemory(useStore.getState().userId, m.id, 'wrong')
       setActionMsg('好的，这条以后少提。想让它记对的，补一句"你记错了，……"')
-    } catch {
-      setActionMsg('反馈没送出去，后端没应答')
+    } catch (e) {
+      setActionMsg(`反馈没送出去：${whyFailed(e)}`)
     }
   }
 
@@ -277,6 +277,9 @@ export default function MemoryViewerModal({ onClose }: Props) {
 
         {/* Body */}
         <div className="mem-viewer-body">
+          {/* 这句原来只挂在「记忆」页签里：在档案卡上划掉一条之后，
+              "划掉了"和"没划掉：…"用户一个都看不到。挪到两个页签共用的位置。 */}
+          {actionMsg && <div className="mem-action-msg">{actionMsg}</div>}
           {loading && <div className="mem-viewer-loading">加载中...</div>}
           {error && <div className="mem-viewer-error">{error}</div>}
 
@@ -319,7 +322,6 @@ export default function MemoryViewerModal({ onClose }: Props) {
                   ))}
                 </div>
               </div>
-              {actionMsg && <div className="mem-action-msg">{actionMsg}</div>}
               <MemoryList
                 memories={visibleMemories}
                 total={allMemories.length}

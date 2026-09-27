@@ -723,6 +723,41 @@ describe('档案卡上能把记错的划掉', () => {
     cleanupFetch()
   })
 
+  it('后端答了话就别赖它"没应答"：403 的原因要念给用户看', async () => {
+    const { default: MemoryViewerModal } = await import('../components/MemoryViewerModal')
+    const base = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : String(input)
+      if (init?.method === 'PUT')
+        return mockResponse({ detail: '用户不在允许列表中' }, 403)
+      if (url.includes('/profile/'))
+        return mockResponse({ user_id: 'web_user_001', profile: PROFILE, prompt_context: '', version: 1 })
+      if (url.includes('/detail')) return mockResponse({ layers: { core: [], important: [], regular: [] } })
+      if (url.includes('/summaries')) return mockResponse({ summaries: [] })
+      return base(input as RequestInfo | URL, init)
+    }) as typeof fetch
+    const spy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    try {
+      render(<MemoryViewerModal onClose={() => {}} />)
+      await waitFor(() =>
+        expect([...document.querySelectorAll('.mem-pref-tag')].some((e) =>
+          e.textContent?.includes('旅行')
+        )).toBe(true)
+      )
+      const hobby = [...document.querySelectorAll('.mem-pref-tag')].find((e) =>
+        e.textContent?.includes('旅行')
+      )!
+      fireEvent.click(hobby.querySelector('.mem-tag-x')!)
+      await waitFor(() =>
+        expect(document.body.textContent).toContain('没划掉：用户不在允许列表中')
+      )
+      expect(document.body.textContent).not.toContain('后端没应答')
+    } finally {
+      spy.mockRestore()
+      globalThis.fetch = base
+    }
+  })
+
   it('后端早就有 PUT /api/profile，本轮第一次把它接上', async () => {
     const { puts, cleanupFetch } = await openProfile()
     const hobbies = [...document.querySelectorAll('.mem-pref-tag')].filter((e) =>
