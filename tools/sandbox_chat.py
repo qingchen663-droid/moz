@@ -197,11 +197,13 @@ def wait_health(port: int, tries: int = 60) -> bool:
     return False
 
 
-def wait_queue_idle(port: int, user: str, limit: int = 300):
-    """等后台落库排队清空了再问回去。
+def wait_queue_idle(port: int, user: str, limit: int = 900):
+    """等后台落库排队清空了再问回去。返回 (等了多久, 队列状态, 是否真的排空)。
 
     实测最慢的一轮四步并行跑了 254.1 秒（中转），而探针原来只 sleep(2) 就问，
     那时"答不上来"其实只是还没存上——量出来的通过率不能信。
+    第十二轮的教训：上限 300 秒被撞上时它会**假装排空了**（当时 6 句只完成 2 句），
+    所以到点没排空必须如实报出来，别把"没等完"当成"记不住"。
     """
     t0 = time.time()
     q: dict = {}
@@ -212,9 +214,9 @@ def wait_queue_idle(port: int, user: str, limit: int = 300):
             time.sleep(5)
             continue
         if not (q.get("pending", 0) + q.get("running", 0)):
-            break
+            return time.time() - t0, q, True
         time.sleep(5)
-    return time.time() - t0, q
+    return time.time() - t0, q, False
 
 
 def kill(proc) -> None:
@@ -345,10 +347,12 @@ def main():
             time.sleep(2)   # 抽取是异步的，给落库留点时间
 
         print("\n== 第二遍：问回去（新开会话，只靠长期记忆）==")
-        waited, q = wait_queue_idle(port, user)
+        waited, q, drained = wait_queue_idle(port, user)
         stats = api(port, f"/memory/{user}/stats")
-        print(f"  等落库排空用了 {waited:.0f}s（这一轮队列 done={q.get('done')} "
-              f"failed={q.get('failed')}）")
+        print(f"  等落库排空用了 {waited:.0f}s（队列 done={q.get('done')} failed={q.get('failed')} "
+              f"pending={q.get('pending')} running={q.get('running')}）")
+        if not drained:
+            print("  ！没等到排空就超时了 —— 下面这个通过率还混着\"其实还没存上\"，不能算结论")
         print(f"  库里记忆 {stats.get('total')} 条")
         right = forgot = wrong = dead = retried = 0
         for text, keys in zip(QUESTIONS, EXPECT):
@@ -371,8 +375,10 @@ def main():
                 mark = f"✗ 答了但不对（缺：{'/'.join(missing)}）"
             back = "" if n == 1 else ("（两次都没回话）" if n == 0 else f"（第 {n} 次才回话）")
             print(f"  {mark}{back}  {secs:.0f}s\n     问：{text}\n     答：{ans[:150]}")
+        verdict = "可以当结论" if drained else "不能当结论：落库没排空就问了"
         print(f"\n答对 {right}/{len(QUESTIONS)}｜直说想不起来 {forgot}｜答错 {wrong}｜没回话 {dead}"
-              f"｜其中 {retried} 条问 + {fact_retry} 条说是重试一次才问出来的（量记忆，不量运气）")
+              f"｜其中 {retried} 条问 + {fact_retry} 条说是重试一次才问出来的（量记忆，不量运气）"
+              f"\n这个数{verdict}")
 
         print("\n== 它到底存成了什么 ==")
         detail = api(port, f"/memory/{user}/detail")
