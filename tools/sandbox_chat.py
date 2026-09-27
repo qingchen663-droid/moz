@@ -12,6 +12,8 @@
   - "答对 x/6" 按每问必须出现的关键字判，不是"回复非空"——moz 直说想不起来要单列，
     那说明检索/落库没到，而不是它答错了
   - 问回去之前先等 save_jobs 排空：落库是后台异步的，不等就把"还没存上"当成"记不住"
+  - 没回话（中转 5xx）自动重试一次：这台机器上 5xx 是常态，不重试量到的是运气不是记忆；
+    重试了几条会明打在结论行里，别当成"产品变好了"
   - 退出码只代表"工具/接口跑通了没有"（没回话才算 1）；通过率是给人读的数字，不是门禁
 """
 
@@ -102,6 +104,23 @@ def chat(port, user, text, timeout=200):
 
 
 CHAIN_SENTENCE = "项目答辩下周三，答辩之后一周出结果，出结果我再决定要不要续约"
+
+
+def chat_retry(port: int, user: str, text: str, tries: int = 2, gap: float = 12.0):
+    """没回话就再问一次。
+
+    中转 5xx 在这台机器上是常态（第九、十、十一轮实测每轮分别 3、1、1 次），
+    不重试的话"答对 x/6"量到的是运气，不是记忆。返回 (回复, 第几次才回话；全失败给 0)。
+    重试会多出一轮对话，但失败那次只留下用户那句话（第十轮起报错那轮也照记）。
+    """
+    ans = ""
+    for n in range(1, tries + 1):
+        ans = chat(port, user, text)
+        if ans and "«错误" not in ans:
+            return ans, n
+        if n < tries:
+            time.sleep(gap)
+    return ans, 0
 
 
 def chain_probe(port: int, user: str) -> int:
@@ -316,10 +335,13 @@ def main():
         print("\n== 第一遍：说事实 ==")
         if "--chain" in sys.argv:
             return chain_probe(port, user)
+        fact_retry = 0
         for text in FACTS:
             t0 = time.time()
-            chat(port, user, text)
-            print(f"  说了：{text}   ({time.time() - t0:.0f}s)")
+            _, n = chat_retry(port, user, text)
+            back = "" if n == 1 else f"（第 {n or '两次都没'} 次才回话）"
+            fact_retry += 1 if n not in (0, 1) else 0
+            print(f"  说了：{text}   ({time.time() - t0:.0f}s){back}")
             time.sleep(2)   # 抽取是异步的，给落库留点时间
 
         print("\n== 第二遍：问回去（新开会话，只靠长期记忆）==")
@@ -328,9 +350,12 @@ def main():
         print(f"  等落库排空用了 {waited:.0f}s（这一轮队列 done={q.get('done')} "
               f"failed={q.get('failed')}）")
         print(f"  库里记忆 {stats.get('total')} 条")
-        right = forgot = wrong = dead = 0
+        right = forgot = wrong = dead = retried = 0
         for text, keys in zip(QUESTIONS, EXPECT):
-            ans = chat(port, user, text)
+            t0 = time.time()
+            ans, n = chat_retry(port, user, text)
+            retried += 1 if n not in (0, 1) else 0
+            secs = time.time() - t0
             missing = [k for k in keys if k not in ans]
             if not ans or "«错误" in ans:
                 dead += 1
@@ -344,8 +369,10 @@ def main():
             else:
                 wrong += 1
                 mark = f"✗ 答了但不对（缺：{'/'.join(missing)}）"
-            print(f"  {mark}\n     问：{text}\n     答：{ans[:150]}")
-        print(f"\n答对 {right}/{len(QUESTIONS)}｜直说想不起来 {forgot}｜答错 {wrong}｜没回话 {dead}")
+            back = "" if n == 1 else ("（两次都没回话）" if n == 0 else f"（第 {n} 次才回话）")
+            print(f"  {mark}{back}  {secs:.0f}s\n     问：{text}\n     答：{ans[:150]}")
+        print(f"\n答对 {right}/{len(QUESTIONS)}｜直说想不起来 {forgot}｜答错 {wrong}｜没回话 {dead}"
+              f"｜其中 {retried} 条问 + {fact_retry} 条说是重试一次才问出来的（量记忆，不量运气）")
 
         print("\n== 它到底存成了什么 ==")
         detail = api(port, f"/memory/{user}/detail")
