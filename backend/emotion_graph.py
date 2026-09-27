@@ -692,6 +692,112 @@ def run_emotion_workflow(
     return reply
 
 
+class SaveDeps:
+    """一轮后台落库要用的那几个管理器，由服务端启动时装配一次。"""
+
+    def __init__(self, memory_manager=None, working_memory_store=None,
+                 profile_manager=None, care_store=None, care_graph=None):
+        self.memory_manager = memory_manager
+        self.working_memory_store = working_memory_store
+        self.profile_manager = profile_manager
+        self.care_store = care_store
+        self.care_graph = care_graph
+
+
+def _emotion_from_job(job: Dict):
+    raw = job.get("emotion_type")
+    if not raw:
+        return None
+    try:
+        return EmotionType.from_string(raw)
+    except (ValueError, AttributeError):
+        return None
+
+
+async def run_save_job(deps: SaveDeps, job: Dict) -> None:
+    """把一轮对话落成工作记忆 / 长期记忆 / 档案卡 / 关心事项。
+
+    旧实现是四步串行，实测 3~7 分钟。这里四步并行，只保留一条真依赖：
+    时间标签靠"刚创建 10 秒内"认领记忆，所以必须紧跟在长期记忆之后、且不能并行。
+    每步各自吞异常（与旧行为一致）——否则整轮重试会把已存好的记忆存成重复条目。
+    """
+    import asyncio
+
+    user_id = job.get("user_id") or "default"
+    user_msg = job.get("user_message") or ""
+    reply = job.get("reply") or ""
+    emotion_type = _emotion_from_job(job)
+    try:
+        emotion_intensity = float(job["emotion_intensity"]) if job.get("emotion_intensity") is not None else None
+    except (TypeError, ValueError):
+        emotion_intensity = None
+    conversation_id = job.get("conversation_id")
+
+    async def _working_memory():
+        update_llm = get_chat_client(temperature=0.0, use_thinking=False)
+        await asyncio.to_thread(
+            update_working_memory, deps.working_memory_store, user_id, user_msg, reply, update_llm
+        )
+
+    async def _temporal_labels():
+        temporal = TemporalExtractor.extract_from_text(user_msg)
+        if not (temporal.event_time or temporal.time_context or temporal.recurrence):
+            return 0
+        return deps.memory_manager.attach_temporal_metadata(
+            user_id=user_id, temporal_data=temporal.to_dict(),
+        )
+
+    async def _long_term():
+        await asyncio.to_thread(
+            deps.memory_manager.extract_and_store_facts,
+            user_id, user_msg, reply,
+            MemoryCategory.EMOTION, emotion_type, emotion_intensity, conversation_id,
+        )
+        try:
+            count = await _temporal_labels()
+            if count:
+                logger.info(f"[时间标签] 为 {count} 条记忆附加了时间标签")
+        except Exception as e:
+            logger.warning(f"[时间标签更新] 失败: {e}")
+
+    async def _profile_card():
+        from user_profile import ProfileUpdater
+        profile_updater = ProfileUpdater(deps.profile_manager)
+        llm_client = get_chat_client(temperature=0.0, use_thinking=False)
+        updated_fields = await asyncio.to_thread(
+            profile_updater.update_from_conversation, user_id, user_msg, reply, llm_client,
+        )
+        if updated_fields:
+            logger.info(f"[档案卡更新] 用户 {user_id}: 更新了 {updated_fields}")
+
+    async def _care_harvest():
+        from llm_config import get_llm_client
+        touched = await asyncio.to_thread(
+            care_extractor.harvest,
+            deps.care_store, user_id, user_msg, reply,
+            get_llm_client(temperature=0.0, use_thinking=False),
+            deps.care_graph,
+        )
+        if touched:
+            logger.info("[关心抽取] 自动记下: %s", touched)
+
+    steps = [
+        ("工作记忆更新", deps.working_memory_store, _working_memory),
+        ("流式记忆存储", deps.memory_manager, _long_term),
+        ("档案卡更新", deps.profile_manager, _profile_card),
+        ("关心抽取", deps.care_store, _care_harvest),
+    ]
+    coros = [fn() for label, manager, fn in steps if manager]
+    if not coros:
+        return
+    t0 = time.time()
+    outcomes = await asyncio.gather(*coros, return_exceptions=True)
+    for (label, manager, _fn), outcome in zip(steps, outcomes):
+        if isinstance(outcome, BaseException) and manager:
+            logger.warning(f"[{label}] 失败: {outcome}")
+    logger.info("🧠 [后台落库] 四步并行完成，耗时 %.1fs", time.time() - t0)
+
+
 def run_emotion_workflow_streaming(
     memory_manager: Optional[MemoryManager],
     user_id: str,
@@ -703,6 +809,8 @@ def run_emotion_workflow_streaming(
     profile_manager=None,
     care_store=None,
     care_graph=None,
+    save_queue=None,
+    save_worker=None,
 ):
     """
     流式工作流：情感分析+记忆检索同步执行，对话生成逐 token 流式输出。
@@ -787,97 +895,20 @@ def run_emotion_workflow_streaming(
 
             yield {'type': 'reply', 'text': reply}
 
-            # 后台异步更新工作记忆和长期记忆，不阻塞响应
-            async def _background_save():
-                # 1. 更新工作记忆
-                if working_memory_store:
-                    try:
-                        update_llm = get_chat_client(temperature=0.0, use_thinking=False)
-                        await asyncio.to_thread(update_working_memory, working_memory_store, state.get("user_id", "default"), state.get("user_message", ""), reply, update_llm)
-                    except Exception as e:
-                        logger.warning(f"[流式工作记忆更新] 失败: {e}")
-
-                # 2. 存储长期记忆（传递情感分析 Agent 的结果）
-                if memory_manager:
-                    try:
-                        # 从情感分析 Agent 的结果中提取情感标签
-                        emotion_analysis = state.get("emotion_analysis")
-                        emotion_type = None
-                        emotion_int = None
-                        if emotion_analysis:
-                            try:
-                                emotion_type = EmotionType.from_string(emotion_analysis.get("current_emotion", ""))
-                            except (ValueError, AttributeError):
-                                emotion_type = None
-                            emotion_int = emotion_analysis.get("emotion_intensity")
-                        
-                        await asyncio.to_thread(
-                            memory_manager.extract_and_store_facts,
-                            state.get("user_id", "default"),
-                            state.get("user_message", ""),
-                            reply,
-                            MemoryCategory.EMOTION,
-                            emotion_type,
-                            emotion_int,
-                            state.get("conversation_id"),
-                        )
-                        logger.info("💾 [流式记忆存储] 已保存")
-                    except Exception as e:
-                        logger.warning(f"[流式记忆存储] 失败: {e}")
-
-                # 3. 新增：更新档案卡
-                if profile_manager:
-                    try:
-                        from user_profile import ProfileUpdater
-                        profile_updater = ProfileUpdater(profile_manager)
-                        llm_client = get_chat_client(temperature=0.0, use_thinking=False)
-                        updated_fields = await asyncio.to_thread(
-                            profile_updater.update_from_conversation,
-                            state.get("user_id", "default"),
-                            state.get("user_message", ""),
-                            reply,
-                            llm_client,
-                        )
-                        if updated_fields:
-                            logger.info(f"[档案卡更新] 用户 {state.get('user_id', 'default')}: 更新了 {updated_fields}")
-                    except Exception as e:
-                        logger.warning(f"[档案卡更新] 失败: {e}")
-
-                # 4. 新增：提取时间标签
-                if memory_manager:
-                    try:
-                        from temporal_metadata import TemporalExtractor
-                        user_msg = state.get("user_message", "")
-                        temporal = TemporalExtractor.extract_from_text(user_msg)
-                        if temporal.event_time or temporal.time_context or temporal.recurrence:
-                            count = memory_manager.attach_temporal_metadata(
-                                user_id=state.get("user_id", "default"),
-                                temporal_data=temporal.to_dict(),
-                            )
-                            if count:
-                                logger.info(f"[时间标签] 为 {count} 条记忆附加了时间标签")
-                    except Exception as e:
-                        logger.warning(f"[时间标签更新] 失败: {e}")
-
-                # 5. 自动记下值得主动惦记的事（生日/约定/复诊…），用户不需要手动录入
-                if care_store:
-                    try:
-                        from llm_config import get_llm_client
-                        touched = await asyncio.to_thread(
-                            care_extractor.harvest,
-                            care_store,
-                            state.get("user_id", "default"),
-                            state.get("user_message", ""),
-                            reply,
-                            get_llm_client(temperature=0.0, use_thinking=False),
-                            care_graph,
-                        )
-                        if touched:
-                            logger.info("[关心抽取] 自动记下: %s", touched)
-                    except Exception as e:
-                        logger.warning(f"[关心抽取] 失败: {e}")
-
-            asyncio.create_task(_background_save())
+            # 这一轮要记的东西先落进持久化队列：后端重启也丢不掉
+            emotion_analysis = state.get("emotion_analysis") or {}
+            try:
+                if save_queue.enqueue(
+                    user_id=state.get("user_id", "default"),
+                    user_message=state.get("user_message", ""),
+                    reply=reply,
+                    conversation_id=state.get("conversation_id"),
+                    emotion_type=str(emotion_analysis.get("current_emotion") or ""),
+                    emotion_intensity=emotion_analysis.get("emotion_intensity"),
+                ):
+                    save_worker.submit()
+            except Exception as e:
+                logger.warning(f"[落库队列] 本轮登记失败: {e}")
 
             total_time = time.time() - (state.get("workflow_start_time") or time.time())
             logger.info(f"📊 流式工作流完成 (总耗时: {total_time:.2f}s)")

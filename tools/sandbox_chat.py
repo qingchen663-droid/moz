@@ -5,7 +5,8 @@
 用一个空 moz.db 起第二个后端（默认 8123 端口），跑完连目录一起删。
 
     PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/sandbox_chat.py
-    PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/sandbox_chat.py --chain   # 只验先后链
+    PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/sandbox_chat.py --chain    # 只验先后链
+    PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/sandbox_chat.py --restart  # 验"落库中途被重启也不丢"
 """
 
 import json
@@ -123,7 +124,8 @@ def chain_probe(port: int, user: str) -> int:
     return 0
 
 
-def main():
+def prepare_sandbox():
+    """把 backend 复制到临时目录，得到一个空库的沙箱。"""
     user = "sandbox_user"
     tmp = Path(tempfile.mkdtemp(prefix="moz-sandbox-"))
     work = tmp / "backend"
@@ -137,10 +139,11 @@ def main():
             shutil.copy2(src, work / name)
     if (ROOT / ".env").exists():
         shutil.copy2(ROOT / ".env", tmp / ".env")
+    return tmp, work, user
 
-    port = free_port()
-    print(f"沙箱后端 {work} 端口 {port}（空库，真实 moz.db 没被复制过来）")
-    log = open(tmp / "server.log", "wb")
+
+def spawn_backend(work: Path, port: int, user: str, log_name: str = "server.log"):
+    log = open(work.parent / log_name, "wb")
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=str(work), stdout=log, stderr=log,
@@ -150,14 +153,125 @@ def main():
         env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1",
              "MOZ_ALLOWED_USER_IDS": user},
     )
+    return proc, log
+
+
+def wait_health(port: int, tries: int = 60) -> bool:
+    for _ in range(tries):
+        try:
+            if api(port, "/health", timeout=3).get("status") == "ok":
+                return True
+        except Exception:
+            time.sleep(1)
+    return False
+
+
+def kill(proc) -> None:
+    """硬杀：不等后台任务收尾，这才像 --reload 砸在一半。"""
+    proc.kill()
+    proc.wait(timeout=20)
+
+
+def read_log(path: Path, needle: str) -> list:
     try:
-        for _ in range(60):
-            try:
-                if api(port, "/health", timeout=3).get("status") == "ok":
-                    break
-            except Exception:
-                time.sleep(1)
-        else:
+        text = path.read_bytes().decode("utf-8", "ignore")
+    except OSError:
+        return []
+    return [l for l in text.splitlines() if needle in l]
+
+
+def restart_probe(work: Path, user: str, port: int, tmp: Path) -> int:
+    """P0 验收：说完一句带生日和先后关系的活 → 落库跑到一半硬杀后端 → 重启后必须自己补完。
+
+    旧的后台落库挂在 asyncio.create_task 上，重启即丢；现在先写 save_jobs 表，
+    新进程的 recover() 会把它捡回来。这一步只查接口回读，绝不再发一句话。
+    """
+    print("\n== P0 验收：落库中途重启不丢 ==")
+    proc, log = spawn_backend(work, port, user)
+    try:
+        if not wait_health(port):
+            print("后端没起来，看 server.log")
+            return 1
+        sentence = "记一下：我妈生日是农历十月初五，她喜欢养花；项目答辩下周三，答辩之后一周出结果"
+        t0 = time.time()
+        answer = chat(port, user, sentence)
+        print(f"  说了：{sentence}\n  回了：{answer[:90]}  ({time.time() - t0:.0f}s)")
+
+        queued = {}
+        for _ in range(24):
+            queued = api(port, f"/care/save-queue?user_id={user}")
+            if queued.get("pending", 0) + queued.get("running", 0) > 0:
+                break
+            time.sleep(1)
+        print(f"  队列（杀掉前）：{queued}")
+        if queued.get("pending", 0) + queued.get("running", 0) < 1:
+            print("  ✗ 没抓到落库还在路上的瞬间（这一轮太快或没排队）—— 结论不算数")
+            return 1
+
+        kill(proc)
+        log.close()
+        print(f"  已硬杀后端（落库进行中），{tmp / 'server.log'} 是杀掉时的日志")
+
+        proc, log = spawn_backend(work, port, user, log_name="server2.log")
+        if not wait_health(port):
+            print("重启后后端没起来")
+            return 1
+        print("  后端已重启（同一份库，没再发任何消息），等它自己补记…")
+
+        t0 = time.time()
+        items, edges, total, q2 = [], [], 0, {}
+        for _ in range(80):
+            time.sleep(5)
+            items = api(port, f"/care/items?user_id={user}&status=all").get("items", [])
+            edges = [e for e in api(port, f"/care/graph?user_id={user}").get("edges", [])
+                     if e.get("rel") == "after"]
+            total = api(port, f"/memory/{user}/stats").get("total", 0)
+            q2 = api(port, f"/care/save-queue?user_id={user}")
+            if items and edges and not (q2.get("pending", 0) + q2.get("running", 0)):
+                break
+        spent = time.time() - t0
+        print(f"  补记耗时 {spent:.0f}s｜记忆 {total} 条｜事 {len(items)} 件｜链 {len(edges)} 条｜队列 {q2}")
+        print(f"  记下的事：{[(i['title'], '有日期' if i['due_at'] else '没日期') for i in items]}")
+        print(f"  链边：{[(e['label'], e['offset_days'], e['source']) for e in edges]}")
+        for line in read_log(tmp / "server.log", "后台落库")[-2:] + \
+                read_log(tmp / "server.log", "没落完")[-2:] + \
+                read_log(tmp / "server2.log", "没落完")[-2:] + \
+                read_log(tmp / "server2.log", "后台落库")[-2:]:
+            print(f"  日志：{line[-120:]}")
+
+        bad = []
+        if total < 1:
+            bad.append("重启后一条长期记忆都没补上")
+        if not any("妈" in (i.get("title") or "") or "生日" in (i.get("title") or "") for i in items):
+            bad.append("重启后没补出妈妈生日这件事")
+        if not edges:
+            bad.append("重启后没补出答辩→出结果的先后链")
+        if q2.get("pending", 0) + q2.get("running", 0):
+            bad.append("队列里还有没跑完的任务")
+        if bad:
+            print("  ✗ " + "；".join(bad))
+            return 1
+        print("  ✓ 杀掉的那一轮被重启后的进程补完了")
+        return 0
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            proc.kill()
+        log.close()
+        print(f"\n沙箱日志留在 {tmp}（可以直接删）")
+
+
+def main():
+    tmp, work, user = prepare_sandbox()
+    port = free_port()
+    print(f"沙箱后端 {work} 端口 {port}（空库，真实 moz.db 没被复制过来）")
+    if "--restart" in sys.argv:
+        return restart_probe(work, user, port, tmp)
+    proc, log = spawn_backend(work, port, user)
+    try:
+        if not wait_health(port):
             print("后端没起来，看沙箱里的 server.log")
             return 1
 

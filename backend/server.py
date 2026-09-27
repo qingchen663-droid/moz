@@ -38,6 +38,8 @@ from model_config import CHAT_MODEL, CHAT_BASE_URL, get_chat_api_key, detect_pro
 from memory_manager import EmotionType, MemoryCategory, MemoryManager
 from working_memory import WorkingMemoryStore
 from emotion_graph import build_emotion_graph, run_emotion_workflow_streaming, load_prompt_config, save_prompt_config, get_dialogue_prompt, DIALOGUE_AGENT_PROMPT
+from emotion_graph import SaveDeps, run_save_job
+from save_queue import SaveQueue, SaveWorker
 from summary_service import SummaryService
 from memory_consolidation import MemoryConsolidator
 from file_processor import is_multimodal_model
@@ -206,6 +208,22 @@ async def lifespan(app: FastAPI):
     _app_state["care_store"] = CareStore()
     # 事件关联图：把"记下的事"和"记得的事实"用人/主题连起来，心跳顺带增量刷新
     _app_state["care_graph"] = care_graph.CareGraph()
+
+    # 一轮后台落库要跑几分钟模型调用；改成持久化队列，后端重启不再"聊完白聊"
+    _app_state["save_queue"] = SaveQueue(db_path)
+    replayed = _app_state["save_queue"].recover()
+    if replayed:
+        logger.info("发现 %d 轮上次没落完的对话，正在补记", replayed)
+    save_deps = SaveDeps(
+        memory_manager=mm,
+        working_memory_store=_app_state["working_memory_store"],
+        profile_manager=profile_manager,
+        care_store=_app_state["care_store"],
+        care_graph=_app_state["care_graph"],
+    )
+    save_worker = SaveWorker(_app_state["save_queue"], lambda job: run_save_job(save_deps, job))
+    _app_state["save_worker"] = save_worker
+    save_task = asyncio.create_task(save_worker.run())
     care_task = asyncio.create_task(care_engine.care_loop(
         _app_state["care_store"],
         _app_state["working_memory_store"],
@@ -219,6 +237,8 @@ async def lifespan(app: FastAPI):
     yield
 
     care_task.cancel()
+    save_worker.stop()
+    save_task.cancel()
     # 新增：关闭档案卡管理器
     profile_manager.close()
     logger.info("moz 后端服务已停止")
@@ -478,6 +498,8 @@ async def chat(user_id: str, req: ChatRequest):
                 care_store=_app_state.get("care_store"),
                 care_graph=_app_state.get("care_graph"),
                 conversation_id=cid,
+                save_queue=_app_state.get("save_queue"),
+                save_worker=_app_state.get("save_worker"),
             ):
                 chunk_type = chunk.get("type")
                 if chunk_type == "status":
@@ -1103,6 +1125,14 @@ async def dry_run_care(user_id: str):
     return {"would_say": out, "budget_today": _app_state["care_store"].daily_budget(user_id)}
 
 
+@app.get("/api/care/save-queue", dependencies=[Depends(verify_access_key)])
+async def care_save_queue(user_id: str = DEFAULT_USER_ID):
+    """后台落库队列的当前状态：还有几轮没记完。只读。"""
+    user_id = normalize_user_id(user_id)
+    queue = _app_state["save_queue"]
+    return {"available": True, "pending_for_user": queue.pending_for(user_id), **queue.stats()}
+
+
 # ================================================================
 # API: 用户头像
 # ================================================================
@@ -1145,7 +1175,8 @@ async def get_avatar(user_id: str):
     user_id = normalize_user_id(user_id)
     path = _avatar_path(user_id)
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="未设置头像")
+        # 没头像才是常态，用 404 表达会在控制台留一条假报错：直接回 JSON 空值
+        return JSONResponse({"avatar": None})
     with open(path, "rb") as f:
         data = f.read()
     return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})

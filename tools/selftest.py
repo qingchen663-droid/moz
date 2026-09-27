@@ -76,6 +76,7 @@ READ_ENDPOINTS = [
     "/health", f"/conversations/{USER}", f"/memory/{USER}/stats", f"/memory/{USER}/detail",
     "/config/model", "/config/model-presets", "/config/saved-models", "/config/prompt", "/users",
     f"/care/items?user_id={USER}", f"/care/settings?user_id={USER}", f"/care/pending?user_id={USER}",
+    f"/care/save-queue?user_id={USER}",
     f"/profile/{USER}", "/logs?limit=5", f"/export/{USER}",
 ]
 
@@ -990,6 +991,189 @@ def css_uses_dvh():
     return True
 
 
+def save_queue_survives_restart():
+    """后台落库不许再挂在内存任务上：重启等于崩溃，队列要能自己捡回来。
+
+    旧实现是 asyncio.create_task 里的 4 次串行模型调用（实测 3~7 分钟），
+    --reload 一砸这轮就"聊完白聊"。这里用临时库模拟"跑到一半进程没了"。
+    """
+    import shutil
+    import tempfile
+
+    from save_queue import MAX_ATTEMPTS, SaveQueue, SaveWorker
+
+    bad = []
+    d = tempfile.mkdtemp()
+    try:
+        q = SaveQueue(os.path.join(d, "q.db"))
+        if q.enqueue("u1", "我妈生日是10月5号", "记下了") is None:
+            bad.append("空实现：一句话都没排进队列")
+        q.enqueue("u1", "", "空的不该占位")
+        if q.stats()["pending"] != 1:
+            bad.append(f"空消息也被排队：{q.stats()}")
+        if q.pending_for("u1") != 1:
+            bad.append("pending_for 数不对，接口上的排队数会骗人")
+
+        first = q.claim("worker-a")
+        if not first or first["status"] != "pending":
+            bad.append("claim 没取到任务（取到的还是 running 之外的状态）")
+        if q.claim("worker-b") is not None:
+            bad.append("同一条任务被两个 worker 同时 claim 走了")
+        if q.stats()["running"] != 1:
+            bad.append("claim 之后没标 running，重启时无从判断谁是遗骸")
+
+        recovered = q.recover()          # 进程重启：把 running 当遗骸捡回来
+        if recovered != 1 or q.stats()["pending"] != 1:
+            bad.append(f"重启后没把 running 捡回来（recover={recovered}, {q.stats()}）")
+        again = q.claim("worker-c")
+        if not again or again["user_message"] != "我妈生日是10月5号":
+            bad.append("捡回来的任务读不回原文，等于白排")
+        q.mark_done(again["id"])
+        if q.stats()["done"] != 1 or q.pending_for("u1") != 0:
+            bad.append(f"mark_done 之后状态不干净：{q.stats()}")
+
+        q.enqueue("u1", "再说一次", "好的")
+        for _ in range(MAX_ATTEMPTS + 1):
+            got = q.claim("w")
+            if not got:
+                break
+            q.mark_failed(got["id"], "中转连接失败")
+        st = q.stats()
+        if st["failed"] != 1 or st["pending"]:
+            bad.append(f"重试没有上限（{st}）：坏任务会永远占着队列")
+        if not isinstance(q.reap_stale(max_age=-1), int):
+            bad.append("reap_stale 不可用")
+
+        # worker 必须真的调用处理函数并回写状态，否则队列只是个体面摆设
+        seen = []
+
+        async def fake(job):
+            seen.append(job["user_message"])
+
+        import asyncio
+
+        wq = SaveQueue(os.path.join(d, "w.db"))
+        wq.enqueue("u2", "跑一遍就好", "嗯")
+
+        async def once():
+            worker = SaveWorker(wq, fake, poll_seconds=0.05)
+            task = asyncio.create_task(worker.run())
+            deadline = time.time() + 5
+            while time.time() < deadline and wq.stats()["done"] != 1:
+                await asyncio.sleep(0.05)
+            worker.stop()
+            task.cancel()
+
+        asyncio.run(once())
+        if seen != ["跑一遍就好"] or wq.stats()["done"] != 1:
+            bad.append(f"worker 没把任务跑完（跑过 {seen} 次，{wq.stats()}）")
+
+        kept = SaveQueue(os.path.join(d, "p.db"))
+        for n in range(6):
+            kept.enqueue("u3", f"第{n}轮", "好")
+            job = kept.claim("w")
+            kept.mark_done(job["id"])
+        kept.enqueue("u3", "还没跑", "好")
+        kept.prune(keep=2)
+        after = kept.stats()
+        if after["done"] != 2 or after["pending"] != 1:
+            bad.append(f"prune 动了没跑完的任务（{after}）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    import inspect
+
+    src = inspect.getsource(_load_emotion_graph())
+    if "_background_save" in src:
+        bad.append("emotion_graph 里还有内存态的 _background_save")
+    return "; ".join(bad) or True
+
+
+def _load_emotion_graph():
+    import emotion_graph
+
+    return emotion_graph
+
+
+def memory_quality_floor():
+    """长期记忆的底线：同一件事不许攒成三条，提问和moz自己的话不许冒充用户的事实。
+
+    都用临时库，绝不碰 backend/moz.db——上一轮 --full 探针污染用户库的事不再重复。
+    """
+    import shutil
+    import tempfile
+
+    import memory_manager as MM
+    from memory_governance import is_near_duplicate, is_question_shaped, normalized_content
+
+    bad = []
+    # 提问形状：? / ？ / 「…吗」都要认，"今天好烦呢"是陈述不是提问
+    for text in ["[对话摘要] 用户说：我家猫叫什么来着？几岁了？", "你喜欢吃香菜吗", "这是几点？"]:
+        if not is_question_shaped(text):
+            bad.append(f"提问没被认出来：{text}")
+    for text in ["我家猫叫团子", "今天好烦呢", "[关于用户] 我讨厌吃香菜"]:
+        if is_question_shaped(text):
+            bad.append(f"陈述被误判成提问：{text}")
+
+    # 近义判据：只差虚词算重复，换主语/换日期不算
+    dup = [("我讨厌吃香菜", "用户讨厌吃香菜"), ("我妈喜欢养花", "用户的妈妈喜欢养花"),
+           ("我的猫叫团子", "用户的猫叫团子")]
+    for a, b in dup:
+        if not is_near_duplicate(normalized_content(a), normalized_content(b)):
+            bad.append(f"同一件事没认出来：{a} / {b}")
+    keep = [("我妈生日是十月初五", "我妈生日是三月初五"), ("我喜欢猫", "他喜欢猫"),
+            ("我不吃香菜", "我吃香菜"), ("猫叫团子", "狗叫团子")]
+    for a, b in keep:
+        if is_near_duplicate(normalized_content(a), normalized_content(b)):
+            bad.append(f"两件事被当成重复：{a} / {b}")
+
+    d = tempfile.mkdtemp()
+    try:
+        m = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "q.db"))
+        m.embedding_service.get_embedding = lambda text: None
+        # 事实提取走的是大模型：快检门禁不许碰它，这里钉成"什么都没提到"，
+        # 让它落到 [对话摘要] 那条回落分支
+        m._extract_facts = lambda *a, **k: []
+        u = "quality"
+        for text in ["[关于用户] 我讨厌吃香菜", "[关于用户] 用户讨厌吃香菜",
+                     "[关于用户] 我讨厌吃香菜的"]:
+            m.add_memory(u, text, category=MM.MemoryCategory.FACT)
+        stored = [x.content for x in m._get_user_memories(u).values()]
+        if len(stored) != 1:
+            bad.append(f"同一件事攒了 {len(stored)} 条：{stored}")
+
+        m.extract_and_store_facts(u, "我家猫叫什么来着？几岁了？", "团子呀，五岁了",
+                                  category=MM.MemoryCategory.FACT)
+        added = [x.content for x in m._get_user_memories(u).values() if x.content not in stored]
+        if any(c.startswith("[对话摘要] 用户说：") for c in added):
+            bad.append(f"提问被记成了长期记忆：{[c for c in added if '用户说' in c]}")
+        if not any("AI回复要点" in c for c in added):
+            bad.append(f"AI 的回复一条没落，回落分支被改坏了：{added}")
+        ai = [x for x in m._get_user_memories(u).values() if "AI回复要点" in x.content]
+        if ai and ai[0].source_type != "ai_reply":
+            bad.append(f"AI 回复没单独标 source_type（{ai[0].source_type}），检索时降不了权")
+
+        m.add_memory(u, "[关于用户] 我妈喜欢养花", category=MM.MemoryCategory.FACT)
+        m.add_memory(u, "[对话摘要] AI回复要点：你喜欢养花呀", category=MM.MemoryCategory.FACT,
+                     source_type="ai_reply")
+        # 库里早就存在的"提问形状"条目也要降权：只挡新写入不够，直接量打分
+        m.add_memory(u, "[对话摘要] 用户说：我妈喜欢什么来着？", category=MM.MemoryCategory.FACT)
+        scored = {
+            x.content: m._match_score(x, "妈妈喜欢养花")
+            for x in m._get_user_memories(u).values() if "养花" in x.content or "喜欢什么" in x.content
+        }
+        mine = [v for k, v in scored.items() if k.startswith("[关于用户]")]
+        others = [v for k, v in scored.items() if not k.startswith("[关于用户]")]
+        if not mine or not others:
+            bad.append(f"打分样本没取到：{scored}")
+        elif min(mine) <= max(others):
+            bad.append(f"用户自己的事实没排在提问/AI回复之上：{scored}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    return "; ".join(bad) or True
+
+
 def frontend_no_junk():
     """孤儿样式/备份文件：曾经因为弹窗样式只在 ModelDialog.new.css 里而整块裸奔。"""
     comp = ROOT / "frontend" / "src" / "components"
@@ -1042,10 +1226,16 @@ def weather_probe():
 def avatar_probe():
     code, payload = http(f"/avatar/{USER}", raw=True)
     if code == 404:
-        return True  # 没设头像也合法
+        return '没设头像还回 404：那是控制台里一条假报错，该回 {"avatar": null}'
     if code != 200:
         return f"头像读取 {code}"
-    return True if payload[:3] == b"\xff\xd8\xff" else "返回的不是 JPEG"
+    if payload[:3] == b"\xff\xd8\xff":
+        return True
+    try:
+        body = json.loads(payload)
+    except (ValueError, TypeError):
+        return f"既不是 JPEG 也不是 JSON：{payload[:24]!r}"
+    return True if body.get("avatar") is None else f"JSON 里带了头像：{body}"
 
 
 # ── 6. 慢检：真实对话往返 ────────────────────────────────
@@ -1261,7 +1451,6 @@ def main():
     check("多模态声明可读回", model_capability_roundtrip)
     check("我存的模型可切换", saved_models_roundtrip)
     check("导出覆盖关心事项", export_covers_care)
-    check("限流不误伤本地", rate_limit_not_hostile)
     check("安静时段判定", engine_logic)
     check("日期抽取与去噪", extractor_logic)
     check("聊到日子自己记下", care_harvest_roundtrip)
@@ -1270,6 +1459,8 @@ def main():
     check("数据库不变量", db_invariants)
     check("记忆容量不悄悄删", capacity_policy_check)
     check("检索提速不改排序", keyword_parity_check)
+    check("落库队列重启不丢", save_queue_survives_restart)
+    check("记忆质量底线", memory_quality_floor)
     check("事件关联成图", care_link_graph_check)
     check("事件先后链", care_chain_link_check)
     check("探针清理器不错杀", probe_cleaner_works)
@@ -1277,6 +1468,8 @@ def main():
     check("头像字节流", avatar_probe)
     check("前端高度用dvh", css_uses_dvh)
     check("前端无孤儿杂物", frontend_no_junk)
+    # 这项会连发 80 次打满自己的 IP 桶，必须排在最后，否则紧接着的检查会被限流打掉
+    check("限流不误伤本地", rate_limit_not_hostile)
     if a.full:
         # 探针会污染"话多话少"的学习值（探针全是一句话回答），跑完原样还回去
         care_before = read_care_settings(USER)
