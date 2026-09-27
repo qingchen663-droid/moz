@@ -441,6 +441,12 @@ def care_no_dump():
         E._polish = polish
         E._last_user_seen.clear()
         E._last_poll_seen.clear()
+        import shutil
+        try:
+            store._conn().close()          # Windows 上连接不关就删不掉目录
+        except Exception:
+            pass
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def store_logic():
