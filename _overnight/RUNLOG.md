@@ -1,8 +1,8 @@
 # moz 整夜自测与产品审核运行日志
 
-开始：2026-09-26 23:00 左右　·　本页最后更新：2026-09-27 03:45（第三轮 + 追加三批）
+开始：2026-09-26 23:00 左右　·　本页最后更新：2026-09-27 10:10（第三轮 + 追加四批）
 执行方式：全局测试台 → 产品经理视角审核 → 逐条修复 → 复测 → 每修一条提交一次。
-**当前门禁：selftest 22 项（--full 26 项）+ vitest 49 条 + tsc 无输出。** 本轮记录在页尾"第三轮"。
+**当前门禁：selftest 23 项（--full 26 项）+ vitest 50 条 + tsc 无输出。** 本轮记录在页尾"第三轮"。
 
 ## 怎么跑（明天早上你自己验也是这两条）
 
@@ -14,7 +14,7 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py
 # 它跑完会自己擦掉写进库里的测试痕迹；两次全量之间隔 60s，否则会被自己的限流打掉
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py --full
 
-# 前端：类型检查 + 49 个结构回归
+# 前端：类型检查 + 50 个结构回归
 cd frontend && npx tsc -b && npx vitest run
 ```
 
@@ -192,8 +192,8 @@ cd frontend && npx tsc -b && npx vitest run
 
 ## 交接：下一轮从这里接
 
-门禁：`PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py`（22 项）
-+ `cd frontend && npx tsc -b && npx vitest run`（49 条）。工作树干净，HEAD 见 `git log`。
+门禁：`PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py`（23 项）
++ `cd frontend && npx tsc -b && npx vitest run`（50 条）。工作树干净，HEAD 见 `git log`。
 
 ### 02:50–03:16 又做了一批（同样每条一个提交）
 
@@ -243,11 +243,23 @@ selftest 新增 `聊到日子自己记下`（端到端跑 harvest()，临时用�
 `loadConversations` 自己兜住，`loadUsers()`（界面上早就没有多用户入口了）失败也不再污染控制台。
 门禁：selftest 22 项、vitest 49 条、tsc 无输出，全绿。
 
+### 交接后追加（用户看着面板提的）：模型可以存好几套
+
+自定义模型原来只有一个槽位，换回上一个就得重打名字/地址/Key。
+现在模型弹窗里多了「我存的模型」：把当前生效这套起个名字存下来，列表里点「用这个」
+整套（含密钥、深度思考、能否发图）换回来，最多 12 套。
+**密钥不经过浏览器**：存的时候后端自己从生效配置读，列表只回 `has_key`，
+所以 `backend/saved_models.json` 和 `runtime_model_config.json` 一样进 .gitignore。
+门禁变成 **selftest 23 项 / vitest 50 条**；新增两项都刻意不碰真 Key
+（后端那条全程临时文件，前端那条用 mock 后端）。浏览器里存→显示→删往返验过一遍，
+用户当前生效的 `runtime_model_config.json` 字节未变。
+
 ### 还剩这些会让人皱眉
 
-1. **回复看不见 / 自动滚动**：`ChatArea` 的滚动 effect 依赖 `[messages, statusText]`，
-   流式期间每条 token 都会触发，逻辑上跟得住；但这轮浏览器面板没开（视口 0x0），
-   **没法实测**。要看的是：moz 回话那 20~35 秒里用户正在打字时，新回复会不会被顶到屏幕外。
+1. **回复看不见 / 自动滚动**：面板后来打开了，真视口下看过一眼静态布局——输入框、气泡、侧栏都正常
+   （`100dvh` 那批改动视觉上成立）。**还没验的是动的那半**：moz 回话那 20~35 秒里用户正在打字时，
+   新回复会不会被顶到屏幕外。`ChatArea` 的滚动 effect 依赖 `[messages, statusText]`，流式期间每 token 都触发，
+   逻辑上跟得住；要真人试一次才算数。
 2. `daily_budget` 现在只管"没来由的搭话"；`rain`/事项提醒走另一条硬上限（每日 8 条）。
    如果哪天事项很多，需要再看是不是要给提醒也加个更细的节奏。
 3. `限流不误伤本地` 这项自己连发 80 次，会挤占同一个 IP 桶、污染紧接着跑的检查（见上面"坑 1"）。
