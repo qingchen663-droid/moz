@@ -2271,6 +2271,7 @@ class MemoryManager:
         else:
             user_summary = user_msg.strip()[:60]
             ai_summary = assistant_msg.strip()[:80]
+            stored_user = False
             # "用户说：…？" 是提问，不是关于用户的事实，存下来只会污染以后的检索
             if len(user_summary) >= 2 and not is_question_shaped(user_summary):
                 self.add_memory(
@@ -2281,9 +2282,14 @@ class MemoryManager:
                     emotion_intensity=emotion_intensity,
                     conversation_id=conversation_id,
                 )
-            if len(ai_summary) >= 4 and not looks_like_system_copy(ai_summary):
+                stored_user = True
+            if stored_user and len(ai_summary) >= 4 and not looks_like_system_copy(ai_summary):
                 # 她自己的"抱歉，我暂时无法回复"和报错文案不是用户的事实，
-                # 存下来只会变成一条以后会被回忆起来的垃圾
+                # 存下来只会变成一条以后会被回忆起来的垃圾。
+                # 用户那句是提问时也不存这句回答：回答只是把已有的事实换个说法再讲一遍，
+                # 单独进长期记忆等于给自己的回声再存一份（第十四轮实测：
+                # 沙箱那 11 条里 4 条是这种回声，占检索前 5 名的 12/30，
+                # 问"有什么吃的我不能吃"时真答案被压到第 3，前两名是猫和老郑）
                 self.add_memory(
                     user_id=user_id,
                     content=f"[对话摘要] AI回复要点：{ai_summary}",

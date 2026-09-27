@@ -442,6 +442,34 @@ def test_profile_refuses_empty_shells():
     assert len(after) == 2 and after[-1]["name"] == "王芳"   # 有名字就不算空壳
 
 
+def test_question_answer_pair_leaves_no_memory(tmp_path):
+    """用户问一句、她答一句，那句回答不该变成一条"关于用户的事实"。
+
+    第十四轮实测：上一轮沙箱 11 条长期记忆里 4 条是 `[对话摘要] AI回复要点：…`
+    （全是答提问时存下来的），检索前 5 名里她们家回声占 12/30。
+    用户那句是陈述时照旧成对存（用户说 + 她的要点），这条不许退化。
+    """
+    from memory_manager import MemoryManager, MemoryCategory
+
+    m = MemoryManager(storage_path=str(tmp_path), db_path=str(tmp_path / "m.db"))
+    try:
+        m.embedding_service.get_embedding = lambda text: None
+        m._extract_facts = lambda *a, **k: []          # 单测不许打中转
+        m.extract_and_store_facts("q_user", "我家猫叫什么来着？", "团子呀，五岁的橘猫～",
+                                  category=MemoryCategory.FACT)
+        assert list(m._get_user_memories("q_user").values()) == [], "一问一答存出了记忆"
+
+        m.extract_and_store_facts("s_user", "我最近在学做酸菜鱼", "先少放点辣椒，别辣到胃",
+                                  category=MemoryCategory.FACT)
+        stored = [x.content for x in m._get_user_memories("s_user").values()]
+        assert any("酸菜鱼" in c for c in stored), stored
+        assert any("AI回复要点" in c for c in stored), stored
+    finally:
+        conn = getattr(getattr(m, "_local", None), "conn", None)
+        if conn is not None:
+            conn.close()          # MemoryManager 没有 _conn()，连接挂在线程本地
+
+
 def test_extraction_path_skips_empty_values(tmp_path):
     """整条落地路径也不许写空值：identity.nickname="" 以前会真的存成空串。"""
     from user_profile import ProfileManager, ProfileUpdater, UserProfile
