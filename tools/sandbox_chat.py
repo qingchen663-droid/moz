@@ -350,7 +350,9 @@ def main():
         for text in FACTS:
             t0 = time.time()
             _, n = chat_retry(port, user, text)
-            back = "" if n == 1 else f"（第 {n or '两次都没'} 次才回话）"
+            back = "" if n == 1 else (
+                "（两次都没回话：她没接住，但这句话照样得存上）" if n == 0
+                else f"（第 {n} 次才回话）")
             fact_retry += 1 if n not in (0, 1) else 0
             print(f"  说了：{text}   ({time.time() - t0:.0f}s){back}")
             time.sleep(2)   # 抽取是异步的，给落库留点时间
