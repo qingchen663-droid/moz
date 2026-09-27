@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Any, Dict, Optional
@@ -79,9 +80,63 @@ def normalized_content(content: str) -> str:
     """Normalize punctuation, width, case and common extraction prefixes."""
     value = unicodedata.normalize("NFKC", content or "").strip().lower()
     value = re.sub(r"^\[(?:关于用户|用户情感状态|AI互动|对话摘要|AI回复要点)\]\s*", "", value)
-    value = re.sub(r"^用户(?:说|提到|表示)[：:]?\s*", "", value)
+    # 抽取器一会儿写"我讨厌吃香菜"一会儿写"用户讨厌吃香菜"——同一件事的两条记忆
+    # 就是这么来的。第一人称和"用户"都指同一个人，一律折掉；第三人称（他/她）留着，
+    # 那是别人的事实，不能并到用户名下。
+    value = re.sub(r"^(?:用户|我们|我)(?:说|提到|表示|要求|希望|希望以后)?[：:]?", "", value)
     value = re.sub(r"[\s，。！？；：、“”‘’,.!?;:'\"()（）\[\]{}<>《》-]+", "", value)
-    return value
+    value = value.replace("的", "")
+    # 抽掉"用户/我"这层主语后，"用户的妈妈"会剩成"妈妈"而"我妈"剩成"妈"
+    return re.sub(r"(妈|爸|哥|姐)\1", r"\1", value)
+
+
+def is_question_shaped(content: str) -> bool:
+    """这条内容是在提问，不是在陈述用户的事实。
+
+    提问进长期记忆的后果很实在：以后她会把"我问过团子叫什么"当成用户的事实，
+    甚至拿自己上轮的回答当证据套娃引用。这里只用尾部判断，不走正则——
+    检索打分时每条记忆都要调一次。
+    """
+    value = (content or "").rstrip()
+    if not value:
+        return False
+    if ord(value[-1]) in (0x3F, 0xFF1F):        # 半角 ? 和全角 ？
+        return True
+    body = value.rstrip("。！!~　 ")
+    if body.endswith("吗"):
+        return True
+    # "今天好烦呢" 是陈述不是提问，所以 呢 要配疑问词才算
+    return body.endswith("呢") and any(w in body for w in ("什么", "哪", "谁", "怎么", "多少"))
+
+
+# 语气词/助词之外的差别就是新信息，不能并条。
+_FILLER = set("的了着啊呀呢吧嘛哦嗯过就都也很挺那点儿些")
+_MAX_FILLER_GAP = 4
+
+
+def _negated(text: str) -> bool:
+    return any(ch in text for ch in "不没别")
+
+
+def is_near_duplicate(a: str, b: str) -> bool:
+    """两条已归一化的正文是不是同一件事的两种写法。
+
+    判据是"多出来的部分全是虚词"，而不是字符重合比例：比例会把"喜欢猫"和
+    "他喜欢猫"算成同一件事，那是两个人；否定式不同也一律不算重复。
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if _negated(a) != _negated(b):
+        return False
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if len(long) - len(short) > _MAX_FILLER_GAP:
+        return False
+    if any(ch not in _FILLER for ch in (Counter(long) - Counter(short))):
+        return False
+    it = iter(long)          # 短的那条要能按顺序整条嵌进长的那条
+    return all(ch in it for ch in short)
 
 
 _GOAL_WORDS = (

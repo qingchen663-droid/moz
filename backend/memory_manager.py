@@ -40,6 +40,8 @@ from memory_governance import (
     grade_threshold,
     initial_grade,
     normalized_content,
+    is_near_duplicate,
+    is_question_shaped,
 )
 
 load_dotenv()
@@ -774,17 +776,23 @@ class MemoryManager:
         user_memories = self._get_user_memories(user_id)
         normalized = normalized_content(content)
 
-        # Exact normalization catches punctuation/alias-prefix duplicates even
-        # when the embedding service is unavailable.
+        # 这台机器没有可用的 embedding：归一化相同算同一条，写法不同的同一件事
+        # 靠二元组重叠系数并条。宁可并错也不要同一件事攒成三条互相冲突的记忆。
         for memory in user_memories.values():
-            if memory.active() and normalized_content(memory.content) == normalized:
-                return self.reinforce_memory(
-                    user_id=user_id,
-                    memory_id=memory.id,
-                    event_type="mentioned",
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                )
+            if not memory.active():
+                continue
+            other = normalized_content(memory.content)
+            if not is_near_duplicate(normalized, other):
+                continue
+            if other != normalized:
+                logger.info("[记忆并条] 「%s」并进了已有的一条近义记忆", content[:40])
+            return self.reinforce_memory(
+                user_id=user_id,
+                memory_id=memory.id,
+                event_type="mentioned",
+                conversation_id=conversation_id,
+                message_id=message_id,
+            )
 
         factors, degree_score = DegreeScorer.calculate(
             content=content,
@@ -1744,12 +1752,15 @@ class MemoryManager:
     def _match_prepared(memory: MemoryItem, prepared: Dict, clean_content: str) -> float:
         """同上，但复用查询侧派生数据和已清洗的正文（检索时每条记忆都要算一次）。"""
         clean_query = prepared["clean_query"]
+        # 提问形状的记忆、以及 moz 自己说过的话，不该和用户说定的事实平起平坐
+        weight = 0.45 if is_question_shaped(memory.content) else (
+            0.6 if memory.source_type == "ai_reply" else 1.0)
 
         # 1. 查询中的连续关键词在内容中出现（中文字符级子串匹配，优先级最高）
         if len(clean_query) >= 2 and clean_query in clean_content:
-            return 0.8
+            return 0.8 * weight
         if len(clean_content) >= 2 and clean_content in clean_query:
-            return 0.8
+            return 0.8 * weight
 
         # 2. 提取查询中的中文词（2-4字组合）进行匹配
         common_count = 0
@@ -1759,7 +1770,7 @@ class MemoryManager:
 
         if common_count > 0:
             ratio = common_count / max(len(clean_query), 1)
-            return ratio * (0.6 + memory.importance * 0.4)
+            return ratio * (0.6 + memory.importance * 0.4) * weight
 
         # 3. 英文词匹配（回退）
         content_words = MemoryManager._split_words(memory.content.lower())
@@ -1767,7 +1778,7 @@ class MemoryManager:
         if common:
             union = prepared["query_words"] | content_words
             jaccard = len(common) / len(union)
-            return jaccard * (0.6 + memory.importance * 0.4)
+            return jaccard * (0.6 + memory.importance * 0.4) * weight
 
         return 0.0
 
@@ -2228,7 +2239,7 @@ class MemoryManager:
         extracted_facts = self._extract_facts(user_msg, assistant_msg)
 
         if extracted_facts:
-            for fact in extracted_facts:
+            for fact in [f for f in extracted_facts if not is_question_shaped(f)]:
                 supersedes = self._resolve_fact_conflicts(user_id, fact, category)
                 self.add_memory(
                     user_id=user_id,
@@ -2242,7 +2253,8 @@ class MemoryManager:
         else:
             user_summary = user_msg.strip()[:60]
             ai_summary = assistant_msg.strip()[:80]
-            if len(user_summary) >= 2:
+            # "用户说：…？" 是提问，不是关于用户的事实，存下来只会污染以后的检索
+            if len(user_summary) >= 2 and not is_question_shaped(user_summary):
                 self.add_memory(
                     user_id=user_id,
                     content=f"[对话摘要] 用户说：{user_summary}",
@@ -2251,11 +2263,12 @@ class MemoryManager:
                     emotion_intensity=emotion_intensity,
                     conversation_id=conversation_id,
                 )
-            if len(ai_summary) >= 4:
+            if len(ai_summary) >= 4 and not is_question_shaped(ai_summary):
                 self.add_memory(
                     user_id=user_id,
                     content=f"[对话摘要] AI回复要点：{ai_summary}",
                     category=category,
+                    source_type="ai_reply",
                     emotion=emotion,
                     emotion_intensity=emotion_intensity,
                     conversation_id=conversation_id,
