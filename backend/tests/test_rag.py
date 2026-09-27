@@ -417,27 +417,66 @@ class TestHybridSearch:
 # ================================================================
 
 class TestQueryRewrite:
+    """查询改写：离线钉住。
+
+    第十三轮发现这四个用例里有两条**真的在打中转**（9.27s / 7.09s，整套 pytest 的
+    大头就是它们），而 rewrite_query 会吞掉一切异常 —— 所以中转挂了它们照样绿，
+    等于"花 16 秒买了个假通过"。现在一律 monkeypatch 掉模型客户端。
+    """
+
+    @staticmethod
+    def _fake_llm(monkeypatch, content="[]", delay=0.0):
+        import llm_config
+
+        class Fake:
+            def invoke(self, msgs):
+                if delay:
+                    time.sleep(delay)
+                return type("R", (), {"content": content})()
+
+        monkeypatch.setattr(llm_config, "get_llm_client", lambda **kw: Fake())
 
     def test_rewrite_short_query(self):
         from memory_manager import rewrite_query
-        result = rewrite_query("")
-        assert result == [""]
+        assert rewrite_query("") == [""]
 
     def test_rewrite_single_char(self):
         from memory_manager import rewrite_query
-        result = rewrite_query("好")
-        assert result == ["好"]
+        assert rewrite_query("好") == ["好"]
 
-    def test_rewrite_returns_list(self):
+    def test_rewrite_returns_list(self, monkeypatch):
         from memory_manager import rewrite_query
+        self._fake_llm(monkeypatch, content='["心情不好", "压力"]')
         result = rewrite_query("我今天心情不好")
-        assert isinstance(result, list)
-        assert len(result) >= 1
+        assert isinstance(result, list) and len(result) >= 1
         assert "我今天心情不好" in result
+        assert "压力" in result
 
-    def test_rewrite_preserves_original(self):
+    def test_rewrite_preserves_original_and_caps(self, monkeypatch):
         from memory_manager import rewrite_query
+        self._fake_llm(monkeypatch, content='["a", "b", "c", "d", "e"]')
         result = rewrite_query("我最近压力好大")
         assert result[0] == "我最近压力好大"
+        assert len(result) <= 4, f"改写没封顶：{result}"
+
+    def test_slow_rewrite_does_not_block_the_search(self, monkeypatch):
+        """超时必须真的把调用方放走。
+
+        以前写成 with ThreadPoolExecutor(...)：future.result(5) 是超时了，
+        但退出 with 还要等工作线程跑完，实测模型 8 秒回、调用方等 8.00 秒。
+        """
+        import memory_manager as MM
+        self._fake_llm(monkeypatch, content='["压力"]', delay=3.0)
+        monkeypatch.setattr(MM, "QUERY_REWRITE_TIMEOUT", 0.4)
+        t0 = time.time()
+        result = MM.rewrite_query("我最近压力好大")
+        spent = time.time() - t0
+        assert result == ["我最近压力好大"]
+        assert spent < 1.5, f"超时没截住，调用方白等了 {spent:.2f}s"
+
+    def test_broken_rewrite_output_falls_back(self, monkeypatch):
+        from memory_manager import rewrite_query
+        self._fake_llm(monkeypatch, content="这不是 JSON")
+        assert rewrite_query("我最近压力好大") == ["我最近压力好大"]
 
 

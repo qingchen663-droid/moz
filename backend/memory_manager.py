@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import re
 from functools import lru_cache, wraps
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
@@ -602,11 +603,19 @@ QUERY_REWRITE_PROMPT = """你是一个搜索查询改写专家。请将用户的
 ["查询1", "查询2"]"""
 
 
+# 查询改写共用一个线程池：每次新建一个池的话，超时后 with 退出还要等那次请求跑完，
+# "5 秒上限"就形同虚设（实测模型 8 秒回，调用方等了 8.00 秒）。
+_REWRITE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="query-rewrite")
+QUERY_REWRITE_TIMEOUT = float(os.environ.get("MOZ_QUERY_REWRITE_TIMEOUT", "5"))
+
+
 def rewrite_query(query: str) -> List[str]:
     """
     使用 LLM 将用户口语化输入改写为多个检索查询。
 
-    LLM 不可用或超时时降级返回原始查询。
+    LLM 不可用或超时降级返回原始查询。**超时是真的会返回**：以前这里写成
+    `with ThreadPoolExecutor(...)`，即使 future.result(5) 超时了，退出 with 也要
+    等工作线程跑完，慢中转会把整轮检索拖满（实测模型 8 秒回，调用方等 8.00 秒）。
     """
     if not query or len(query.strip()) < 2:
         return [query]
@@ -618,11 +627,14 @@ def rewrite_query(query: str) -> List[str]:
         llm = get_llm_client(temperature=0.0, use_thinking=False)
         prompt = QUERY_REWRITE_PROMPT.format(query=query)
 
-        # 5 秒超时，避免 LLM 慢响应阻塞检索
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(llm.invoke, [HumanMessage(content=prompt)])
-            response = future.result(timeout=5)
+        future = _REWRITE_POOL.submit(llm.invoke, [HumanMessage(content=prompt)])
+        try:
+            response = future.result(timeout=QUERY_REWRITE_TIMEOUT)
+        except FutureTimeout:
+            # 别等它：这一次改写不要了，原始查询照样能搜
+            future.cancel()
+            logger.warning("[查询改写] 超过 %.0fs 没回，先用原始查询", QUERY_REWRITE_TIMEOUT)
+            return [query]
 
         content = response.content.strip()
 
@@ -636,8 +648,6 @@ def rewrite_query(query: str) -> List[str]:
             # 确保原始查询也在列表中
             result = [query] + [q for q in queries if q != query]
             return result[:4]  # 最多 4 个查询（原始 + 3 个改写）
-    except concurrent.futures.TimeoutError:
-        logger.warning("[查询改写] LLM 超时(5s)，使用原始查询")
     except Exception as e:
         logger.warning(f"[查询改写] 失败，使用原始查询: {e}")
 
