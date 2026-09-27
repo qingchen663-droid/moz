@@ -227,6 +227,107 @@ def extractor_logic():
     return "; ".join(fail) or True
 
 
+def relative_dates_land_right():
+    """规则兜底里的相对说法必须落在"对的那个日子"，不能只是"今天+7天"。
+
+    中转挂掉/没配 Key 时走的就是这条路：以前"下周三"被折成下周一、"下个月3号"被折成
+    +30 天，日期错了 moz 就会在错的日子当面说错话；时间戳还带着"用户敲字那一刻"的钟点。
+    """
+    import datetime as _dt
+    import care_extractor as X
+
+    WD = "一二三四五六日"                       # weekday(): 0=周一
+    today = _dt.date.today()
+    monday = today - _dt.timedelta(days=today.weekday())
+    now = _dt.datetime.now()
+    fail = []
+
+    def one(text):
+        """一句只该记一件事时，返回那条 (本地时间, 事项)；没记就 None。"""
+        got = X._fallback_items(text)
+        if not got:
+            return None
+        it = got[0]
+        ts = float(it.get("due_at") or 0)
+        if not ts:
+            ts = X._to_timestamp(it.get("due_date"), it.get("repeat") == "yearly")
+        return (_dt.datetime.fromtimestamp(ts), it) if ts else None
+
+    # 1) 下周X = 下一个自然周的星期 X（不是"今天+7天"）
+    for ch, want in (("三", 2), ("五", 4), ("一", 0), ("日", 6)):
+        r = one(f"我下周{ch}要去体检")
+        if not r:
+            fail.append(f"下周{ch}没记下来")
+            continue
+        d, it = r
+        if d.weekday() != want:
+            fail.append(f"下周{ch}落在星期{WD[d.weekday()]}")
+        if not 7 <= (d.date() - monday).days <= 13:
+            fail.append(f"下周{ch}不在下一个自然周：{d:%m-%d}")
+        if f"下周{ch}" in it["title"]:
+            fail.append(f"标题还带着日期，读起来像半句话：{it['title']}")
+        if d.date() <= today:
+            fail.append(f"下周{ch}记成了过去：{d:%m-%d}")
+
+    # 2) 裸写和"这周X"= 本周那个星期几，过了就顺延一周；没记只能是因为当天已经过了
+    for ch, want in (("三", 2), ("六", 5)):
+        r = one(f"我周{ch}要去找医生复诊")
+        if not r:
+            this_wd = monday + _dt.timedelta(days=want)
+            if not (this_wd <= today and (this_wd != today or now.hour >= 9)):
+                fail.append(f"本周{ch}不该记却拒了")
+            continue
+        d, _ = r
+        if d.weekday() != want:
+            fail.append(f"周{ch}落在星期{WD[d.weekday()]}")
+        if not (today <= d.date() <= monday + _dt.timedelta(days=13)):
+            fail.append(f"周{ch}离今天太远/太近：{d:%m-%d}")
+
+    # 3) "下个月N号"是真的下个月 N 号，不是今天+30 天
+    r = one("我下个月3号要搬家")
+    if not r:
+        fail.append("下个月3号没记下来")
+    else:
+        d, _ = r
+        nm = today.month % 12 + 1
+        if (d.month, d.day) != (nm, 3):
+            fail.append(f"下个月3号折成了 {d:%Y-%m-%d}")
+        if (d.hour, d.minute) != (9, 0):
+            fail.append(f"没给钟点时该落在早上 9 点，实得 {d:%H:%M}")
+
+    # 4) 给了钟点就用它：别把"下午两点"的答辩记成早上九点
+    r = one("我下周三下午两点要去做项目答辩")
+    if not r:
+        fail.append("下周三下午两点没记下来")
+    else:
+        d, _ = r
+        if (d.hour, d.minute) != (14, 0):
+            fail.append(f"下午两点折成了 {d:%H:%M}")
+
+    # 5) 明天这类词表说法也别带上"敲字那一刻"的钟点
+    r = one("我明天要去复诊")
+    if not r:
+        fail.append("明天没记下来")
+    else:
+        d, _ = r
+        if d.date() != today + _dt.timedelta(days=1):
+            fail.append(f"明天折成了 {d:%m-%d}")
+        if d.hour == now.hour and d.minute == now.minute:
+            fail.append(f"明天保留了敲字的钟点 {d:%H:%M}")
+
+    # 6) 重复发生的事不许被记成一次性的某月某日
+    if one("我每周三都要去体检"):
+        fail.append("把每周的事记成了一条一次性的")
+    # 7) 没有的那一天宁可不记，也别滚成"下个月的第一天"这种鬼日子
+    import calendar as _cal
+    if one("我下个月40号要搬家"):
+        fail.append("根本没有 40 号，却记下来了")
+    r = one("我下个月31号要搬家")
+    if r and _cal.monthrange(r[0].year, r[0].month)[1] < 31:
+        fail.append(f"{r[0]:%Y-%m} 没有 31 号，却记成了 {r[0]:%Y-%m-%d}")
+    return "; ".join(fail) or True
+
+
 def store_logic():
     from care_store import CareStore
     u = "__selftest_store__"
@@ -1475,6 +1576,7 @@ def main():
     check("导出覆盖关心事项", export_covers_care)
     check("安静时段判定", engine_logic)
     check("日期抽取与去噪", extractor_logic)
+    check("相对日期落在对的日子", relative_dates_land_right)
     check("聊到日子自己记下", care_harvest_roundtrip)
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)

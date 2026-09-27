@@ -125,7 +125,12 @@ def _item_from_clause(clause: str) -> Optional[Dict[str, Any]]:
         # 永远不会到点提醒，也当不了先后链的起点。过去的说法也不该再来烦用户。
         if not ts or ts <= time.time():
             return None
-        return [{"kind": "event", "title": _normalize_title(clause), "due_date": None,
+        # 和上面绝对日期那条路一样：说法已经折进 due_at 了，别再留在标题里
+        title = re.sub(r"[的下在是]+$", "",
+                       _normalize_title(TemporalExtractor.strip_phrases(clause)))
+        if not title:
+            return None
+        return [{"kind": "event", "title": title, "due_date": None,
                  "due_at": ts, "repeat": "none",
                  "why": f"规则兜底：{temporal.event_time.get('description', '')}提到过"}]
 
