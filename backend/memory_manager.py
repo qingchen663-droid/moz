@@ -1664,8 +1664,16 @@ class MemoryManager:
             self._save_to_disk()
         return to_archive
 
-    MAX_ACTIVE_MEMORIES = int(os.environ.get("MOZ_MAX_ACTIVE_MEMORIES", "300"))
-    CONSOLIDATION_TRIGGER = int(os.environ.get("MOZ_CONSOLIDATION_TRIGGER", "200"))
+    # 活跃记忆上限。以前是 300：一个每天聊十几句的人几周就撞顶，
+    # 之后最低分的旧记忆会被静默归档（界面上只表现为"长期记忆 · 300 条"不再涨），
+    # 归档再堆到 600 条还会被物理删除——用户故事就这么悄悄没了。
+    # 实测检索代价是线性的（约 65µs/条/查询），5000 条时单次检索 ~0.3s、
+    # 线上那种 3 路查询 ~1s，相比模型回一句 25~35s 完全可忽略，所以放宽到 5000。
+    MAX_ACTIVE_MEMORIES = int(os.environ.get("MOZ_MAX_ACTIVE_MEMORIES", "5000"))
+    # 巩固会同步调用模型（每次最多 5 个簇），触发点必须明显低于上限，也别低到天天触发
+    CONSOLIDATION_TRIGGER = int(os.environ.get("MOZ_CONSOLIDATION_TRIGGER", "3000"))
+    # 归档条数超过这个值才允许物理删除；0 = 永不硬删（一条归档才 ~180 字节，留着不心疼）
+    ARCHIVE_DELETE_AFTER = int(os.environ.get("MOZ_ARCHIVE_DELETE_AFTER", "0"))
 
     def auto_maintain(self, user_id: str):
         """Auto-maintain memory count: consolidate first, then archive lowest-value.
@@ -1710,21 +1718,23 @@ class MemoryManager:
                 self._dirty.update((user_id, mid) for mid in to_archive)
                 logger.info("[自动维护] 归档 %d 条低价值记忆, user=%s", len(to_archive), user_id)
 
-        # Tier 3: Hard-delete old archived memories beyond 2x cap
-        archived = [
-            m for m in user_memories.values() 
-            if m.status == MemoryStatus.ARCHIVED
-        ]
-        delete_limit = self.MAX_ACTIVE_MEMORIES * 2
-        if len(archived) > delete_limit:
-            archived.sort(key=lambda m: m.updated_at)
-            to_delete = [m.id for m in archived[:len(archived) - delete_limit]]
-            for mid in to_delete:
-                del user_memories[mid]
-                conn = self._get_conn()
-                conn.execute("DELETE FROM memories WHERE user_id = ? AND memory_id = ?", (user_id, mid))
-            conn.commit()
-            logger.info("[自动维护] 删除 %d 条过期归档记忆, user=%s", len(to_delete), user_id)
+        # Tier 3: 默认**不**物理删除归档（0 = 永不删）。
+        # 陪伴类产品的底线是"你说过的话不会凭空消失"，真要腾空间由用户自己在设置里清。
+        delete_after = self.ARCHIVE_DELETE_AFTER
+        if delete_after > 0:
+            archived = [
+                m for m in user_memories.values()
+                if m.status == MemoryStatus.ARCHIVED
+            ]
+            if len(archived) > delete_after:
+                archived.sort(key=lambda m: m.updated_at)
+                to_delete = [m.id for m in archived[:len(archived) - delete_after]]
+                for mid in to_delete:
+                    del user_memories[mid]
+                    conn = self._get_conn()
+                    conn.execute("DELETE FROM memories WHERE user_id = ? AND memory_id = ?", (user_id, mid))
+                conn.commit()
+                logger.info("[自动维护] 删除 %d 条过期归档记忆, user=%s", len(to_delete), user_id)
 
     @_synchronized
     def export_memories(self, user_id: str) -> List[Dict]:

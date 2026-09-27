@@ -539,6 +539,48 @@ def saved_models_roundtrip():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def capacity_policy_check():
+    """"长期记忆"的容量底线：不许悄悄把用户说过的东西弄没。
+
+    实测过：上限 300 时，灌到 1000 条 planted 记忆，最早那批先被静默归档、
+    再被物理删除，界面上只表现为"长期记忆 · 300 条"不再涨。
+    """
+    import shutil
+    import tempfile
+
+    sys.path.insert(0, str(ROOT / "backend"))
+    import memory_manager as MM
+
+    cls = MM.MemoryManager
+    bad, soft = [], []
+    if cls.MAX_ACTIVE_MEMORIES < 2000:
+        bad.append(f"活跃上限只有 {cls.MAX_ACTIVE_MEMORIES}：每天聊几句的人几周就撞顶，之后旧记忆静默归档")
+    if cls.ARCHIVE_DELETE_AFTER != 0:
+        bad.append(f"归档仍会被硬删（阈值 {cls.ARCHIVE_DELETE_AFTER}），用户说过的话会凭空消失")
+    if cls.CONSOLIDATION_TRIGGER > cls.MAX_ACTIVE_MEMORIES:
+        bad.append("巩固触发点高于活跃上限，等于永远不跑")
+
+    d = tempfile.mkdtemp()
+    try:
+        m = cls(storage_path=d, db_path=os.path.join(d, "cap.db"))
+        m.embedding_service.get_embedding = lambda text: None
+        old = time.time() - 400 * 86400
+        item = m.add_memory("cap-user", "很久没再提过的一件小事", confidence=0.6)
+        item.created_at = old
+        item.last_accessed = old
+        item.access_count = 0
+        item.importance = 0.12
+        archived = m.prune_memories("cap-user")
+        after = m.memories["cap-user"][item.id].importance
+        if not archived:
+            soft.append(f"warn: 遗忘曲线的归档分支跑不到（衰减后 importance={after:.3f} 正好等于阈值 0.1，"
+                        "判据是严格小于）——文档里说会'慢慢淡忘'，实际只会降到地板")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    return "; ".join(bad) or (soft[0] if soft else True)
+
+
 def css_uses_dvh():
     """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。
 
@@ -834,6 +876,7 @@ def main():
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)
     check("数据库不变量", db_invariants)
+    check("记忆容量不悄悄删", capacity_policy_check)
     check("探针清理器不错杀", probe_cleaner_works)
     check("天气源可用", weather_probe)
     check("头像字节流", avatar_probe)
