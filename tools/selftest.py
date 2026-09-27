@@ -484,7 +484,10 @@ def care_extract_llm_probe():
         return f"生日字段不对：{birthday}"
     if X.extract("我最近睡不好，唉", "听起来挺难受的", client):
         return "把情绪当成待办事项记下来了"
-    return True
+    # 先后链的新字段：模型不给 after 不算缺陷（规则兜底那条路会补），但要能看见它给没给
+    chain = X.extract("项目答辩下周三，答辩之后一周出结果", "好，我记下了", client)
+    notes = [] if any(i.get("after") for i in chain) else ["模型没用 after 字段（规则兜底仍会连）"]
+    return "; ".join(notes) or True
 
 
 def saved_models_roundtrip():
@@ -843,6 +846,133 @@ def care_link_graph_check():
     return "; ".join(bad[:3]) if bad else True
 
 
+def care_chain_link_check():
+    """事件先后链：A 之后 N 天是 B，到点要顺着问 B，而不是再提醒一遍 A。
+
+    链是这套主动关心里最容易"当用户面说错话"的功能：前件认错了，moz 就会在答辩当天
+    追问结果。所以这里既验"连得上"，更验"该拒的时候拒"：认不出锚点不连、
+    父件删了要断、一天最多问一条、模型挂了也说得出人话。
+    """
+    import shutil
+    import tempfile
+    import types
+
+    import care_engine as E
+    import care_extractor as X
+    from care_graph import ITEM, CareGraph
+    from care_store import CareStore
+
+    bad = []
+    d = tempfile.mkdtemp(prefix="moz-selftest-chain-")
+    user = "__selftest_chain__"
+    try:
+        store = CareStore(os.path.join(d, "c.db"))
+        graph = CareGraph(os.path.join(d, "c.db"))
+        # 安静时段设成起止相同 = 永不安静，否则半夜跑这项会假失败
+        store.save_settings(user, {"quiet_start": "03:00", "quiet_end": "03:00"})
+        now = time.time()
+
+        touched = X.harvest(store, user, "项目答辩下周三，答辩之后一周出结果", "", None, graph=graph)
+        rows = graph.chain_rows(user)
+        items = store.list_items(user)
+        if len(rows) != 1:
+            bad.append(f"规则兜底没建出先后链：harvest={touched}，链={len(rows)}")
+        elif rows[0]["source"] != "rule" or not 0 < float(rows[0]["gap_days"]) <= 8:
+            bad.append(f"链的出处或天数不对：{dict(rows[0])}")
+        if len(items) < 2:
+            bad.append(f"一句话里的两件事只记下 {len(items)} 条：{[i['title'] for i in items]}")
+
+        # 同一句话再说一遍：不许多出事项，也不许多出链
+        before_items, before_chains = len(store.list_items(user)), len(graph.chain_rows(user))
+        X.harvest(store, user, "项目答辩下周三，答辩之后一周出结果", "", None, graph=graph)
+        graph.sync_all(store, None, user)
+        graph.sync_all(store, None, user)
+        if (len(store.list_items(user)), len(graph.chain_rows(user))) != (before_items, before_chains):
+            bad.append(f"重复说不幂等：事项 {before_items}→{len(store.list_items(user))}，"
+                       f"链 {before_chains}→{len(graph.chain_rows(user))}")
+
+        # 认不出前件就不许连：宁可不问，也别问错
+        solo = CareStore(os.path.join(d, "s.db"))
+        solo_graph = CareGraph(os.path.join(d, "s.db"))
+        solo_user = user + "_solo"
+        X.harvest(solo, solo_user, "下周三体检，之后三天要出差", "", None, graph=solo_graph)
+        if solo_graph.chain_rows(solo_user):
+            bad.append("「之后三天」没点名前件，还是被硬连成了链")
+
+        # 到点追问：expect = 前件日期 + 间隔；同时那条后件不许再被当孤立事项提醒一遍
+        a = store.add_item(user, "面试", kind="checkin", due_at=now - 3 * 86400, source="auto")
+        b = store.add_item(user, "出结果", kind="promise", due_at=now, source="auto")
+        graph.add_chain(user, b["id"], a["id"], days=3, source="rule", before_title="面试")
+        cands = E.collect(store, None, user, now, graph=graph)
+        mine = [c for c in cands if c["ref_id"] == b["id"]]
+        if len(mine) != 1 or mine[0]["kind"] != "chain":
+            bad.append(f"到期链该以 chain 身份问一次，实际：{[(c['kind'], c['title']) for c in mine]}")
+        if [c for c in cands if c["kind"] == "chain" and c["ref_id"] != b["id"]]:
+            bad.append("链把不该今天问的事也捞出来了")
+        if not graph.add_chain(user, b["id"], a["id"], days=3, source="rule", before_title="面试"):
+            bad.append("重写同一条链被拒了（一件事只允许一个前件）")
+
+        # 问过了就别再问：mark_fired 之后这条链应当彻底安静
+        store.mark_fired(b["id"], now)
+        if any(c["kind"] == "chain" and c["ref_id"] == b["id"]
+               for c in E.collect(store, None, user, now, graph=graph)):
+            bad.append("已经问过的链当天又被拿出来问")
+
+        # 配额：一天最多顺一条链；当天的主动消息够 8 条就一条都不发
+        c2 = store.add_item(user, "搬家", kind="event", due_at=now - 86400, source="auto")
+        d2 = store.add_item(user, "装宽带", kind="promise", source="auto")
+        graph.add_chain(user, d2["id"], c2["id"], days=1, source="rule", before_title="搬家")
+        chains_now = [c for c in E.collect(store, None, user, now, graph=graph) if c["kind"] == "chain"]
+        if len(chains_now) > 1:
+            bad.append(f"一天顺了 {len(chains_now)} 条链，超过上限 1")
+        for _ in range(E.MAX_PROACTIVE_PER_DAY):
+            store.enqueue(user, "rain", "占位")
+        if E.tick_once(store, None, user, now, dry_run=True, graph=graph):
+            bad.append("当天主动消息已经到硬上限，还继续发（变成通知轰炸机）")
+
+        # 措辞：提示词里必须同时有前后两件事；模板兜底不能写成通知腔
+        cand = mine[0]
+        captured = {}
+
+        class FakeLLM:
+            def invoke(self, msgs):
+                captured["system"] = msgs[0].content
+                captured["human"] = msgs[1].content
+                return types.SimpleNamespace(content="上次面试完，结果出来了吗？")
+
+        real = E.get_llm_client
+        try:
+            E.get_llm_client = lambda **kw: FakeLLM()
+            said = E._polish(cand, persona="")
+        finally:
+            E.get_llm_client = real
+        if "面试" not in captured.get("system", "") or "出结果" not in captured.get("system", ""):
+            bad.append("提示词里没同时给出前后两件事，模型无从顺着问")
+        if "面试" not in cand["why"]:
+            bad.append(f"why 没交代前件：{cand['why']}")
+        if not said.strip():
+            bad.append("润色返回空话")
+        plain = E._template(cand)
+        if any(w in plain for w in ("提醒", "通知", "您好", "请问")):
+            bad.append(f"模型挂了时的兜底句像通知：{plain}")
+
+        # 父件没了要断链；链也不许当成枢纽邻居污染 related()
+        if a["id"] in [r["id"] for r in graph.related(user, ITEM, b["id"], limit=5)]:
+            bad.append("链边被当成了枢纽邻居，related() 被污染")
+        store.delete_item(user, a["id"])
+        graph.forget(user, ITEM, a["id"])
+        graph.sync_all(store, None, user)
+        if any(r["before_id"] == a["id"] for r in graph.chain_rows(user)):
+            bad.append("删掉前件后链还在（会拿不存在的事去追问用户）")
+
+        # 不传 graph 时行为必须和改动前一致
+        if any(c["kind"] == "chain" for c in E.collect(store, None, user, now)):
+            bad.append("没接关联图时也会冒链候选（不该悄悄改变老行为）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return "; ".join(bad[:4]) if bad else True
+
+
 def css_uses_dvh():
     """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。
 
@@ -1141,6 +1271,7 @@ def main():
     check("记忆容量不悄悄删", capacity_policy_check)
     check("检索提速不改排序", keyword_parity_check)
     check("事件关联成图", care_link_graph_check)
+    check("事件先后链", care_chain_link_check)
     check("探针清理器不错杀", probe_cleaner_works)
     check("天气源可用", weather_probe)
     check("头像字节流", avatar_probe)

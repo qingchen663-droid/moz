@@ -476,6 +476,7 @@ async def chat(user_id: str, req: ChatRequest):
                 working_memory_store=_app_state.get("working_memory_store"),
                 profile_manager=_app_state.get("profile_manager"),
                 care_store=_app_state.get("care_store"),
+                care_graph=_app_state.get("care_graph"),
                 conversation_id=cid,
             ):
                 chunk_type = chunk.get("type")

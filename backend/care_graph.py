@@ -30,8 +30,11 @@ TOPIC = "topic"
 REL_ABOUT = "about"        # 节点 → 人
 REL_TOPIC = "topic"        # 节点 → 主题
 REL_TOGETHER = "together"  # 同一次对话里一起记下的两件事
+REL_AFTER = "after"        # src 这件事发生在 dst 之后 offset_days 天（有方向）
 
-REL_WEIGHT = {REL_ABOUT: 1.0, REL_TOPIC: 0.55, REL_TOGETHER: 0.8}
+REL_WEIGHT = {REL_ABOUT: 1.0, REL_TOPIC: 0.55, REL_TOGETHER: 0.8, REL_AFTER: 1.0}
+# 超过 400 天的"先后"多半是抽取算错了日期，别拿它去追问用户
+MAX_CHAIN_OFFSET_DAYS = float(os.environ.get("MOZ_CARE_CHAIN_MAX_DAYS", "400"))
 # 连着这么多条以上的枢纽当成通用词，直接不参与关联
 HUB_DEGREE_CAP = int(os.environ.get("MOZ_CARE_HUB_DEGREE_CAP", "60"))
 # 每个枢纽最多往回展开多少邻居，防止一个热枢纽拖垮心跳
@@ -155,6 +158,8 @@ class CareGraph:
                 weight REAL NOT NULL DEFAULT 1.0,
                 label TEXT NOT NULL DEFAULT '',
                 kind TEXT NOT NULL DEFAULT '',
+                offset_days REAL NOT NULL DEFAULT -1,
+                source TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
                 UNIQUE(user_id, src_type, src_id, rel, dst_type, dst_id)
             );
@@ -169,16 +174,31 @@ class CareGraph:
             );
             """
         )
+        self._migrate()
         self._conn().commit()
+
+    def _migrate(self) -> None:
+        """老库里的 care_links 没有链的两列：ADD COLUMN 是原地改，重复执行会报"已存在"。"""
+        conn = self._conn()
+        for column in ("offset_days REAL NOT NULL DEFAULT -1", "source TEXT NOT NULL DEFAULT ''"):
+            try:
+                conn.execute(f"ALTER TABLE care_links ADD COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass
 
     # ── 写入 ─────────────────────────────────────────────
     def _replace_edges(self, user_id: str, src_type: str, src_id: str,
                        rows: Sequence[Tuple[str, str, str, float]], label: str, kind: str) -> int:
-        """一个节点的所有边整批重写：枢纽词表以后改了，老边会跟着换掉而不是留下对的。"""
+        """一个节点的所有枢纽边整批重写：枢纽词表以后改了，老边会跟着换掉而不是留下对的。
+
+        together/after 不是枢纽边，不能跟着一起删 —— 心跳每分钟都会重跑这里，
+        连带删的话链就永远存不下来。
+        """
         conn = self._conn()
         conn.execute(
-            "DELETE FROM care_links WHERE user_id = ? AND src_type = ? AND src_id = ? AND rel != ?",
-            (user_id, src_type, src_id, REL_TOGETHER),
+            "DELETE FROM care_links WHERE user_id = ? AND src_type = ? AND src_id = ?"
+            " AND rel NOT IN (?, ?)",
+            (user_id, src_type, src_id, REL_TOGETHER, REL_AFTER),
         )
         now = time.time()
         for rel, dst_type, dst_id, weight in rows:
@@ -190,6 +210,52 @@ class CareGraph:
             )
         conn.commit()
         return len(rows)
+
+    def add_chain(self, user_id: str, src_id: str, dst_id: str, *, days: float,
+                  source: str, before_title: str, after_title: str = "") -> bool:
+        """记下"src 这件事发生在 dst 之后 days 天"。返回 False = 条件不够，一条链都不该建。
+
+        链的代价是 moz 会当面对用户说错话，所以这里只做"合格就存"，不做"大概像就连"：
+        天数不在合理区间、两端是同一件事，一律拒绝。
+        """
+        if not src_id or not dst_id or src_id == dst_id:
+            return False
+        if not (0 < float(days) <= MAX_CHAIN_OFFSET_DAYS):
+            return False
+        conn = self._conn()
+        # 一件事只允许一个前件：前件认错时 moz 会问错话，宁换不叠
+        conn.execute(
+            "DELETE FROM care_links WHERE user_id = ? AND src_type = ? AND src_id = ? AND rel = ?",
+            (user_id, ITEM, src_id, REL_AFTER),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO care_links"
+            "(user_id,src_type,src_id,rel,dst_type,dst_id,weight,label,kind,offset_days,source,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (user_id, ITEM, src_id, REL_AFTER, ITEM, dst_id,
+             REL_WEIGHT[REL_AFTER] if source == "llm" else 0.75,
+             before_title[:40], "chain", float(days), source, time.time()),
+        )
+        conn.commit()
+        return True
+
+    def chain_rows(self, user_id: str) -> List[sqlite3.Row]:
+        """所有链边 + 两端事项的标题/日期/状态，供引擎一次查完算到期。"""
+        return self._conn().execute(
+            """
+            SELECT l.src_id AS after_id, a.title AS after_title, a.kind AS after_kind,
+                   a.due_at AS after_due, a.status AS after_status,
+                   a.last_fired_at AS after_fired, a.updated_at AS after_updated,
+                   l.dst_id AS before_id, b.title AS before_title, b.due_at AS before_due,
+                   b.status AS before_status, b.last_fired_at AS before_fired,
+                   l.offset_days AS gap_days, l.source AS source
+            FROM care_links l
+            JOIN care_items a ON a.id = l.src_id AND a.user_id = l.user_id
+            JOIN care_items b ON b.id = l.dst_id AND b.user_id = l.user_id
+            WHERE l.user_id = ? AND l.rel = ?
+            """,
+            (user_id, REL_AFTER),
+        ).fetchall()
 
     def link_item_by_time(self, user_id: str, item_id: str, created_at: float) -> int:
         """同一句话里一次记下的几件事本来就有语境关系：连一条直连边。"""
@@ -266,6 +332,17 @@ class CareGraph:
                  " (SELECT memory_id FROM memories WHERE user_id = ?"
                  "   AND json_extract(data, '$.status') <> 'active')", (user_id, MEMORY, user_id)),
             ]
+        # 链两端任一没了或不再 active，就不再追问：父件都不提了，还问什么下文
+        statements += [
+            ("DELETE FROM care_links WHERE user_id = ? AND rel = ? AND (src_type = ? OR dst_type = ?)"
+             " AND (src_id NOT IN (SELECT id FROM care_items WHERE user_id = ?)"
+             "   OR dst_id NOT IN (SELECT id FROM care_items WHERE user_id = ?))",
+             (user_id, REL_AFTER, ITEM, ITEM, user_id, user_id)),
+            ("DELETE FROM care_links WHERE user_id = ? AND rel = ? AND (src_id IN"
+             " (SELECT id FROM care_items WHERE user_id = ? AND status <> 'active')"
+             "  OR dst_id IN (SELECT id FROM care_items WHERE user_id = ? AND status <> 'active'))",
+             (user_id, REL_AFTER, user_id, user_id)),
+        ]
         try:
             for sql, args in statements:
                 conn.execute(sql, args)
@@ -335,10 +412,11 @@ class CareGraph:
 
     # ── 读 ──────────────────────────────────────────────
     def _hubs(self, user_id: str, node_type: str, node_id: str) -> List[sqlite3.Row]:
+        """只取枢纽边：together/after 的两端都是事项，当成枢纽会让 related() 连出错邻居。"""
         return self._conn().execute(
             "SELECT rel, dst_type, dst_id, weight FROM care_links"
-            " WHERE user_id = ? AND src_type = ? AND src_id = ? AND rel != ?",
-            (user_id, node_type, node_id, REL_TOGETHER),
+            " WHERE user_id = ? AND src_type = ? AND src_id = ? AND rel NOT IN (?, ?)",
+            (user_id, node_type, node_id, REL_TOGETHER, REL_AFTER),
         ).fetchall()
 
     def _degree(self, user_id: str, hub_type: str, hub_id: str) -> int:
@@ -426,14 +504,14 @@ class CareGraph:
 
     def describe(self, user_id: str, *, limit: int = 400) -> Dict[str, Any]:
         rows = self._conn().execute(
-            "SELECT src_type, src_id, rel, dst_type, dst_id, weight, label, kind FROM care_links"
-            " WHERE user_id = ? ORDER BY dst_type, dst_id LIMIT ?",
+            "SELECT src_type, src_id, rel, dst_type, dst_id, weight, label, kind, offset_days, source"
+            " FROM care_links WHERE user_id = ? ORDER BY dst_type, dst_id LIMIT ?",
             (user_id, limit),
         ).fetchall()
         edges = [dict(r) for r in rows]
         hubs: Dict[str, int] = {}
         for edge in edges:
-            if edge["rel"] == REL_TOGETHER:
+            if edge["rel"] in (REL_TOGETHER, REL_AFTER):
                 continue
             key = f"{edge['dst_type']}:{edge['dst_id']}"
             hubs[key] = hubs.get(key, 0) + 1
@@ -441,8 +519,14 @@ class CareGraph:
 
     def stats(self, user_id: str) -> Dict[str, Any]:
         row = self._conn().execute(
-            "SELECT COUNT(*) AS n, SUM(rel != ?) AS hub_edges FROM care_links WHERE user_id = ?",
-            (REL_TOGETHER, user_id),
+            "SELECT COUNT(*) AS n,"
+            " SUM(rel NOT IN (?, ?)) AS hub_edges,"
+            " SUM(rel = ?) AS chains,"
+            " SUM(rel = ? AND offset_days > 0 AND offset_days <= ?) AS chains_live"
+            " FROM care_links WHERE user_id = ?",
+            (REL_TOGETHER, REL_AFTER, REL_AFTER, REL_AFTER, MAX_CHAIN_OFFSET_DAYS, user_id),
         ).fetchone()
         return {"edges": int(row["n"] or 0), "hub_edges": int(row["hub_edges"] or 0),
+                # chains_live 分开报：区分"没连上"和"连上了但没算出天数，只能当关联"
+                "chains": int(row["chains"] or 0), "chains_live": int(row["chains_live"] or 0),
                 "degree_cap": HUB_DEGREE_CAP, **self._watermark(user_id)}

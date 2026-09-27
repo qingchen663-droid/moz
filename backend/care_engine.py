@@ -16,13 +16,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_config import get_llm_client
 from weather import get_weather
-from care_graph import ITEM as NODE_ITEM
+from care_graph import ITEM as NODE_ITEM, MAX_CHAIN_OFFSET_DAYS
 
 logger = logging.getLogger(__name__)
 
 MIN_GAP_SECONDS = 90 * 60      # 两条主动消息之间至少隔多久
 USER_PRESENT_SECONDS = 20 * 60  # 用户刚聊过就别插话
 EVENT_LOOKBACK = 6 * 3600       # 过期超过 6 小时就不翻旧账
+CHAIN_WINDOW = 36 * 3600        # 链的追问窗口：跨一天，免得落在安静时段就永远不问
+MAX_CHAIN_PER_DAY = 1           # 一天最多顺一条链，链多也不能变成连环追问
 RAIN_WINDOW = (7, 10)           # 带伞提醒只在早上这个时段说
 BIRTHDAY_AFTER_HOUR = 9
 MAX_PROACTIVE_PER_DAY = 8       # 硬上限：事项堆一起了也不能当通知轰炸机
@@ -107,8 +109,46 @@ def collect(store, wm_store, user_id: str, now: Optional[float] = None,
     chat_on = bool(settings.get("initiate_chat", True))
     out: List[Dict[str, Any]] = []
 
+    # 先后链：到点追问"上次那件事后来怎么样了"，比孤立提醒一条更像记得。
+    # 期望时间只在图里算，不回写 care_items —— 用户看到的日期仍然是他自己说的那个。
+    chain_ids: set = set()
+    chains: List[Dict[str, Any]] = []
+    chains_today = store.fired_since(user_id, _day_start(now), "chain")
+    if remind_on and graph is not None and chains_today < MAX_CHAIN_PER_DAY:
+        try:
+            rows = graph.chain_rows(user_id)
+        except Exception as e:  # 图坏了也不能不关心人，退回普通提醒
+            logger.warning("[主动关心] 读取先后链失败: %s", e)
+            rows = []
+        for row in rows:
+            if "active" not in (row["before_status"], row["after_status"]):
+                continue
+            gap = float(row["gap_days"] or 0)
+            first = float(row["before_due"] or 0)
+            if not first or not 0 < gap <= MAX_CHAIN_OFFSET_DAYS:
+                continue  # 前件没日期或天数离谱，就没有可靠的追问时机
+            expect = first + gap * 86400
+            later = float(row["after_due"] or 0)
+            if later:
+                expect = min(expect, later)  # 后件自己有日期时以它为准，不抢跑
+            if not (expect <= now <= expect + CHAIN_WINDOW):
+                continue
+            if float(row["after_fired"] or 0) >= expect:
+                continue  # 这条链已经问过了
+            chain_ids.add(row["after_id"])
+            chains.append({"priority": 1, "kind": "chain", "ref_id": row["after_id"],
+                           "title": row["after_title"], "expect": expect,
+                           "chain": {"before": row["before_title"], "gap_days": gap},
+                           "why": f"用户说过「{row['before_title']}」之后大约{gap:g}天才是"
+                                  f"「{row['after_title']}」，今天正好到点上，该问的是后者"})
+        # 多条链同时到期时只说最该问的那条；后面的 stable sort 不会打乱这个次序
+        chains.sort(key=lambda c: abs(now - c["expect"]))
+        out.extend(chains)
+
     if remind_on:
         for it in store.list_items(user_id):
+            if it["id"] in chain_ids:
+                continue  # 这条已经以"链"的身份问过了，别再当孤立事项提醒一遍
             title = it["title"]
             kind = it["kind"]
             repeat = it["repeat"]
@@ -167,7 +207,8 @@ def collect(store, wm_store, user_id: str, now: Optional[float] = None,
                 followup = wm_store.get_followup_text(user_id)
             except Exception as e:  # 开放话题坏了不该拖垮整个引擎
                 logger.warning("[主动关心] 读取开放话题失败: %s", e)
-        if followup and store.fired_since(user_id, _day_start(now), "open_loop") == 0:
+        if followup and not chains and not chains_today \
+                and store.fired_since(user_id, _day_start(now), "open_loop") == 0:
             out.append({"priority": 3, "kind": "open_loop", "ref_id": "", "title": followup,
                         "why": f"用户之前留了个没说完的话头：{followup}"})
 
@@ -179,8 +220,8 @@ def collect(store, wm_store, user_id: str, now: Optional[float] = None,
 
     if graph is not None:
         for cand in out:
-            if not cand.get("ref_id"):
-                continue
+            if not cand.get("ref_id") or cand["kind"] == "chain":
+                continue  # 链本身就带着上下文，再塞两条枢纽事实会挤掉那几句话的字数
             try:
                 cand["context"] = graph.context_lines(user_id, NODE_ITEM, cand["ref_id"])
             except Exception as e:  # 关联是加分项，坏了也不能不说话
@@ -192,6 +233,13 @@ def collect(store, wm_store, user_id: str, now: Optional[float] = None,
 
 def _template(cand: Dict[str, Any]) -> str:
     kind, title = cand["kind"], cand["title"]
+    if kind == "chain":
+        chain = cand.get("chain") or {}
+        before, gap = chain.get("before", ""), float(chain.get("gap_days") or 0)
+        later, when = cand["title"], ("上次" if gap < 12 else f"{gap:.0f}天前")
+        if not before or before == later:
+            return f"{when}说的{later}，后来怎么样了？"
+        return f"{when}说的{before}，后来{later}怎么样了？"
     if kind == "birthday":
         return f"{title}快乐呀！今天打算怎么过？"
     if kind == "event":
@@ -211,12 +259,13 @@ def _polish(cand: Dict[str, Any], persona: str = "") -> str:
     """让模型把事实说成人话；调不通就用模板，保证功能不哑。"""
     fallback = _template(cand)
     context = [line for line in (cand.get("context") or []) if line][:2]
+    chain = cand.get("chain") or {}
     try:
         llm = get_llm_client(temperature=0.9)
         system = (
             "你是 moz，用户的朋友。现在由你主动发起关心，不是客服也不是通知机器人。\n"
             "要求：只说一到两句，不超过 "
-            f"{'55' if context else '45'}"
+            f"{'55' if context or chain else '45'}"
             " 个字；口语、具体、贴着事实说；"
             "不要客套开头，不要用「您好」「请问」，不要解释自己为什么说话，不要加表情符号。\n"
         )
@@ -225,6 +274,12 @@ def _polish(cand: Dict[str, Any], persona: str = "") -> str:
                 "下面几件旧事和它连着线（同一个人或同一类事）。最多挑一条自然地带上，"
                 "让这句话听像是记得，而不是提醒音；用不上就一条都别硬塞：\n"
                 + "\n".join(f"- {line}" for line in context) + "\n"
+            )
+        if chain:
+            system += (
+                f"这两件事有先后：「{chain['before']}」之后约{chain['gap_days']:g}天才是"
+                f"「{cand['title']}」，今天该问的是后者。"
+                "只能提这一条链，别把前一件当提醒再念一遍，也别自己编结果。\n"
             )
         if persona:
             system += f"你的说话风格参考：{persona[:200]}\n"
@@ -265,7 +320,8 @@ def tick_once(store, wm_store, user_id: str, now: Optional[float] = None,
     cand = candidates[0]  # 一次只说一件事，别刷屏
     text = _template(cand) if dry_run else _polish(cand, persona)
     result = {"kind": cand["kind"], "ref_id": cand["ref_id"], "title": cand["title"],
-              "why": cand["why"], "text": text, "context": cand.get("context") or []}
+              "why": cand["why"], "text": text, "context": cand.get("context") or [],
+              "chain": cand.get("chain") or {}}
     if dry_run:
         return [result]
 

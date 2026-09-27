@@ -202,7 +202,9 @@ class TestRateLimit:
                 json={"message": "你好", "conversation_history": []},
             )
             assert response.status_code == 429
-            assert "过于频繁" in response.json()["detail"]
+            # 文案给人看，会改；这里只钉"告诉用户要等"这个行为
+            detail = response.json()["detail"]
+            assert "等" in detail and "频繁" not in detail
 
 
 class TestLogsEndpoint:

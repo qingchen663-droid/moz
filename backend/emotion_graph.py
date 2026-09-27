@@ -702,6 +702,7 @@ def run_emotion_workflow_streaming(
     working_memory_store: Optional[WorkingMemoryStore] = None,
     profile_manager=None,
     care_store=None,
+    care_graph=None,
 ):
     """
     流式工作流：情感分析+记忆检索同步执行，对话生成逐 token 流式输出。
@@ -869,6 +870,7 @@ def run_emotion_workflow_streaming(
                             state.get("user_message", ""),
                             reply,
                             get_llm_client(temperature=0.0, use_thinking=False),
+                            care_graph,
                         )
                         if touched:
                             logger.info("[关心抽取] 自动记下: %s", touched)
