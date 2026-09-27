@@ -362,3 +362,56 @@ class TestMigration:
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
+
+
+class TestProfileAccumulation:
+    """档案卡的列表要累加。
+
+    提取提示词让模型"数组字段返回完整数组"，可它每轮只看得到那一句话，
+    给的"完整"只是本轮新出现的那几个 —— 照着覆盖就会把上次记的抹掉
+    （第十二轮实测：连说三个爱好只剩最后一个，说两位家人只剩一位）。
+    """
+
+    def test_merge_accumulates_lists_and_replaces_scalars(self):
+        from user_profile import merge_profile_value
+
+        assert merge_profile_value(["编程"], ["旅行"]) == ["编程", "旅行"]
+        assert merge_profile_value(["编程", "旅行"], ["编程"]) == ["编程", "旅行"]   # 不攒重复
+        assert merge_profile_value(None, ["钓鱼"]) == ["钓鱼"]
+        assert merge_profile_value("程序员", "设计师") == "设计师"                    # 标量以新的为准
+        fam = [{"relation": "妈妈", "description": "喜欢养花"}]
+        merged = merge_profile_value(fam, [{"relation": "妈妈", "description": "爱跳广场舞"}])
+        assert len(merged) == 1 and merged[0]["description"] == "爱跳广场舞"          # 同一人不新增
+        merged2 = merge_profile_value(merged, [{"relation": "姐姐", "description": "在念书"}])
+        assert [x["relation"] for x in merged2] == ["妈妈", "姐姐"]
+
+    def test_three_turns_keep_three_hobbies(self):
+        import json as _json
+        from user_profile import ProfileUpdater
+
+        class StubClient:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def invoke(self, messages):
+                return type("R", (), {"content": _json.dumps(self.payload, ensure_ascii=False)})()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+            db_path = f.name
+        try:
+            manager = ProfileManager(db_path)
+            updater = ProfileUpdater(manager)
+            for payload in ({"preferences.hobbies": ["编程"]},
+                            {"preferences.hobbies": ["旅行"]},
+                            {"preferences.hobbies": ["钓鱼"]}):
+                updater.update_from_conversation("acc_user", "随便说一句", "嗯", StubClient(payload))
+            profile = manager.get_profile("acc_user")
+            hobbies = profile.preferences.get("hobbies")
+            assert hobbies == ["编程", "旅行", "钓鱼"], f"爱好被后一轮覆盖成：{hobbies}"
+            assert "编程" in profile.to_prompt_context() and "钓鱼" in profile.to_prompt_context()
+            manager.close()
+        finally:
+            try:
+                os.unlink(db_path)
+            except PermissionError:
+                pass

@@ -257,6 +257,49 @@ AI：{assistant_msg}
 """
 
 
+MAX_PROFILE_ITEMS = 20
+_ID_KEYS = ("relation", "name", "title", "key")
+
+
+def _identity_key(item: Any) -> Optional[tuple]:
+    """列表里的"同一条"怎么认：家人/朋友按 relation 或 name，别的按整条内容。"""
+    if isinstance(item, dict):
+        for key in _ID_KEYS:
+            if item.get(key):
+                return (key, str(item[key]))
+    return None
+
+
+def merge_profile_value(old: Any, new: Any) -> Any:
+    """档案卡里的列表要累加，不能整条覆盖。
+
+    提取提示词让模型"数组字段返回完整数组"，可它每一轮只看得到那一句话，
+    给的"完整"其实只是本轮新出现的——照它说的覆盖就会把上次记的抹掉
+    （实测：连说三个爱好，档案卡里只剩最后一个；说两位家人，只剩一位）。
+    标量仍然覆盖：改了名字、换了工作，新的才算。
+    """
+    if isinstance(new, list):
+        out = list(old) if isinstance(old, list) else ([] if old in (None, "", {}) else [old])
+        for item in new:
+            key = _identity_key(item)
+            if key is None:
+                if item not in out:
+                    out.append(item)
+                continue
+            for i, have in enumerate(out):
+                if _identity_key(have) == key:
+                    out[i] = item      # 同一个人：新的描述换掉旧的，但不新增一条
+                    break
+            else:
+                out.append(item)
+        return out[-MAX_PROFILE_ITEMS:]
+    if isinstance(new, dict) and isinstance(old, dict):
+        merged = dict(old)
+        merged.update({k: v for k, v in new.items() if v not in (None, "", [])})
+        return merged
+    return new
+
+
 class ProfileUpdater:
     """档案卡自动更新器"""
     
@@ -348,26 +391,24 @@ class ProfileUpdater:
             if len(parts) == 2:
                 # 两层路径：section.field
                 section, field = parts
-                
+
+                def write(bucket: Dict[str, Any], key: str, path: str = field_path) -> None:
+                    merged = merge_profile_value(bucket.get(key), value)
+                    if merged != bucket.get(key):
+                        bucket[key] = merged
+                        updated_fields.append(path)
+
                 if section == "identity" and hasattr(profile, "identity"):
-                    if profile.identity.get(field) != value:
-                        profile.identity[field] = value
-                        updated_fields.append(field_path)
+                    write(profile.identity, field)
                 
                 elif section == "preferences" and hasattr(profile, "preferences"):
-                    if profile.preferences.get(field) != value:
-                        profile.preferences[field] = value
-                        updated_fields.append(field_path)
+                    write(profile.preferences, field)
                 
                 elif section == "relationships" and hasattr(profile, "relationships"):
-                    if profile.relationships.get(field) != value:
-                        profile.relationships[field] = value
-                        updated_fields.append(field_path)
+                    write(profile.relationships, field)
                 
                 elif section == "emotional_profile" and hasattr(profile, "emotional_profile"):
-                    if profile.emotional_profile.get(field) != value:
-                        profile.emotional_profile[field] = value
-                        updated_fields.append(field_path)
+                    write(profile.emotional_profile, field)
             
             elif len(parts) == 3:
                 # 三层路径：section.subsection.field（如 relationships.romantic.status）
