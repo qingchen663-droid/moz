@@ -666,3 +666,68 @@ describe('「moz 记得什么」里的措辞', () => {
     }
   })
 })
+
+describe('档案卡上能把记错的划掉', () => {
+  const PROFILE = {
+    identity: { name: '小明', occupation: '程序员' },
+    preferences: { hobbies: ['编程', '旅行'], food: ['美式'] },
+    relationships: { family: [{ relation: '妈妈', description: '喜欢养花' }] },
+    emotional_profile: { recent_mood_trend: '还行' },
+  }
+
+  async function openProfile() {
+    const { default: MemoryViewerModal } = await import('../components/MemoryViewerModal')
+    const puts: Array<{ url: string; method?: string; body: unknown }> = []
+    const base = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : String(input)
+      if (init?.method === 'PUT') {
+        puts.push({ url, method: init.method, body: JSON.parse(String(init.body)) })
+        return mockResponse({ ok: true, updated_fields: ['preferences'], version: 2 })
+      }
+      if (url.includes('/profile/'))
+        return mockResponse({ user_id: 'web_user_001', profile: PROFILE, prompt_context: '', version: 1 })
+      if (url.includes('/detail'))
+        return mockResponse({ layers: { core: [], important: [], regular: [] } })
+      if (url.includes('/summaries')) return mockResponse({ summaries: [] })
+      return base(input as RequestInfo | URL, init)
+    }) as typeof fetch
+    render(<MemoryViewerModal onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelectorAll('.mem-tag-x').length).toBeGreaterThan(0))
+    return { puts, cleanupFetch: () => (globalThis.fetch = base) }
+  }
+
+  it('后端早就有 PUT /api/profile，本轮第一次把它接上', async () => {
+    const { puts, cleanupFetch } = await openProfile()
+    const hobbies = [...document.querySelectorAll('.mem-pref-tag')].filter((e) =>
+      e.textContent?.includes('旅行')
+    )
+    expect(hobbies.length).toBe(1)
+    fireEvent.click(hobbies[0].querySelector('.mem-tag-x')!)
+    await waitFor(() => expect(puts.length).toBe(1))
+    expect(puts[0].url).toContain('/profile/web_user_001')
+    // 后端是整段替换，所以回写的必须是"去掉旅行之后的整个 preferences"
+    expect(puts[0].body).toEqual({
+      preferences: { hobbies: ['编程'], food: ['美式'] },
+    })
+    await waitFor(() =>
+      expect(document.body.textContent).not.toContain('旅行')
+    )
+    expect(document.body.textContent).toContain('编程')
+    cleanupFetch()
+  })
+
+  it('基本信息的姓名也能划掉，并提示可以开口纠正', async () => {
+    const { puts, cleanupFetch } = await openProfile()
+    expect(document.body.textContent).toContain('记错了点 × 划掉')
+    const row = [...document.querySelectorAll('.mem-kv-item')].find((e) =>
+      e.textContent?.includes('小明')
+    )
+    expect(row).toBeTruthy()
+    fireEvent.click(row!.querySelector('.mem-tag-x')!)
+    await waitFor(() => expect(puts.length).toBe(1))
+    expect(puts[0].body).toEqual({ identity: { occupation: '程序员' } })
+    await waitFor(() => expect(document.body.textContent).not.toContain('小明'))
+    cleanupFetch()
+  })
+})

@@ -255,7 +255,9 @@
 }
 
 .mem-pref-tag {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 3px 10px;
   border-radius: 12px;
   font-size: 12px;
@@ -269,6 +271,30 @@
   background: #fef3c7;
   border-color: #fcd34d;
   color: #92400e;
+}
+
+/* 档案卡顶部一句提示 */
+.mem-hint {
+  font-size: 12px;
+  color: var(--color-text-dim);
+  margin: 2px 0 10px;
+}
+
+/* 档案卡上"这条不对，划掉"：默认几乎看不见，指点它才亮起来 */
+.mem-tag-x {
+  border: 0;
+  background: transparent;
+  color: var(--color-text-dim);
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  opacity: 0.45;
+}
+
+.mem-tag-x:hover {
+  opacity: 1;
+  color: #b42318;
 }
 
 .mem-rel-group {

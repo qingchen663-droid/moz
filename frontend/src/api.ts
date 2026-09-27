@@ -275,6 +275,18 @@ export const api = {
     return request(`/profile/${userId}`)
   },
 
+  /** 档案卡是整段替换的：改一条也要把那一整段发回去（后端 PUT /api/profile）。 */
+  updateProfile(
+    userId: string,
+    section: string,
+    value: Record<string, unknown>
+  ): Promise<{ ok: boolean; updated_fields: string[]; version: number }> {
+    return request(`/profile/${encodeURIComponent(userId)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ [section]: value }),
+    })
+  },
+
   // ── 主动关心 / 个人关心数据库 ─────────────────────────
   getCareItems(userId: string, status = 'active'): Promise<{ items: CareItem[] }> {
     return request(`/care/items?user_id=${encodeURIComponent(userId)}&status=${status}`)

@@ -156,6 +156,27 @@ export default function MemoryViewerModal({ onClose }: Props) {
     return haystack.includes(keyword)
   })
 
+  /** 档案卡上的"这条不对，划掉"。后端 PUT 是整段替换，所以删一条要回写一整段。 */
+  const dropProfileEntry = async (section: string, key: string, index = -1) => {
+    if (!profile) return
+    const bucket: Record<string, any> = { ...(profile as any)[section] }
+    if (index < 0) {
+      delete bucket[key]
+    } else {
+      const arr = Array.isArray(bucket[key]) ? bucket[key] : [bucket[key]]
+      const kept = arr.filter((_: unknown, i: number) => i !== index)
+      if (kept.length) bucket[key] = kept
+      else delete bucket[key]
+    }
+    try {
+      await api.updateProfile(useStore.getState().userId, section, bucket)
+      setProfile({ ...profile, [section]: bucket })
+      setActionMsg('划掉了。她要是哪天又自己想起来，直接说"你记错了，……"')
+    } catch {
+      setActionMsg('没划掉：后端没应答')
+    }
+  }
+
   const forget = async (m: MemoryDetail & { layer: string }) => {
     if (!window.confirm(`忘掉这条？\n\n「${humanMemory(m.content).text}」`)) return
     try {
@@ -245,7 +266,11 @@ export default function MemoryViewerModal({ onClose }: Props) {
           {error && <div className="mem-viewer-error">{error}</div>}
 
           {!loading && !error && activeTab === 'profile' && profile && (
-            <ProfileView profile={profile} coreMemories={memoryData?.layers.core ?? []} />
+            <ProfileView
+              profile={profile}
+              coreMemories={memoryData?.layers.core ?? []}
+              onRemove={dropProfileEntry}
+            />
           )}
           {!loading && !error && activeTab === 'profile' && !profile && (
             <div className="mem-empty">
@@ -324,9 +349,11 @@ export default function MemoryViewerModal({ onClose }: Props) {
 function ProfileView({
   profile,
   coreMemories,
+  onRemove,
 }: {
   profile: UserProfileData
   coreMemories: MemoryDetail[]
+  onRemove: (section: string, key: string, index?: number) => void
 }) {
   const { identity, preferences, relationships, emotional_profile } = profile
 
@@ -352,6 +379,9 @@ function ProfileView({
 
   return (
     <div className="mem-profile">
+      <div className="mem-hint">
+        这里是她自己填的档案。记错了点 × 划掉，或者直接在对话里说「你记错了，……」。
+      </div>
       {hasData(identity) && (
         <Section title="基本信息">
           <KVGrid
@@ -364,6 +394,7 @@ function ProfileView({
               location: '地点',
               education: '学历',
             }}
+            onRemove={(key) => onRemove('identity', key)}
           />
         </Section>
       )}
@@ -380,6 +411,13 @@ function ProfileView({
                   {items.map((item: string, i: number) => (
                     <span key={i} className="mem-pref-tag">
                       {item}
+                      <button
+                        className="mem-tag-x"
+                        title="这条不对，划掉"
+                        onClick={() => onRemove('preferences', key, i)}
+                      >
+                        ×
+                      </button>
                     </span>
                   ))}
                 </div>
@@ -399,6 +437,13 @@ function ProfileView({
                   <span className="mem-rel-relation">{r.relation}</span>
                   {r.name && <span className="mem-rel-name">{r.name}</span>}
                   {r.description && <span className="mem-rel-desc">{r.description}</span>}
+                  <button
+                    className="mem-tag-x"
+                    title="这条不对，划掉"
+                    onClick={() => onRemove('relationships', 'family', i)}
+                  >
+                    ×
+                  </button>
                 </div>
               ))}
             </div>
@@ -410,6 +455,13 @@ function ProfileView({
                 <div key={i} className="mem-rel-item">
                   {r.name && <span className="mem-rel-name">{r.name}</span>}
                   {r.description && <span className="mem-rel-desc">{r.description}</span>}
+                  <button
+                    className="mem-tag-x"
+                    title="这条不对，划掉"
+                    onClick={() => onRemove('relationships', 'friends', i)}
+                  >
+                    ×
+                  </button>
                 </div>
               ))}
             </div>
@@ -424,6 +476,13 @@ function ProfileView({
                 {relationships.romantic.partner_name && (
                   <span className="mem-rel-name">{relationships.romantic.partner_name}</span>
                 )}
+                <button
+                  className="mem-tag-x"
+                  title="这条不对，划掉"
+                  onClick={() => onRemove('relationships', 'romantic')}
+                >
+                  ×
+                </button>
               </div>
             </div>
           )}
@@ -436,6 +495,13 @@ function ProfileView({
             <div className="mem-emo-row">
               <span className="mem-emo-key">近期心情</span>
               <span className="mem-emo-val">{emotional_profile.recent_mood_trend}</span>
+              <button
+                className="mem-tag-x"
+                title="这条不对，划掉"
+                onClick={() => onRemove('emotional_profile', 'recent_mood_trend')}
+              >
+                ×
+              </button>
             </div>
           )}
           {emotional_profile.common_triggers?.length > 0 && (
@@ -445,6 +511,13 @@ function ProfileView({
                 {emotional_profile.common_triggers.map((t: string, i: number) => (
                   <span key={i} className="mem-pref-tag mem-pref-tag--warn">
                     {t}
+                    <button
+                      className="mem-tag-x"
+                      title="这条不对，划掉"
+                      onClick={() => onRemove('emotional_profile', 'common_triggers', i)}
+                    >
+                      ×
+                    </button>
                   </span>
                 ))}
               </div>
@@ -457,6 +530,13 @@ function ProfileView({
                 {emotional_profile.coping_strategies.map((t: string, i: number) => (
                   <span key={i} className="mem-pref-tag">
                     {t}
+                    <button
+                      className="mem-tag-x"
+                      title="这条不对，划掉"
+                      onClick={() => onRemove('emotional_profile', 'coping_strategies', i)}
+                    >
+                      ×
+                    </button>
                   </span>
                 ))}
               </div>
@@ -466,6 +546,13 @@ function ProfileView({
             <div className="mem-emo-row">
               <span className="mem-emo-key">支持偏好</span>
               <span className="mem-emo-val">{emotional_profile.support_preferences}</span>
+              <button
+                className="mem-tag-x"
+                title="这条不对，划掉"
+                onClick={() => onRemove('emotional_profile', 'support_preferences')}
+              >
+                ×
+              </button>
             </div>
           )}
         </Section>
@@ -590,9 +677,11 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 function KVGrid({
   data,
   labelMap,
+  onRemove,
 }: {
   data: Record<string, any>
   labelMap: Record<string, string>
+  onRemove?: (key: string) => void
 }) {
   return (
     <div className="mem-kv-grid">
@@ -602,6 +691,11 @@ function KVGrid({
           <div key={key} className="mem-kv-item">
             <span className="mem-kv-key">{labelMap[key] || key}</span>
             <span className="mem-kv-val">{String(val)}</span>
+            {onRemove && (
+              <button className="mem-tag-x" title="这条不对，划掉" onClick={() => onRemove(key)}>
+                ×
+              </button>
+            )}
           </div>
         )
       })}
