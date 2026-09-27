@@ -242,3 +242,33 @@ class TestMemoryItem:
         assert item.importance == 0.5
         assert item.access_count == 0
         assert item.is_consolidated is False
+
+
+# ================================================================
+# 关心事项标题去重
+# ================================================================
+
+class TestCareTitleDedupe:
+    """「我妈生日」和「妈妈生日」是同一个人同一件事，不许各存一条。"""
+
+    def test_kin_aliases_collapse(self):
+        from care_extractor import _normalize_title
+        assert _normalize_title("我妈生日") == "妈妈生日"
+        assert _normalize_title("我妈妈的生日") == "妈妈生日"
+        assert _normalize_title("母亲生日") == "妈妈生日"
+        assert _normalize_title("姥姥忌日") == "外婆忌日"
+
+    def test_other_people_untouched(self):
+        from care_extractor import _normalize_title
+        for t in ("姑妈生日", "姨妈生日", "和妈妈逛街", "娘家拆迁", "项目答辩", "我的猫叫团子"):
+            assert _normalize_title(t) == t, f"{t} 被改坏了"
+
+    def test_three_phrasings_store_one_item(self, tmp_path):
+        from care_extractor import harvest
+        from care_store import CareStore
+        store = CareStore(db_path=str(tmp_path / "care.db"))
+        for msg in ("我妈生日是10月5日", "妈妈生日是10月5日", "我妈妈的生日是10月5号"):
+            harvest(store, "kin", msg, "")
+        harvest(store, "kin", "我爸生日是10月6日", "")
+        titles = [it["title"] for it in store.list_items("kin")]
+        assert set(titles) == {"爸爸生日", "妈妈生日"}

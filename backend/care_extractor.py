@@ -61,9 +61,39 @@ after 的方向最容易搞反：填反了 moz 就会在答辩当天追问结果
 
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
+# 「我妈生日」「妈妈生日」「我妈妈的生日」是同一个人同一件事。
+# 去重键只认整串标题相等时，用户分三天说这三种说法就攒成三条，
+# 到那天一天里会说三遍"生日快乐呀"；标题带"我妈妈的"时念出来也不是人话。
+_KIN = {
+    "妈妈": ("母亲", "老妈", "妈"),
+    "爸爸": ("父亲", "老爸", "爹", "爸"),
+    "外婆": ("姥姥", "外祖母"),
+    "外公": ("姥爷", "外祖父"),
+    "爷爷": ("祖父",),
+    "奶奶": ("祖母",),
+}
+_KIN_WORDS = sorted(
+    list(_KIN) + [a for aliases in _KIN.values() for a in aliases],
+    key=len, reverse=True,
+)
+# 只吃开头的"（我/我的/咱）+ 称谓 +（的）"，句子中段的称谓不动，免得把
+# "和王妈约了跳舞"改成"和王妈妈约了跳舞"
+_LEAD_KIN_RE = re.compile(r"^(?:我的|我|咱的|咱|俺的|俺)?(" + "|".join(_KIN_WORDS) + r")的?")
+
+
+def _canon_person(title: str) -> str:
+    m = _LEAD_KIN_RE.match(title)
+    if not m:
+        return title
+    word = m.group(1)
+    for canon, aliases in _KIN.items():
+        if word == canon or word in aliases:
+            return canon + title[m.end():]
+    return title
+
 
 def _normalize_title(title: str) -> str:
-    return re.sub(r"\s+", "", (title or "").strip())[:24]
+    return _canon_person(re.sub(r"\s+", "", (title or "").strip()))[:24]
 
 
 def _to_timestamp(raw: Any, yearly: bool) -> float:

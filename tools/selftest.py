@@ -1540,6 +1540,58 @@ def birthday_not_mislabeled():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def same_fact_one_item():
+    """同一件生日换个说法，不许在关心库里攒成三条。
+
+    第十三轮复现（临时库）：去重键是标题整串相等，所以
+    「我妈生日是10月5日」「妈妈生日是10月5日」「我妈妈的生日是10月5号」各存一条，
+    collect() 到那天早上给出三条候选，心跳每隔 MIN_GAP_SECONDS 说一遍
+    「我妈妈的生日快乐呀！」——一句不像人话，三句是骚扰。
+    """
+    import shutil
+    import tempfile
+
+    import care_engine as E
+    import care_extractor as X
+    from care_store import CareStore
+
+    d = tempfile.mkdtemp(prefix="moz-samefact-")
+    bad = []
+    try:
+        store = CareStore(db_path=os.path.join(d, "c.db"))
+        u = "kin"
+        for msg in ("我妈生日是10月5日", "妈妈生日是10月5日", "我妈妈的生日是10月5号"):
+            X.harvest(store, u, msg, "")
+        X.harvest(store, u, "我爸生日是10月6日", "")
+        rows = store.list_items(u)
+        titles = [it["title"] for it in rows]
+        moms = [t for t in titles if "10月" not in t and ("妈" in t)]
+        if len(moms) != 1:
+            bad.append(f"妈妈的生日攒成 {len(moms)} 条：{titles}")
+        if len(rows) != 2:
+            bad.append(f"两条该有（妈妈/爸爸生日），实际 {len(rows)} 条：{titles}")
+        for t in titles:
+            if t.startswith(("我", "俺", "咱")):
+                bad.append(f"标题还带着「我」，念出来不像人话：{t}")
+        due = time.mktime((2026, 10, 5, 10, 0, 0, 0, -1, -1))
+        for it in rows:
+            if "妈" in it["title"]:
+                store.update_item(u, it["id"], {"due_at": due})
+        said = [E._template(c) for c in E.collect(store, None, u, now=due)
+                if c["kind"] == "birthday"]
+        if len(said) != 1:
+            bad.append(f"到那天早上要说 {len(said)} 遍生日快乐：{said}")
+        elif said[0].startswith(("我", "俺", "咱")) or "我的" in said[0]:
+            bad.append(f"生日那句读起来不像人话：{said[0]}")
+        return "; ".join(bad) or True
+    finally:
+        try:
+            store._conn().close()
+        except Exception:
+            pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def followup_not_a_prompt():
     """追话头那句不许把给模型的指令念给用户听。
 
@@ -1883,6 +1935,7 @@ def main():
     check("相对日期落在对的日子", relative_dates_land_right)
     check("聊到日子自己记下", care_harvest_roundtrip)
     check("生日不许记成事件提醒", birthday_not_mislabeled)
+    check("一件事换个说法不攒成两条", same_fact_one_item)
     check("追话头不说指令", followup_not_a_prompt)
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)
