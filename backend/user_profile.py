@@ -259,6 +259,22 @@ AI：{assistant_msg}
 
 MAX_PROFILE_ITEMS = 20
 _ID_KEYS = ("relation", "name", "title", "key")
+# 只剩这些键的条目，界面上就是一行没有内容的标签（"母亲" 后面什么都没有）
+_LABEL_KEYS = ("relation", "type", "category", "kind", "id", "status")
+
+
+def _is_junk(value: Any) -> bool:
+    """模型常回这种形状：只给了称谓，名字和描述都是空串。"""
+    if value is None or value == [] or value == {}:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple)):
+        return all(_is_junk(v) for v in value)
+    if isinstance(value, dict):
+        kept = {k for k, v in value.items() if not _is_junk(v)}
+        return not kept or kept <= set(_LABEL_KEYS)
+    return False
 
 
 def _identity_key(item: Any) -> Optional[tuple]:
@@ -277,12 +293,18 @@ def merge_profile_value(old: Any, new: Any) -> Any:
     给的"完整"其实只是本轮新出现的——照它说的覆盖就会把上次记的抹掉
     （实测：连说三个爱好，档案卡里只剩最后一个；说两位家人，只剩一位）。
     标量仍然覆盖：改了名字、换了工作，新的才算。
+    空值（空串、只有称谓的空壳）一律不写：既不进新条目，也不把已有的抹掉——
+    要纠正记错的东西走界面上的 × 或对话里说一句，不该靠模型回一个空串。
     """
+    if _is_junk(new):
+        return old
     if isinstance(old, list) and not isinstance(new, list):
         new = [new]          # 模型偶尔把数组字段回成单个值，那也算追加，不是替换整张表
     if isinstance(new, list):
         out = list(old) if isinstance(old, list) else ([] if old in (None, "", {}) else [old])
         for item in new:
+            if _is_junk(item):
+                continue     # "只给了 relation、name/description 全空" 那种空壳
             key = _identity_key(item)
             if key is None:
                 if item not in out:

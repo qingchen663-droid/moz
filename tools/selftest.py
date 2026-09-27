@@ -1592,6 +1592,50 @@ def same_fact_one_item():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def profile_no_empty_shell():
+    """档案卡不许收"只有称谓、别的都空"的条目。
+
+    第十三轮沙箱实测存成过：
+    family = [{...团子...}, {"relation": "母亲", "name": "", "description": ""}]
+    界面上那就是一行「母亲」后面什么都没有；`identity.nickname = ""` 这种空标量也照存过。
+    """
+    import shutil
+    import tempfile
+
+    from user_profile import ProfileManager, ProfileUpdater, UserProfile, merge_profile_value
+
+    bad = []
+    fam = [{"relation": "宠物", "name": "团子", "description": "五岁橘猫"}]
+    if merge_profile_value(fam, [{"relation": "母亲", "name": "", "description": ""}]) != fam:
+        bad.append("空壳人物还是收进来了")
+    if merge_profile_value("小明", "") != "小明":
+        bad.append("空串把已有的昵称抹掉了")
+    if merge_profile_value(["编程"], ["旅行", ""]) != ["编程", "旅行"]:
+        bad.append("列表里混进空串")
+
+    d = tempfile.mkdtemp(prefix="moz-selftest-shell-")
+    pm = None
+    try:
+        pm = ProfileManager(os.path.join(d, "p.db"))
+        prof = UserProfile(user_id="probe")
+        ProfileUpdater(pm)._apply_extractions(prof, {
+            "identity.nickname": "",
+            "relationships.family": fam + [{"relation": "母亲", "name": "", "description": ""}],
+        })
+        if prof.identity.get("nickname") == "":
+            bad.append("存了个空昵称")
+        if len(prof.relationships.get("family") or []) != 1:
+            bad.append(f"家人列表里 {len(prof.relationships.get('family') or [])} 条（该只有团子那条）")
+        return "; ".join(bad) or True
+    finally:
+        if pm is not None:
+            try:
+                pm.close()
+            except Exception:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def followup_not_a_prompt():
     """追话头那句不许把给模型的指令念给用户听。
 
@@ -1936,6 +1980,7 @@ def main():
     check("聊到日子自己记下", care_harvest_roundtrip)
     check("生日不许记成事件提醒", birthday_not_mislabeled)
     check("一件事换个说法不攒成两条", same_fact_one_item)
+    check("档案卡不收空壳条目", profile_no_empty_shell)
     check("追话头不说指令", followup_not_a_prompt)
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)

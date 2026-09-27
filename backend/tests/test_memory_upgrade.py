@@ -422,6 +422,46 @@ def test_scalar_back_into_a_list_field_appends():
     assert merge_profile_value(["编程"], "编程") == ["编程"]
 
 
+def test_profile_refuses_empty_shells():
+    """模型只回一个称谓、名字和描述全空时，别在档案卡上留一行空白。
+
+    第十三轮沙箱实测存成了：
+    family = [{"relation":"宠物","name":"团子","description":"五岁橘猫"},
+              {"relation":"母亲","name":"","description":""}]
+    第二条在界面上就是"母亲"后面什么都没有。
+    """
+    from user_profile import merge_profile_value
+
+    fam = [{"relation": "宠物", "name": "团子", "description": "五岁橘猫"}]
+    assert merge_profile_value(fam, [{"relation": "母亲", "name": "", "description": ""}]) == fam
+    assert merge_profile_value(fam, ["", None]) == fam
+    assert merge_profile_value(["编程"], ["旅行", ""]) == ["编程", "旅行"]   # 混在里面的空串丢掉
+    assert merge_profile_value("小明", "") == "小明"       # 空值不许把已有的抹掉
+    assert merge_profile_value(None, "") is None
+    after = merge_profile_value(fam, [{"relation": "妈妈", "name": "王芳"}])
+    assert len(after) == 2 and after[-1]["name"] == "王芳"   # 有名字就不算空壳
+
+
+def test_extraction_path_skips_empty_values(tmp_path):
+    """整条落地路径也不许写空值：identity.nickname="" 以前会真的存成空串。"""
+    from user_profile import ProfileManager, ProfileUpdater, UserProfile
+
+    manager = ProfileManager(str(tmp_path / "p.db"))
+    try:
+        prof = UserProfile(user_id="shell_probe")
+        updater = ProfileUpdater(manager)
+        updater._apply_extractions(prof, {
+            "identity.nickname": "",
+            "relationships.family": [{"relation": "母亲", "name": "", "description": ""}],
+            "preferences.food": "讨厌香菜",
+        })
+        assert prof.identity == {}
+        assert prof.relationships == {}
+        assert prof.preferences.get("food") == "讨厌香菜"
+    finally:
+        manager.close()
+
+
 
 
 if __name__ == "__main__":
