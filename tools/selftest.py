@@ -1540,6 +1540,67 @@ def birthday_not_mislabeled():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def followup_not_a_prompt():
+    """追话头那句不许把给模型的指令念给用户听。
+
+    第十二轮复现（临时库）：collect() 以前直接拿 get_followup_text() 当话题标题，
+    模型措辞一挂就走兜底模板，用户会收到
+    「想起你之前说的你可以自然地关心一下这些事的进展：面试结果要等一周(3天前提到)，后来有下文了吗？」
+    """
+    import shutil
+    import tempfile
+
+    import care_engine as E
+    from care_store import CareStore
+    from working_memory import WorkingMemoryStore
+
+    d = tempfile.mkdtemp(prefix="moz-followup-")
+    try:
+        store = CareStore(db_path=os.path.join(d, "c.db"))
+        wm = WorkingMemoryStore(os.path.join(d, "w.db"))
+        u = "loop"
+        old = time.time() - 3 * 86400
+        wm.save(u, "最近在换工作",
+                [{"topic": "面试结果要等一周", "status": "waiting", "due_at": 0,
+                  "created_at": old, "id": "L1"}], "neutral")
+        store.save_settings(u, {"talk_mode": "chatty"})
+
+        topic, days = wm.next_followup(u)
+        bad = []
+        if topic != "面试结果要等一周" or days != 3:
+            bad.append(f"next_followup 给的是 {topic!r}/{days} 天")
+        cand = next((c for c in E.collect(store, wm, u, now=time.time())
+                     if c["kind"] == "open_loop"), None)
+        if not cand:
+            bad.append("collect 没出 open_loop 候选（拿不到话头还是名额卡住了）")
+        else:
+            text = E._template(cand)
+            for leak in ("你可以", "进展", "提到)"):
+                if leak in cand["title"]:
+                    bad.append(f"话题标题里混进了指令：{cand['title']}")
+                    break
+            if "你可以" in text or "进展" in text:
+                bad.append(f"会说出口的那句里还有指令：{text}")
+            if "面试结果要等一周" not in text:
+                bad.append(f"那句没提真正的话题：{text}")
+            if "3天前" not in cand["why"]:
+                bad.append(f"依据里没写放了几天：{cand['why']}")
+        # 刚说不到一天的事不该就追问
+        fresh = time.time() - 3600
+        wm.save(u, "刚提的", [{"topic": "新话头", "status": "waiting", "due_at": 0,
+                              "created_at": fresh, "id": "L2"}], "neutral")
+        if wm.next_followup(u)[0] == "新话头":
+            bad.append("刚说一小时就被列为可追问")
+        return "; ".join(bad) or True
+    finally:
+        for closer in (getattr(store, "_conn", None), getattr(wm, "_get_conn", None)):
+            try:
+                closer().close()
+            except Exception:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def frontend_no_junk():
     """孤儿样式/备份文件：曾经因为弹窗样式只在 ModelDialog.new.css 里而整块裸奔。"""
     comp = ROOT / "frontend" / "src" / "components"
@@ -1822,6 +1883,7 @@ def main():
     check("相对日期落在对的日子", relative_dates_land_right)
     check("聊到日子自己记下", care_harvest_roundtrip)
     check("生日不许记成事件提醒", birthday_not_mislabeled)
+    check("追话头不说指令", followup_not_a_prompt)
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)
     check("主动关心不轰炸", care_no_dump)

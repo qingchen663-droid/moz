@@ -142,26 +142,39 @@ class WorkingMemoryStore:
         conn.execute("DELETE FROM working_memory WHERE user_id = ?", (user_id,))
         conn.commit()
 
-    def get_followup_text(self, user_id: str) -> str:
-        """获取需要主动追问的开放话题文本。
-
-        筛选条件：status == waiting 且已存在超过 1 天的话题。
-        """
-        data = self.load(user_id)
-        followups = []
-        for loop_dict in data["open_topics"]:
+    def _followup_loops(self, user_id: str) -> List[OpenLoop]:
+        """够格被追问的话题：还在等、且已经放了至少一天。等得最久的排前面。"""
+        out = []
+        for loop_dict in self.load(user_id)["open_topics"]:
             loop = OpenLoop.from_dict(loop_dict)
-            if not loop.is_active():
-                continue
-            age_hours = (time.time() - loop.created_at) / 3600
-            if age_hours >= 24:
-                days = int(age_hours // 24)
-                time_hint = f"({days}天前提到)" if days < 7 else "(上周提到)"
-                followups.append(f"{loop.topic}{time_hint}")
+            if loop.is_active() and time.time() - loop.created_at >= 86400:
+                out.append(loop)
+        out.sort(key=lambda x: x.created_at)
+        return out
 
-        if not followups:
+    def next_followup(self, user_id: str):
+        """给主动关心用的那一条：(话题原文, 放了几天)。没有就 ("", 0)。
+
+        以前 care_engine 直接拿 get_followup_text() 当话题标题，
+        于是那句兜底措辞变成"想起你之前说的你可以自然地关心一下这些事的进展：…"。
+        """
+        loops = self._followup_loops(user_id)
+        if not loops:
+            return "", 0
+        loop = loops[0]
+        return loop.topic, max(1, int((time.time() - loop.created_at) // 86400))
+
+    def get_followup_text(self, user_id: str) -> str:
+        """拼给**对话 prompt** 的一句提醒。这是给模型的指令，不是给用户看的文案。"""
+        loops = self._followup_loops(user_id)
+        if not loops:
             return ""
-        return "你可以自然地关心一下这些事的进展：" + "；".join(followups[:3])
+        followups = []
+        for loop in loops[:3]:
+            days = int((time.time() - loop.created_at) // 86400)
+            hint = f"({days}天前提到)" if days < 7 else "(上周提到)"
+            followups.append(f"{loop.topic}{hint}")
+        return "你可以自然地关心一下这些事的进展：" + "；".join(followups)
 
     def format_for_prompt(self, user_id: str) -> str:
         """格式化工作记忆为可注入 prompt 的文本。"""

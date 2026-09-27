@@ -219,16 +219,16 @@ def collect(store, wm_store, user_id: str, now: Optional[float] = None,
     budget = store.daily_budget(user_id) if chat_on else 0
     chat_used = sum(store.fired_since(user_id, _day_start(now), k) for k in CHAT_KINDS)
     if chat_used < budget:
-        followup = ""
+        followup, follow_days = "", 0
         if wm_store:
             try:
-                followup = wm_store.get_followup_text(user_id)
+                followup, follow_days = wm_store.next_followup(user_id)
             except Exception as e:  # 开放话题坏了不该拖垮整个引擎
                 logger.warning("[主动关心] 读取开放话题失败: %s", e)
         if followup and not chains and not chains_today \
                 and store.fired_since(user_id, _day_start(now), "open_loop") == 0:
             out.append({"priority": 3, "kind": "open_loop", "ref_id": "", "title": followup,
-                        "why": f"用户之前留了个没说完的话头：{followup}"})
+                        "why": f"用户{follow_days}天前留了个没说完的话头：{followup}"})
 
         if store.fired_since(user_id, _day_start(now), "miss_you") == 0:
             seen = _last_user_seen.get(user_id)
