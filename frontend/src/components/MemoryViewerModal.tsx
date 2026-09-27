@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { MemoryDetail, MemoryDetailResponse, UserProfileData } from '../types'
+import { humanMemory } from '../memoryText'
 import './MemoryViewerModal.css'
 import { useStore } from '../store'
 
@@ -139,8 +140,11 @@ export default function MemoryViewerModal({ onClose }: Props) {
   const visibleMemories = allMemories.filter((m) => {
     if (layerFilter !== 'all' && m.layer !== layerFilter) return false
     if (!keyword) return true
+    const seen = humanMemory(m.content)
     const haystack = [
       m.content,
+      seen.text,
+      seen.chip,
       m.category,
       CATEGORY_LABELS[m.category] ?? '',
       m.emotion,
@@ -153,7 +157,7 @@ export default function MemoryViewerModal({ onClose }: Props) {
   })
 
   const forget = async (m: MemoryDetail & { layer: string }) => {
-    if (!window.confirm(`忘掉这条？\n\n「${m.content}」`)) return
+    if (!window.confirm(`忘掉这条？\n\n「${humanMemory(m.content).text}」`)) return
     try {
       await api.deleteMemory(useStore.getState().userId, m.id)
       setMemoryData((cur) => {
@@ -470,12 +474,16 @@ function ProfileView({
       {coreMemories.length > 0 && (
         <Section title="核心记忆">
           <div className="mem-core-list">
-            {coreMemories.map((m) => (
-              <div key={m.id} className="mem-core-card">
-                <span className="mem-core-emoji">{m.emotion_emoji}</span>
-                <span className="mem-core-content">{m.content}</span>
-              </div>
-            ))}
+            {coreMemories.map((m) => {
+              const { text, chip } = humanMemory(m.content)
+              return (
+                <div key={m.id} className="mem-core-card">
+                  <span className="mem-core-emoji">{m.emotion_emoji}</span>
+                  <span className="mem-core-content">{text}</span>
+                  {chip && <span className="mem-tag mem-tag--from">{chip}</span>}
+                </div>
+              )
+            })}
           </div>
         </Section>
       )}
@@ -526,6 +534,7 @@ function MemoryList({
       {memories.map((m) => {
         const temporalLabel = getTemporalLabel(m.temporal_data)
         const badge = LAYER_BADGES[m.layer]
+        const { text, chip } = humanMemory(m.content)
         return (
           <div key={m.id} className="mem-card">
             <div className="mem-card-header">
@@ -548,10 +557,11 @@ function MemoryList({
               </span>
             </div>
 
-            <div className="mem-card-content">{m.content}</div>
+            <div className="mem-card-content">{text}</div>
 
-            {(temporalLabel || m.tags.length > 0) && (
+            {(chip || temporalLabel || m.tags.length > 0) && (
               <div className="mem-card-tags">
+                {chip && <span className="mem-tag mem-tag--from">{chip}</span>}
                 {temporalLabel && <span className="mem-tag mem-tag--time">{temporalLabel}</span>}
                 {m.tags.map((t, i) => (
                   <span key={i} className="mem-tag">

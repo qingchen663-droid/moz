@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { api } from '../api'
 import type { CareEdge, CareItem, CareKind, CareRelatedNode, CareSettings } from '../types'
+import { stripInternal } from '../memoryText'
 import './CareSection.css'
 
 const KIND_LABELS: Record<CareKind, string> = {
@@ -39,7 +40,7 @@ function viaNote(via: string): string {
 
 /** 记忆条目的正文带着抽取器的 [关于用户] 这类前缀，是内部标记，别给用户看 */
 function plainLabel(label: string): string {
-  return label.replace(/^\[[^\]]*\]\s*/, '').replace(/^用户(?:说|提到|表示)[：:]\s*/, '')
+  return stripInternal(label)
 }
 
 /** 先后链：src 是晚发生的那件，dst 是早的那件。挂在事项后面显示给用户的就一句话。 */
@@ -55,6 +56,69 @@ function chainNotes(items: CareItem[], edges: CareEdge[]): Record<string, string
     if (later && !out[e.src_id]) out[e.src_id] = `晚于「${earlier || plainLabel(e.label)}」${days} 天`
   }
   return out
+}
+
+const DAY = 86400
+
+function startOfDay(t: number): number {
+  const d = new Date(t * 1000)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime() / 1000
+}
+
+/** 还没到的那个日子。重复事项要往后滚——「妈妈生日 · 每年」标着去年那一天，读起来像坏了。 */
+function nextDue(it: CareItem, today: number): number {
+  if (!it.due_at) return 0
+  const step = it.repeat === 'daily' ? DAY : it.repeat === 'weekly' ? 7 * DAY : 0
+  if (step) {
+    let t = it.due_at
+    const floor = startOfDay(today)
+    while (t < floor) t += step
+    return t
+  }
+  if (it.repeat !== 'yearly') return it.due_at
+  const due = new Date(it.due_at * 1000)
+  const now = new Date(today * 1000)
+  const cand = new Date(
+    now.getFullYear(),
+    due.getMonth(),
+    due.getDate(),
+    due.getHours(),
+    due.getMinutes()
+  )
+  if (cand.getTime() / 1000 < startOfDay(today)) cand.setFullYear(cand.getFullYear() + 1)
+  return cand.getTime() / 1000
+}
+
+/** 一次性且日子已经过了。不改成"已完成"：状态一变，关联图会把它的边剪掉，
+ *  「答辩 → 出结果」这类先后链就没了——所以只在显示上沉底并标出来。 */
+function isGone(it: CareItem, today: number): boolean {
+  return !!it.due_at && it.repeat === 'none' && it.due_at < startOfDay(today)
+}
+
+export function dueNote(it: CareItem, today: number = Date.now() / 1000): string {
+  if (!it.due_at) return ' · 未定时'
+  const rep =
+    it.repeat === 'yearly'
+      ? ' · 每年'
+      : it.repeat === 'weekly'
+        ? ' · 每周'
+        : it.repeat === 'daily'
+          ? ' · 每天'
+          : ''
+  return ` · ${fromEpoch(nextDue(it, today)).slice(0, 10)}${isGone(it, today) ? ' 已过' : ''}${rep}`
+}
+
+/** 还没到的排前面，过去了的沉到底（按最近的旧事在前）。接口按日期升序返回，
+ *  聊过三个月之后第一屏会全是早过去的事（实测 11 条里 6 条、54%）。 */
+export function sortForPanel(items: CareItem[], today: number = Date.now() / 1000): CareItem[] {
+  const live = items.filter((i) => !isGone(i, today))
+  const past = items.filter((i) => isGone(i, today))
+  // 按"下一次什么时候"排，不是按库里那个原始日期：每年重复的那条存的可能是去年的日子
+  const next = (i: CareItem) => nextDue(i, today) || Number.POSITIVE_INFINITY
+  live.sort((a, b) => next(a) - next(b))
+  past.sort((a, b) => b.due_at - a.due_at)
+  return [...live, ...past]
 }
 
 export default function CareSection() {
@@ -260,14 +324,13 @@ export default function CareSection() {
         ) : (
           <>
             <div className="care-list-label">我记着的事（自动从对话里记的，说错了可以删）</div>
-            {items.map((it) => (
+            {sortForPanel(items).map((it) => (
               <div key={it.id} className="care-item">
                 <div className="care-item-main">
                   <span className="care-item-title">{it.title}</span>
                   <span className="care-item-meta">
                     {KIND_LABELS[it.kind]}
-                    {it.due_at ? ` · ${fromEpoch(it.due_at).slice(0, 10)}` : ' · 未定时'}
-                    {it.repeat === 'yearly' ? ' · 每年' : it.repeat === 'daily' ? ' · 每天' : ''}
+                    {dueNote(it)}
                     {it.source === 'auto' ? ' · 自动记下' : ''}
                   </span>
                   {(chains[it.id] || links[it.id]?.length) && (

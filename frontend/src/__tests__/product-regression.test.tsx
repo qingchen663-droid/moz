@@ -610,3 +610,59 @@ describe('后端结构变化不能弄崩应用', () => {
     expect(tags).toEqual(['下周面试', '老数据：纯字符串'])
   })
 })
+
+describe('「moz 记得什么」里的措辞', () => {
+  // 三条正文照抄第十轮沙箱里真实存下来的样子
+  const row = (id: string, content: string) => ({
+    id,
+    content,
+    layer: 'regular',
+    category: 'fact',
+    emotion: 'neutral',
+    emotion_emoji: '😐',
+    tags: [],
+    importance: 0.6,
+    access_count: 0,
+    is_consolidated: false,
+    created_at: 1760000000,
+    temporal_data: {},
+  })
+
+  it('内部分类标记不摊给用户看，来路改成人话', async () => {
+    const { default: MemoryViewerModal } = await import('../components/MemoryViewerModal')
+    const base = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : String(input)
+      if (url.includes('/detail'))
+        return mockResponse({
+          layers: {
+            core: [],
+            important: [],
+            regular: [
+              row('m1', '[关于用户] 用户的妈妈喜欢养花'),
+              row('m2', '[对话摘要] AI回复要点：团子呀，五岁的橘猫'),
+              row('m3', '[对话摘要] 用户说：我下周三下午两点要去做项目答辩'),
+            ],
+          },
+        })
+      if (url.includes('/profile/')) return mockResponse({ profile: null })
+      return mockResponse({ summaries: [] })
+    }) as typeof fetch
+
+    try {
+      render(<MemoryViewerModal onClose={() => {}} />)
+      await waitFor(() => expect(document.querySelector('.mem-viewer-tabs')).toBeTruthy())
+      fireEvent.click(screen.getByText('记忆'))
+      await waitFor(() => expect(document.querySelectorAll('.mem-card').length).toBe(3))
+      const body = document.body.textContent || ''
+      expect(body).not.toContain('[关于用户]')
+      expect(body).not.toContain('[对话摘要]')
+      expect(body).not.toContain('AI回复要点：')
+      expect(body).toContain('你的妈妈喜欢养花')   // 第三称的"用户"改成"你"
+      expect(body).toContain('她自己的话')
+      expect(body).toContain('那次聊天里你说的')
+    } finally {
+      globalThis.fetch = base
+    }
+  })
+})

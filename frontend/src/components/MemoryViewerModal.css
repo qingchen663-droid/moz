@@ -464,6 +464,14 @@
   font-weight: 600;
 }
 
+/* 这条是从哪来的（"那次聊天"/"她自己的话"）：比标签更淡，别抢正文 */
+.mem-tag--from {
+  background: transparent;
+  border: 1px solid var(--color-border, #ddd);
+  color: var(--color-text-dim);
+  font-weight: 400;
+}
+
 .mem-summaries-list {
   padding: 0;
 }
