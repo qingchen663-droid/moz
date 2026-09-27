@@ -13,6 +13,7 @@
 
 import argparse
 import datetime as dt
+import http.client
 import json
 import math
 import os
@@ -2009,19 +2010,23 @@ def vision_probe():
         req = urllib.request.Request(f"{API}/chat/{USER}", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         out = []
-        with urllib.request.urlopen(req, timeout=200) as res:
-            for raw in res:
-                line = raw.decode("utf-8", "ignore").strip()
-                if not line.startswith("data: "):
-                    continue
-                try:
-                    ev = json.loads(line[6:])
-                except json.JSONDecodeError:
-                    continue
-                if ev.get("type") == "token":
-                    out.append(ev.get("text", ""))
-                elif ev.get("type") in ("done", "error"):
-                    break
+        try:
+            with urllib.request.urlopen(req, timeout=200) as res:
+                for raw in res:
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        ev = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("type") == "token":
+                        out.append(ev.get("text", ""))
+                    elif ev.get("type") in ("done", "error"):
+                        break
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+            # 断流是中转的常态，不该把这项记成"产品失败"（沙箱那边第十四轮也修过同一课）
+            return f"«连接断了：{type(e).__name__}»"
         return "".join(out)
 
     red = ask(png((220, 30, 30)))

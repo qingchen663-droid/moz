@@ -158,8 +158,14 @@ def rebuild_conversation_index(users, db_path=DB):
 
 def delete_memories(entries, conn, api=API):
     """能走接口就走接口：MemoryManager 在进程里缓存着记忆，
-    直接 DELETE 数据库会让界面继续显示旧内容，甚至被缓存回写复活。"""
-    left = []
+    直接 DELETE 数据库会让界面继续显示旧内容，甚至被缓存回写复活。
+
+    第十四轮起把"为什么没删成"分开说：连不上后端 和 后端回了状态码
+    （多半是 404 记忆不存在——它只认进程内缓存）是两回事。
+    以前一律打印"后端没在跑？"，害人跑去重启后端做白工。
+    """
+    left, codes = [], {}
+    unreachable = no_api = 0
     for user_id, mid, _content, _ts in entries:
         if api:
             req = urllib.request.Request(f"{api}/memory/{user_id}/{mid}", method="DELETE")
@@ -167,15 +173,30 @@ def delete_memories(entries, conn, api=API):
                 with urllib.request.urlopen(req, timeout=10) as res:
                     if res.status < 400:
                         continue
+                    codes[res.status] = codes.get(res.status, 0) + 1
+            except urllib.error.HTTPError as e:      # 后端在跑，是它不认这条 id
+                codes[e.code] = codes.get(e.code, 0) + 1
             except (urllib.error.URLError, OSError, ValueError):
-                pass
+                unreachable += 1
+        else:
+            no_api += 1
         left.append((user_id, mid))
     for user_id, mid in left:
         conn.execute("DELETE FROM memory_grade_events WHERE memory_id = ?", (mid,))
         conn.execute("DELETE FROM memories WHERE user_id = ? AND memory_id = ?", (user_id, mid))
     if left:
-        print(f"！{len(left)} 条没走成接口（后端没在跑？），改用直连删除——记得重启后端，"
-              "否则界面上的记忆还是旧的")
+        why = []
+        for code, n in sorted(codes.items()):
+            tag = f"接口回了 {code}×{n}"
+            if code == 404:
+                tag += "（后端在跑，是它不认这条 id）"
+            why.append(tag)
+        if unreachable:
+            why.append(f"连不上后端×{unreachable}")
+        if no_api:
+            why.append("没配接口地址")
+        print(f"！{len(left)} 条没走成接口（{'；'.join(why) or '原因不明'}），改用直连删除——"
+              "记得重启后端，否则界面上的记忆还是旧的")
     return len(left)
 
 
