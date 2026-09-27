@@ -111,6 +111,27 @@ def _split_clauses(text: str) -> List[str]:
     return [p.strip() for p in _CLAUSE_SPLIT.split(text or "") if p.strip()][:MAX_CLAUSES]
 
 
+# 模型给的字段经常自己不一致（第十二轮 --full 实测：{"kind":"event","title":"妈妈生日",
+# "due_date":"10-05","repeat":"yearly"}）。这种行到了界面上是「事件提醒 · 妈妈生日」，
+# 到那天 moz 还会说"今天不是妈妈生日嘛，准备得怎么样了？"
+BIRTHDAY_WORDS = ("生日", "过生", "诞辰")
+# 忌日这类不能祝福，措辞要换调子（"姥姥忌日快乐呀"是说得出口的最差的一种）
+MEMORIAL_WORDS = ("忌日", "去世", "离世", "走了", "周年祭")
+
+
+def reconcile(kind: str, title: str, repeat: str) -> tuple:
+    """把 kind / repeat 钉到标题说的是那件事上。
+
+    - 标题里有"生日"：kind 必须是 birthday（否则界面标错、到点措辞也错）
+    - kind 是 birthday 却没说重复：一定是 yearly，不然过完这一年她再也不提生日
+    """
+    if any(w in title for w in BIRTHDAY_WORDS):
+        kind = "birthday"
+    if kind == "birthday" and repeat == "none":
+        repeat = "yearly"
+    return kind, repeat
+
+
 def _item_from_clause(clause: str) -> Optional[Dict[str, Any]]:
     """单个分句 → 一条事项；认不出可靠日期就返回 None（宁缺毋滥）。"""
     m = _CN_DATE.search(clause)
@@ -340,6 +361,7 @@ def harvest(store: CareStore, user_id: str, user_msg: str, assistant_msg: str,
             continue
         kind = raw.get("kind") if raw.get("kind") in KINDS else "event"
         repeat = raw.get("repeat") if raw.get("repeat") in REPEATS else "none"
+        kind, repeat = reconcile(kind, title, repeat)
         due_at = _to_timestamp(raw.get("due_date"), repeat == "yearly") or float(raw.get("due_at") or 0)
         if repeat == "yearly" and not due_at:
             continue  # 生日没日期就没法主动祝福，别存成噪音
@@ -352,6 +374,8 @@ def harvest(store: CareStore, user_id: str, user_msg: str, assistant_msg: str,
                 patch["due_at"] = due_at
             if repeat != "none" and dup["repeat"] == "none":
                 patch["repeat"] = repeat
+            if kind == "birthday" and dup["kind"] != "birthday":
+                patch["kind"] = kind      # 之前记成"事件提醒"的生日，标签也一并改正
             if patch:
                 updated = store.update_item(user_id, dup["id"], patch)
                 existing[title] = updated or {**dup, **patch}

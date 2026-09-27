@@ -18,6 +18,7 @@ from llm_config import get_llm_client
 from weather import get_weather
 from care_graph import ITEM as NODE_ITEM, MAX_CHAIN_OFFSET_DAYS
 from care_store import CHAT_KINDS
+from care_extractor import MEMORIAL_WORDS
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +264,9 @@ def _template(cand: Dict[str, Any]) -> str:
             return f"{when}说的{later}，后来怎么样了？"
         return f"{when}说的{before}，后来{later}怎么样了？"
     if kind == "birthday":
+        if any(w in title for w in MEMORIAL_WORDS):
+            # 规则兜底把"忌日"也归到 yearly/birthday 这一类，照默认模板就是"忌日快乐呀"
+            return f"今天是{title}，我一直记着。你还好吗？"
         return f"{title}快乐呀！今天打算怎么过？"
     if kind == "event":
         return f"今天不是{title}嘛，准备得怎么样了？"
@@ -305,6 +309,8 @@ def _polish(cand: Dict[str, Any], persona: str = "") -> str:
             )
         if persona:
             system += f"你的说话风格参考：{persona[:200]}\n"
+        if cand["kind"] == "birthday" and any(w in cand["title"] for w in MEMORIAL_WORDS):
+            system += "这条是缅怀的日子：别祝福、别说快乐，安静地记着、问一句他/她还好吗。\n"
         msg = [SystemMessage(content=system),
                HumanMessage(content=f"背景：{cand['why']}\n请只输出你要对用户说的那句话。")]
         reply = llm.invoke(msg)

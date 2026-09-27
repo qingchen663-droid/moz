@@ -1473,6 +1473,73 @@ def system_copy_not_memory():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def birthday_not_mislabeled():
+    """生日被模型标成"事件提醒"时，界面和到点那句话都会跟着错。
+
+    第十二轮 --full 实测到模型返回
+    {"kind":"event","title":"妈妈生日","due_date":"10-05","repeat":"yearly"}，
+    于是界面上写「事件提醒 · 妈妈生日 · 每年」，到那天她会问"准备得怎么样了？"。
+    """
+    import shutil
+    import tempfile
+
+    import care_engine as E
+    import care_extractor as X
+    from care_store import CareStore
+
+    bad = []
+    cases = [("event", "妈妈生日", "yearly", "birthday", "yearly"),
+             ("birthday", "姥姥生日", "none", "birthday", "yearly"),
+             ("health", "每年体检", "yearly", "health", "yearly"),      # 不许误伤
+             ("event", "项目答辩", "none", "event", "none"),
+             ("person", "结婚纪念日", "yearly", "person", "yearly")]
+    for kind, title, repeat, wk, wr in cases:
+        got = X.reconcile(kind, title, repeat)
+        if got != (wk, wr):
+            bad.append(f"{kind}/{title}/{repeat} 归一成 {got}，应为 {(wk, wr)}")
+
+    hi = E._template({"kind": "birthday", "title": "妈妈生日"})
+    if "快乐" not in hi:
+        bad.append(f"生日模板丢了祝福：{hi}")
+    mi = E._template({"kind": "birthday", "title": "姥姥忌日"})
+    if "快乐" in mi:
+        bad.append(f"忌日说了祝福：{mi}")
+    if not mi.strip():
+        bad.append("忌日那句是空的")
+
+    BUGGY = [{"kind": "event", "title": "妈妈生日", "due_date": "10-05",
+              "repeat": "yearly", "why": "用户明确说妈妈生日是10月5日"}]
+    d = tempfile.mkdtemp(prefix="moz-bday-")
+    keep = X.extract
+    try:
+        X.extract = lambda *a, **k: list(BUGGY)
+        store = CareStore(db_path=os.path.join(d, "moz.db"))
+        u = "bday"
+        X.harvest(store, u, "我妈生日是10月5日", "", llm_client=object())
+        rows = store.list_items(u)
+        if not rows:
+            bad.append("生日那条没存下来")
+        else:
+            it = rows[0]
+            if it["kind"] != "birthday" or it["repeat"] != "yearly":
+                bad.append(f"模型标错没被纠正：kind={it['kind']} repeat={it['repeat']}")
+            # 同一件事再说一遍，也不许把标签改回 event
+            X.harvest(store, u, "我妈生日是10月5日", "", llm_client=object())
+            again = store.list_items(u)
+            if len(again) != 1:
+                bad.append(f"同一件生日攒了 {len(again)} 条")
+            elif again[0]["kind"] != "birthday":
+                bad.append(f"重复一次之后标签又退回 {again[0]['kind']}")
+        return "; ".join(bad) or True
+    finally:
+        X.extract = keep
+        try:
+            store._conn().close()
+        except Exception:
+            pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def frontend_no_junk():
     """孤儿样式/备份文件：曾经因为弹窗样式只在 ModelDialog.new.css 里而整块裸奔。"""
     comp = ROOT / "frontend" / "src" / "components"
@@ -1754,6 +1821,7 @@ def main():
     check("日期抽取与去噪", extractor_logic)
     check("相对日期落在对的日子", relative_dates_land_right)
     check("聊到日子自己记下", care_harvest_roundtrip)
+    check("生日不许记成事件提醒", birthday_not_mislabeled)
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)
     check("主动关心不轰炸", care_no_dump)
