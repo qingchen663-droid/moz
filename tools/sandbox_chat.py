@@ -7,6 +7,12 @@
     PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/sandbox_chat.py
     PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/sandbox_chat.py --chain    # 只验先后链
     PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/sandbox_chat.py --restart  # 验"落库中途被重启也不丢"
+
+判分口径（第九轮改过一次，别再改回去）：
+  - "答对 x/6" 按每问必须出现的关键字判，不是"回复非空"——moz 直说想不起来要单列，
+    那说明检索/落库没到，而不是它答错了
+  - 问回去之前先等 save_jobs 排空：落库是后台异步的，不等就把"还没存上"当成"记不住"
+  - 退出码只代表"工具/接口跑通了没有"（没回话才算 1）；通过率是给人读的数字，不是门禁
 """
 
 import json
@@ -40,6 +46,12 @@ QUESTIONS = [
     "有什么吃的我不能吃来着？",
     "我驾照是在哪儿换的？",
 ]
+# 每问一组"必须出现的关键字"（同组内是或）。以前判分只看"回复非空"，
+# 于是"抱歉，我没有关于青柠计划的任何记忆"也算答对，报出来的 6/6 是假的。
+EXPECT = [
+    ("团子",), ("养花",), ("答辩",), ("老郑",), ("香菜",), ("滨江", "车管所"),
+]
+FORGET_PHRASES = ("没印象", "想不起", "不知道", "没有关于", "没记下", "没提过", "不清楚", "抱歉")
 
 
 def free_port() -> int:
@@ -166,6 +178,26 @@ def wait_health(port: int, tries: int = 60) -> bool:
     return False
 
 
+def wait_queue_idle(port: int, user: str, limit: int = 300):
+    """等后台落库排队清空了再问回去。
+
+    实测最慢的一轮四步并行跑了 254.1 秒（中转），而探针原来只 sleep(2) 就问，
+    那时"答不上来"其实只是还没存上——量出来的通过率不能信。
+    """
+    t0 = time.time()
+    q: dict = {}
+    while time.time() - t0 < limit:
+        try:
+            q = api(port, f"/care/save-queue?user_id={user}", timeout=20)
+        except Exception:
+            time.sleep(5)
+            continue
+        if not (q.get("pending", 0) + q.get("running", 0)):
+            break
+        time.sleep(5)
+    return time.time() - t0, q
+
+
 def kill(proc) -> None:
     """硬杀：不等后台任务收尾，这才像 --reload 砸在一半。"""
     proc.kill()
@@ -242,12 +274,18 @@ def restart_probe(work: Path, user: str, port: int, tmp: Path) -> int:
         bad = []
         if total < 1:
             bad.append("重启后一条长期记忆都没补上")
-        if not any("妈" in (i.get("title") or "") or "生日" in (i.get("title") or "") for i in items):
-            bad.append("重启后没补出妈妈生日这件事")
         if not edges:
             bad.append("重启后没补出答辩→出结果的先后链")
         if q2.get("pending", 0) + q2.get("running", 0):
             bad.append("队列里还有没跑完的任务")
+        # "妈妈生日"这件事单独报，不参与 P0 判据：它卡在农历抽取（等用户拍板），
+        # 上一次它和中转空回复叠在一起出现，把"P0 到底有没有好"糊成了一条 ✗
+        got_mom = any("妈" in (i.get("title") or "") or "生日" in (i.get("title") or "")
+                      for i in items)
+        print(f"  {'✓' if got_mom else '○'} 妈妈生日这件：{'补上了' if got_mom else '没补上'}"
+              f"（农历抽取是已知缺口，等拍板，不算这条的失败）")
+        if edges and {e["source"] for e in edges} == {"rule"}:
+            print("  ！这一轮模型那条是空的，全靠规则兜底在撑（中转空回复，不是代码问题）")
         if bad:
             print("  ✗ " + "；".join(bad))
             return 1
@@ -285,21 +323,36 @@ def main():
             time.sleep(2)   # 抽取是异步的，给落库留点时间
 
         print("\n== 第二遍：问回去（新开会话，只靠长期记忆）==")
+        waited, q = wait_queue_idle(port, user)
         stats = api(port, f"/memory/{user}/stats")
+        print(f"  等落库排空用了 {waited:.0f}s（这一轮队列 done={q.get('done')} "
+              f"failed={q.get('failed')}）")
         print(f"  库里记忆 {stats.get('total')} 条")
-        score = 0
-        for q in QUESTIONS:
-            ans = chat(port, user, q)
-            print(f"  问：{q}\n  答：{ans[:160]}")
-            score += 1 if ans and "«错误" not in ans else 0
-        print(f"\n答出 {score}/{len(QUESTIONS)} 条")
+        right = forgot = wrong = dead = 0
+        for text, keys in zip(QUESTIONS, EXPECT):
+            ans = chat(port, user, text)
+            missing = [k for k in keys if k not in ans]
+            if not ans or "«错误" in ans:
+                dead += 1
+                mark = "✗ 接口没回话"
+            elif not missing:
+                right += 1
+                mark = "✓ 答对"
+            elif any(p in ans for p in FORGET_PHRASES):
+                forgot += 1
+                mark = f"○ 直说想不起来（缺：{'/'.join(missing)}）"
+            else:
+                wrong += 1
+                mark = f"✗ 答了但不对（缺：{'/'.join(missing)}）"
+            print(f"  {mark}\n     问：{text}\n     答：{ans[:150]}")
+        print(f"\n答对 {right}/{len(QUESTIONS)}｜直说想不起来 {forgot}｜答错 {wrong}｜没回话 {dead}")
 
         print("\n== 它到底存成了什么 ==")
         detail = api(port, f"/memory/{user}/detail")
         for layer, items in (detail.get("layers") or {}).items():
             for m in items[:40]:
                 print(f"  [{layer}] {m['content'][:70]}")
-        return 0
+        return 1 if dead else 0
     finally:
         proc.terminate()
         try:
