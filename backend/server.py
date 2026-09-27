@@ -1088,9 +1088,19 @@ async def update_care_settings(user_id: str, patch: dict):
 
 @app.get("/api/care/pending", dependencies=[Depends(verify_access_key)])
 async def get_pending_proactive(user_id: str):
-    """待读的主动关心消息。托盘和前端都从这里取。"""
+    """待读的主动关心消息。托盘和前端都从这里取。
+
+    来取 = 这一刻有人听得见，这是主动关心敢不敢开口的依据；顺手把已经说不出口
+    的话清出队列（隔了天的「今天」、放了两小时的问候），只出队、不写进对话。
+    """
     user_id = normalize_user_id(user_id)
-    return {"items": _app_state["care_store"].pending(user_id)}
+    store: CareStore = _app_state["care_store"]
+    care_engine.note_poll(user_id)
+    stale = store.stale_ids(user_id)
+    if stale:
+        store.ack(user_id, stale)
+        logger.info("[主动关心] %d 条待读消息已经说不出口了，不再补发", len(stale))
+    return {"items": store.pending(user_id)}
 
 
 @app.post("/api/care/ack", dependencies=[Depends(verify_access_key)])
@@ -1115,6 +1125,7 @@ async def dry_run_care(user_id: str):
     """演练：返回此刻够格说的第一句话，不写库、不打扰用户。"""
     user_id = normalize_user_id(user_id)
     link_graph = _app_state.get("care_graph")
+    care_engine.note_poll(user_id)   # 用户正盯着界面看，这一刻显然有人在听
     if link_graph:
         # 先把关联补齐，演练才和真实心跳时说的一样
         await asyncio.to_thread(link_graph.sync_all, _app_state["care_store"],

@@ -3,6 +3,7 @@
 与 moz.db 同库，沿用「按 __file__ 定位、不依赖 cwd」的既有约定。
 """
 
+import datetime as dt
 import json
 import os
 import sqlite3
@@ -15,6 +16,9 @@ DB_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)), "moz.db")
 
 ITEM_KINDS = ("birthday", "event", "promise", "checkin", "health", "person", "note")
 REPEATS = ("none", "daily", "weekly", "yearly")
+# 没来由的搭话：只在当下那一刻成立，攒几小时再补发就莫名其妙
+CHAT_KINDS = ("open_loop", "miss_you")
+CHAT_FRESH_SECONDS = 2 * 3600
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     # 两个独立开关。老版本只有一个 enabled，用户想"只要生日提醒、别没事找我说话"做不到。
@@ -200,12 +204,39 @@ class CareStore:
         conn.commit()
         return row
 
-    def pending(self, user_id: str) -> List[Dict[str, Any]]:
+    def _unread(self, user_id: str) -> List[Dict[str, Any]]:
         rows = self._conn().execute(
             "SELECT * FROM proactive_queue WHERE user_id = ? AND acked_at IS NULL ORDER BY created_at ASC",
             (user_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    @staticmethod
+    def _split_stale(rows: List[Dict[str, Any]], now: float):
+        """哪些还值得说、哪些已经说不出口了。
+
+        这些话句句带着「今天」：隔了天再补发，moz 就是当着用户的面说错日子；
+        问候类过了两小时也不再是那一刻的事。说错话比不说的话严重。
+        """
+        today = dt.datetime.fromtimestamp(now).date()
+        keep: List[Dict[str, Any]] = []
+        stale: List[str] = []
+        for r in rows:
+            created = float(r["created_at"])
+            if dt.datetime.fromtimestamp(created).date() != today:
+                stale.append(r["id"])
+            elif r["kind"] in CHAT_KINDS and now - created > CHAT_FRESH_SECONDS:
+                stale.append(r["id"])
+            else:
+                keep.append(r)
+        return keep, stale
+
+    def pending(self, user_id: str, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        return self._split_stale(self._unread(user_id), now or time.time())[0]
+
+    def stale_ids(self, user_id: str, now: Optional[float] = None) -> List[str]:
+        """取队列时顺手认一下：这些条已经不值得补发了。"""
+        return self._split_stale(self._unread(user_id), now or time.time())[1]
 
     def ack(self, user_id: str, ids: List[str]) -> List[str]:
         """确认已读，返回**本次真正由自己翻转成功**的 id。

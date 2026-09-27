@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm_config import get_llm_client
 from weather import get_weather
 from care_graph import ITEM as NODE_ITEM, MAX_CHAIN_OFFSET_DAYS
+from care_store import CHAT_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +29,21 @@ MAX_CHAIN_PER_DAY = 1           # 一天最多顺一条链，链多也不能变�
 RAIN_WINDOW = (7, 10)           # 带伞提醒只在早上这个时段说
 BIRTHDAY_AFTER_HOUR = 9
 MAX_PROACTIVE_PER_DAY = 8       # 硬上限：事项堆一起了也不能当通知轰炸机
-
-# 没来由地搭话：吃"话多话少"换算出来的当日名额，受「平时主动找我说话」开关管
-CHAT_KINDS = ("open_loop", "miss_you")
+# 多久没人来取消息就算「没人在听」：前端和托盘都是 20 秒一取，留足浏览器后台节流
+PRESENCE_WINDOW_SECONDS = 5 * 60
 
 _last_user_seen: Dict[str, float] = {}
 _last_bot_seen: Dict[str, float] = {}
+_last_poll_seen: Dict[str, float] = {}
+
+
+def note_poll(user_id: str) -> None:
+    """有人来取待读消息（页面开着、或托盘活着）：这是「说出去有人听得见」的唯一凭据。"""
+    _last_poll_seen[user_id] = time.time()
+
+
+def someone_listening(user_id: str, now: float) -> bool:
+    return now - _last_poll_seen.get(user_id, 0) <= PRESENCE_WINDOW_SECONDS
 
 
 def note_user_activity(user_id: str) -> float:
@@ -213,10 +223,15 @@ def collect(store, wm_store, user_id: str, now: Optional[float] = None,
                         "why": f"用户之前留了个没说完的话头：{followup}"})
 
         if store.fired_since(user_id, _day_start(now), "miss_you") == 0:
-            idle_hours = (now - _last_user_seen.get(user_id, 0)) / 3600 if _last_user_seen.get(user_id) else None
+            seen = _last_user_seen.get(user_id)
+            idle_hours = (now - seen) / 3600 if seen else None
             if idle_hours is None or idle_hours >= _idle_threshold(settings.get("talk_score", 0.5)):
+                # 后端刚 --reload 或用户还没聊过：没有参照就别编一个"0 小时"出来，
+                # 这句 why 既进模型也直接摊在界面上，说得出数字才说数字
+                why = ("这一阵没和用户说过话了，主动问候一句" if idle_hours is None else
+                       f"已经大约{int(idle_hours)}小时没聊了，主动问候一句")
                 out.append({"priority": 4, "kind": "miss_you", "ref_id": "", "title": "",
-                            "why": f"已经大约{int(idle_hours or 0)}小时没聊了，主动问候一句"})
+                            "why": why})
 
     if graph is not None:
         for cand in out:
@@ -304,6 +319,10 @@ def tick_once(store, wm_store, user_id: str, now: Optional[float] = None,
     if in_quiet_hours(settings, now):
         return []
     if now - _last_user_seen.get(user_id, 0) < USER_PRESENT_SECONDS:
+        return []
+    if not dry_run and not someone_listening(user_id, now):
+        # 没人来取就别往队列里堆：离线攒一天，用户回来看到的是一次十几条的轰炸，
+        # 而且这些话句句带「今天」，隔天再说就是说错日子
         return []
 
     # "话多话少"换算的当日名额只限没来由的搭话（在 collect 里判），

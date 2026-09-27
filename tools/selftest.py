@@ -328,6 +328,121 @@ def relative_dates_land_right():
     return "; ".join(fail) or True
 
 
+def care_no_dump():
+    """没人听得见就别说话；攒下来的过时话不许一次倒给用户。
+
+    第八轮之前节流只记「生成」不记「送到」：应用关掉两天，回来一次性收到 13 条待读
+    （实测数字），其中 7 条已经跨了天——而这些话句句带「今天」，隔天说就是说错日子。
+    """
+    import care_engine as E
+    import care_store as S
+    import tempfile
+    from care_store import CareStore
+
+    class Clock:
+        """假时钟：整个模拟（含入库的 created_at）都走它，否则测不到"放了一夜"。"""
+        now = 0.0
+
+        @staticmethod
+        def time():
+            return Clock.now
+
+        @staticmethod
+        def sleep(x):
+            pass
+
+    u = "__selftest_nodump__"
+    real = (E.time, S.time)
+    polish = E._polish
+    E._last_poll_seen.clear()
+    E.note_poll(u)                          # 先验接口接得上：server.py 调的就是这两个函数
+    listening = E.someone_listening(u, time.time())
+    E._last_poll_seen.clear()
+    # 用 mkdtemp 不用 TemporaryDirectory：sqlite 连接是线程复用的，退出时删目录会撞
+    # WinError 32（同一个坑在 backend/tests 里也兜过）
+    d = tempfile.mkdtemp(prefix="moz-nodump-")
+    store = CareStore(db_path=os.path.join(d, "moz.db"))
+    E.time = S.time = Clock
+    E._polish = lambda cand, persona="": E._template(cand)   # 快检门禁不许调模型
+    E._last_user_seen.clear()
+    E._last_poll_seen.clear()
+    try:
+        store.save_settings(u, {"talk_mode": "chatty"})
+        day = dt.datetime(2026, 3, 10, 9, 0).timestamp()
+        store.add_item(u, "项目答辩", kind="event", due_at=day + 3600, source="auto")
+        store.add_item(u, "妈妈生日", kind="birthday", due_at=day + 7200,
+                       repeat="yearly", source="auto")
+        store.add_item(u, "复诊", kind="health", due_at=day + 7 * 3600, source="auto")
+
+        # ① 一整天没人来取：一条都不该生成
+        Clock.now = day
+        for k in range(300):                     # 每 60 秒一跳，跳满 5 小时
+            E.tick_once(store, None, u, now=Clock.now)
+            Clock.now += 60
+        silent = store._conn().execute(
+            "SELECT COUNT(*) FROM care_log WHERE user_id=?", (u,)).fetchone()[0]
+
+        # ② 有人开着页面（每 20 秒来取一次）：该说的话照样得说，别把闸门焊死
+        for k in range(300):
+            E._last_poll_seen[u] = Clock.now     # 等价于"这一刻有人开着页面"
+            E.tick_once(store, None, u, now=Clock.now)
+            Clock.now += 60
+        heard = store._conn().execute(
+            "SELECT COUNT(*) FROM care_log WHERE user_id=?", (u,)).fetchone()[0] - silent
+
+        ids = [r[0] for r in store._conn().execute(
+            "SELECT id FROM proactive_queue WHERE user_id=? ORDER BY created_at", (u,))]
+
+        # ③ 队列里的话：跨天的、放了两小时的问候，都不许再补发
+        def backdate(rid, seconds, kind):
+            store._conn().execute(
+                "UPDATE proactive_queue SET created_at=?, kind=? WHERE id=?",
+                (Clock.now - seconds, kind, rid))
+            store._conn().commit()
+
+        if len(ids) < 4:
+            return f"有人在听时只攒出 {len(ids)} 条待读，测不了过期判定"
+        fresh_chat, old_chat, old_event, day_event = ids[:4]
+        backdate(old_chat, 3 * 3600, "miss_you")      # 三小时前的"想问问你今天"
+        backdate(old_event, 30 * 3600, "event")       # 昨天的"今天不是答辩嘛"
+        backdate(day_event, 5 * 3600, "birthday")     # 今天早上的生日祝福
+        backdate(fresh_chat, 3600, "miss_you")        # 一小时前那句还算数
+        keep = {i["id"] for i in store.pending(u, Clock.now)}
+        stale = set(store.stale_ids(u, Clock.now))
+        swept = store.ack(u, list(stale))
+        left_after_sweep = store.stale_ids(u, Clock.now)
+        after = {i["id"] for i in store.pending(u, Clock.now)}
+
+        fail = []
+        if not listening:
+            fail.append("刚有人来取过却判定成没人在听")
+        if silent:
+            fail.append(f"没人听得见还是生成了 {silent} 条")
+        if heard < 2:
+            fail.append(f"有人在听时只说了 {heard} 条，闸门像是焊死了")
+        if fresh_chat not in keep:
+            fail.append("一小时前那句问候被当过期清掉了")
+        if old_chat in keep or old_chat not in stale:
+            fail.append("三小时前的问候还打算补发")
+        if old_event in keep or old_event not in stale:
+            fail.append("隔了一天的「今天」还打算补发")
+        if day_event not in keep:
+            fail.append("当天的生日祝福不该被清掉")
+        if sorted(swept) != sorted(stale):
+            fail.append("过期消息没能出队")
+        if left_after_sweep or after != keep:
+            fail.append(f"出队后还剩 {len(left_after_sweep)} 条过期没清干净")
+        if day_event not in after or fresh_chat not in after:
+            fail.append("清过期时把还值得说的也带走了")
+        # 数字留在各条 fail 里和 RUNLOG 里：门禁约定只有 True 才算过
+        return "; ".join(fail) or True
+    finally:
+        E.time, S.time = real
+        E._polish = polish
+        E._last_user_seen.clear()
+        E._last_poll_seen.clear()
+
+
 def store_logic():
     from care_store import CareStore
     u = "__selftest_store__"
@@ -1580,6 +1695,7 @@ def main():
     check("聊到日子自己记下", care_harvest_roundtrip)
     check("存储与预算与ack竞态", store_logic)
     check("关心两开关独立", care_switch_logic)
+    check("主动关心不轰炸", care_no_dump)
     check("数据库不变量", db_invariants)
     check("不遗忘只降到最低权重", capacity_policy_check)
     check("检索提速不改排序", keyword_parity_check)
