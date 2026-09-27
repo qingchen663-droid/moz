@@ -758,6 +758,41 @@ describe('档案卡上能把记错的划掉', () => {
     }
   })
 
+  it('模型把偏好回成嵌套对象时不许把整块档案卡崩掉', async () => {
+    // 第十四轮沙箱实测存出来的真实形状：
+    // preferences = {"other": {"pet": {"name":"团子","age":5,"type":"猫","breed":"橘猫"}}}
+    const { default: MemoryViewerModal } = await import('../components/MemoryViewerModal')
+    const base = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : String(input)
+      if (url.includes('/profile/'))
+        return mockResponse({
+          user_id: 'web_user_001',
+          profile: {
+            identity: { name: '小明' },
+            preferences: { other: { pet: { name: '团子', age: 5, type: '猫', breed: '橘猫' } } },
+            relationships: {},
+            emotional_profile: {},
+          },
+          prompt_context: '',
+          version: 1,
+        })
+      if (url.includes('/detail')) return mockResponse({ layers: { core: [], important: [], regular: [] } })
+      if (url.includes('/summaries')) return mockResponse({ summaries: [] })
+      return base(input as RequestInfo | URL, init)
+    }) as typeof fetch
+    try {
+      render(<MemoryViewerModal onClose={() => {}} />)
+      await waitFor(() => expect(document.body.textContent).toContain('喜好偏好'))
+      const body = document.body.textContent || ''
+      expect(body).not.toContain('[object Object]')
+      expect(body).toContain('团子')          // 得让人认得出这是哪条，然后能划掉
+      expect(document.querySelectorAll('.mem-tag-x').length).toBeGreaterThan(0)
+    } finally {
+      globalThis.fetch = base
+    }
+  })
+
   it('后端早就有 PUT /api/profile，本轮第一次把它接上', async () => {
     const { puts, cleanupFetch } = await openProfile()
     const hobbies = [...document.querySelectorAll('.mem-pref-tag')].filter((e) =>

@@ -164,9 +164,9 @@ export default function MemoryViewerModal({ onClose }: Props) {
       const bits = ['name', 'relation', 'title', 'topic', 'description', 'detail']
         .map((k) => (item[k] || '').toString().trim())
         .filter(Boolean)
-      return bits.join(' · ') || key
+      return bits.join(' · ') || prefText(item) || key
     }
-    return String(item ?? key)
+    return prefText(item) || key
   }
 
   const dropProfileEntry = async (section: string, key: string, index = -1) => {
@@ -425,9 +425,9 @@ function ProfileView({
               <div key={key} className="mem-pref-row">
                 <span className="mem-pref-key">{prefLabel(key)}</span>
                 <div className="mem-pref-tags">
-                  {items.map((item: string, i: number) => (
+                  {items.map((item: unknown, i: number) => (
                     <span key={i} className="mem-pref-tag">
-                      {item}
+                      {prefText(item)}
                       <button
                         className="mem-tag-x"
                         title="这条不对，划掉"
@@ -451,7 +451,11 @@ function ProfileView({
               <div className="mem-rel-label">家人</div>
               {relationships.family.map((r: any, i: number) => (
                 <div key={i} className="mem-rel-item">
-                  <span className="mem-rel-relation">{r.relation}</span>
+                  {/* 后端 merge 允许列表里出现纯字符串（模型有时就回一个"妈妈"），
+                      那种条目原来 relation/name/description 全取不到，界面上就是一行空白 + 一个 × */}
+                  <span className="mem-rel-relation">
+                    {typeof r === 'string' ? r : r.relation}
+                  </span>
                   {r.name && <span className="mem-rel-name">{r.name}</span>}
                   {r.description && <span className="mem-rel-desc">{r.description}</span>}
                   <button
@@ -470,6 +474,7 @@ function ProfileView({
               <div className="mem-rel-label">朋友</div>
               {relationships.friends.map((r: any, i: number) => (
                 <div key={i} className="mem-rel-item">
+                  {typeof r === 'string' && <span className="mem-rel-name">{r}</span>}
                   {r.name && <span className="mem-rel-name">{r.name}</span>}
                   {r.description && <span className="mem-rel-desc">{r.description}</span>}
                   <button
@@ -707,7 +712,7 @@ function KVGrid({
         return (
           <div key={key} className="mem-kv-item">
             <span className="mem-kv-key">{labelMap[key] || key}</span>
-            <span className="mem-kv-val">{String(val)}</span>
+            <span className="mem-kv-val">{prefText(val)}</span>
             {onRemove && (
               <button className="mem-tag-x" title="这条不对，划掉" onClick={() => onRemove(key)}>
                 ×
@@ -721,6 +726,41 @@ function KVGrid({
 }
 
 /* ── Helpers ── */
+const OBJ_KEY_LABELS: Record<string, string> = {
+  name: '名字',
+  age: '年龄',
+  type: '类型',
+  breed: '品种',
+  pet: '宠物',
+  color: '颜色',
+  size: '大小',
+  where: '地点',
+  when: '时间',
+  note: '备注',
+  desc: '说明',
+  description: '说明',
+}
+
+/** 把档案卡里任意形状的值折成一句能读、也能塞进 JSX 的话。
+ *  第十四轮沙箱实测模型回过嵌套对象：
+ *  preferences.other = {"pet": {"name":"团子","age":5,"type":"猫","breed":"橘猫"}}
+ *  对象直接进 <span> 会抛 "Objects are not valid as a React child"，整块档案卡白屏；
+ *  用 String(val) 也不对，会变成 [object Object]。 */
+function prefText(v: unknown): string {
+  if (v === null || v === undefined) return ''
+  if (Array.isArray(v)) return v.map(prefText).filter(Boolean).join('、')
+  if (typeof v === 'object') {
+    return Object.entries(v as Record<string, unknown>)
+      .map(([k, inner]) => {
+        const text = prefText(inner)
+        return text ? `${OBJ_KEY_LABELS[k] || k}：${text}` : ''
+      })
+      .filter(Boolean)
+      .join('、')
+  }
+  return String(v)
+}
+
 function prefLabel(key: string): string {
   const map: Record<string, string> = {
     hobbies: '爱好',
