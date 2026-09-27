@@ -1944,22 +1944,27 @@ def full_chat_roundtrip():
     req = urllib.request.Request(f"{API}/chat/{USER}", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     got_reply, err = False, None
-    with urllib.request.urlopen(req, timeout=300) as res:
-        for raw in res:
-            line = raw.decode("utf-8", "ignore").strip()
-            if not line.startswith("data: "):
-                continue
-            p = line[6:]
-            if p == "[DONE]":
-                break
-            try:
-                ev = json.loads(p)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "reply":
-                got_reply = True
-            if ev.get("type") == "error":
-                err = ev.get("text")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as res:
+            for raw in res:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data: "):
+                    continue
+                p = line[6:]
+                if p == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(p)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") == "reply":
+                    got_reply = True
+                if ev.get("type") == "error":
+                    err = ev.get("text")
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+        # 第十五轮实测：另一种死法是**客户端自己**等满 300 秒（TimeoutError: timed out），
+        # 连 SSE 的 error 事件都没拿到。那也是供给，别报成产品缺陷——但要带上等了多久。
+        return f"warn: 等了 {time.time() - t0:.0f}s 客户端先超时（{type(e).__name__}），接口一个字都没回"
     if err:
         # 中转慢/断/5xx 折成的那几句人话是**产品按预期在说话**，不该把这项记成代码缺陷
         # （第十四轮实测：一句"回答你好"被拖到 383 秒后由我们自己的 120 秒空档守卫报超时）。
