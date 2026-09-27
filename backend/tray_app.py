@@ -75,7 +75,9 @@ def _notify(text: str) -> None:
 def _poll_loop(icon: pystray.Icon) -> None:
     while True:
         try:
-            items = _get(f"/care/pending?user_id={USER_ID}").get("items", [])
+            # 按了暂停就别再谎报"有人在听"：那只是这台机器还在轮询
+            listening = 0 if _state["paused"] else 1
+            items = _get(f"/care/pending?user_id={USER_ID}&listening={listening}").get("items", [])
             if not _state["online"]:
                 _state["online"] = True
                 icon.title = "moz · 已连接" if not _state["paused"] else "moz · 已暂停主动关心"

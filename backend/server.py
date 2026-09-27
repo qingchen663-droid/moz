@@ -1098,15 +1098,16 @@ async def update_care_settings(user_id: str, patch: dict):
 
 
 @app.get("/api/care/pending", dependencies=[Depends(verify_access_key)])
-async def get_pending_proactive(user_id: str):
+async def get_pending_proactive(user_id: str, listening: bool = True):
     """待读的主动关心消息。托盘和前端都从这里取。
 
     来取 = 这一刻有人听得见，这是主动关心敢不敢开口的依据；顺手把已经说不出口
     的话清出队列（隔了天的「今天」、放了两小时的问候），只出队、不写进对话。
+    托盘按了"暂停"时会带 listening=0：那还只是机器在轮询，不是有人在听。
     """
     user_id = normalize_user_id(user_id)
     store: CareStore = _app_state["care_store"]
-    care_engine.note_poll(user_id)
+    care_engine.note_poll(user_id, listening)
     stale = store.stale_ids(user_id)
     if stale:
         store.ack(user_id, stale)

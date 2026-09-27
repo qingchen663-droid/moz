@@ -37,8 +37,15 @@ _last_bot_seen: Dict[str, float] = {}
 _last_poll_seen: Dict[str, float] = {}
 
 
-def note_poll(user_id: str) -> None:
-    """有人来取待读消息（页面开着、或托盘活着）：这是「说出去有人听得见」的唯一凭据。"""
+def note_poll(user_id: str, listening: bool = True) -> None:
+    """有人来取待读消息（页面开着、或托盘活着）：这是「说出去有人听得见」的唯一凭据。
+
+    托盘即使被用户点了"暂停主动关心"也还在 20 秒一取——那不算在听，
+    照旧记成在场就等于"她在你按了静音的房间里自言自语"。
+    """
+    if not listening:
+        _last_poll_seen.pop(user_id, None)
+        return
     _last_poll_seen[user_id] = time.time()
 
 

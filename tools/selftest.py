@@ -357,6 +357,8 @@ def care_no_dump():
     E._last_poll_seen.clear()
     E.note_poll(u)                          # 先验接口接得上：server.py 调的就是这两个函数
     listening = E.someone_listening(u, time.time())
+    E.note_poll(u, listening=False)         # 托盘按了暂停：还在轮询，但不算"有人在听"
+    paused = E.someone_listening(u, time.time())
     E._last_poll_seen.clear()
     # 用 mkdtemp 不用 TemporaryDirectory：sqlite 连接是线程复用的，退出时删目录会撞
     # WinError 32（同一个坑在 backend/tests 里也兜过）
@@ -416,6 +418,8 @@ def care_no_dump():
         fail = []
         if not listening:
             fail.append("刚有人来取过却判定成没人在听")
+        if paused:
+            fail.append("托盘按了暂停还算「有人在听」")
         if silent:
             fail.append(f"没人听得见还是生成了 {silent} 条")
         if heard < 2:
