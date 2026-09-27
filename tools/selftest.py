@@ -1916,6 +1916,13 @@ def full_chat_roundtrip():
             if ev.get("type") == "error":
                 err = ev.get("text")
     if err:
+        # 中转慢/断/5xx 折成的那几句人话是**产品按预期在说话**，不该把这项记成代码缺陷
+        # （第十四轮实测：一句"回答你好"被拖到 383 秒后由我们自己的 120 秒空档守卫报超时）。
+        # 但也不能一句"没事"就打消：warn 里带上等了多久，连着几轮好看趋势。
+        supply = ("想得太久", "等模型回话等超时", "中转限流", "连不上模型中转",
+                  "中转那边出了点问题", "连接中途断", "服务没正常响应")
+        if any(mark in str(err) for mark in supply):
+            return f"warn: 中转没回话（等了 {time.time() - t0:.0f}s）：{str(err)[:60]}"
         return f"对话报错: {err}"
     if not got_reply:
         return "没有收到完整回复"
