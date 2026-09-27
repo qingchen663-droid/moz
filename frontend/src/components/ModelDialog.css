@@ -632,25 +632,31 @@
 }
 
 .model-pick-list {
-  margin-top: 8px;
-  padding: 8px;
-  max-height: 180px;
+  margin-top: 10px;
+  padding: 10px;
+  max-height: 260px;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
+  /* 按宽度决定几列：窄弹窗里一行一个，名字不会被截断得看不清 */
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  /* 关键：不写这行的话，Chrome 会把 auto 轨道压到容器高度里均分，
+     每行文字被 overflow:hidden 裁掉半截（这里踩过一次，看着就是"挤到一起"） */
+  grid-auto-rows: min-content;
+  gap: 8px;
   background: #FAF7F2;
   border: 1px solid #ECE3D8;
   border-radius: 10px;
 }
 
 .model-pick-item {
-  padding: 7px 10px;
-  border-radius: 7px;
-  border: 1px solid transparent;
+  padding: 9px 12px;
+  min-height: 36px;
+  border-radius: 8px;
+  border: 1px solid #F0E8DE;
   background: #FFFFFF;
   color: #2D2420;
-  font-size: 12px;
+  font-size: 12.5px;
+  line-height: 1.45;
   font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
   text-align: left;
   white-space: nowrap;

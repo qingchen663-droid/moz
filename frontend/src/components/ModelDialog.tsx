@@ -190,6 +190,9 @@ export default function ModelDialog({ onClose }: Props) {
     }
   }
 
+  // 中转会把向量/重排模型一起列出来，那些没法拿来聊天，摆在列表里只会误导
+  const pickable = (models ?? []).filter((id) => !/embedding|rerank|moderation/i.test(id))
+
   if (loading) {
     return (
       <div className="dialog-overlay" onClick={onClose}>
@@ -431,7 +434,11 @@ export default function ModelDialog({ onClose }: Props) {
                     </button>
                     {models && (
                       <span className="model-fetch-hint">
-                        能连上，{models.length} 个模型可用；点一下填进上面
+                        能连上，{pickable.length} 个能聊天
+                        {models.length > pickable.length
+                          ? `（另有 ${models.length - pickable.length} 个向量/重排模型已滤掉）`
+                          : ''}
+                        ；点一下填进上面
                       </span>
                     )}
                     {!modelsLoading && !models && !modelsError && (
@@ -445,12 +452,13 @@ export default function ModelDialog({ onClose }: Props) {
 
                   {models && (
                     <div className="model-pick-list">
-                      {models.map((id) => (
+                      {pickable.map((id) => (
                         <button
                           type="button"
                           key={id}
                           className={`model-pick-item ${id === formModel.trim() ? 'active' : ''}`}
                           onClick={() => setFormModel(id)}
+                          title={id}
                         >
                           {id}
                         </button>
