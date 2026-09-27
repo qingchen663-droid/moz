@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_config import get_llm_client
 from weather import get_weather
+from care_graph import ITEM as NODE_ITEM
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +92,13 @@ def _idle_threshold(score: float) -> float:
     return max(3.0, 12.0 - 8.0 * float(score or 0.5))
 
 
-def collect(store, wm_store, user_id: str, now: Optional[float] = None) -> List[Dict[str, Any]]:
+def collect(store, wm_store, user_id: str, now: Optional[float] = None,
+            graph=None) -> List[Dict[str, Any]]:
     """列出此刻够格主动开口的理由，按优先级排好。
 
     两个开关各管一段：「到点提醒」管记下的事，「主动找我说话」管问候和追话头，
     互不牵连；带伞提醒有自己的勾，不受这两个影响。
+    传了 graph 就给每条事项附上"和它连着线的旧事"，措辞时才有"记得"而不是"通知"的感觉。
     """
     now = now or time.time()
     cur = dt.datetime.fromtimestamp(now)
@@ -174,6 +177,16 @@ def collect(store, wm_store, user_id: str, now: Optional[float] = None) -> List[
                 out.append({"priority": 4, "kind": "miss_you", "ref_id": "", "title": "",
                             "why": f"已经大约{int(idle_hours or 0)}小时没聊了，主动问候一句"})
 
+    if graph is not None:
+        for cand in out:
+            if not cand.get("ref_id"):
+                continue
+            try:
+                cand["context"] = graph.context_lines(user_id, NODE_ITEM, cand["ref_id"])
+            except Exception as e:  # 关联是加分项，坏了也不能不说话
+                logger.warning("[主动关心] 取关联上下文失败: %s", e)
+                cand["context"] = []
+
     return sorted(out, key=lambda c: c["priority"])
 
 
@@ -197,13 +210,22 @@ def _template(cand: Dict[str, Any]) -> str:
 def _polish(cand: Dict[str, Any], persona: str = "") -> str:
     """让模型把事实说成人话；调不通就用模板，保证功能不哑。"""
     fallback = _template(cand)
+    context = [line for line in (cand.get("context") or []) if line][:2]
     try:
         llm = get_llm_client(temperature=0.9)
         system = (
             "你是 moz，用户的朋友。现在由你主动发起关心，不是客服也不是通知机器人。\n"
-            "要求：只说一到两句，不超过 45 个字；口语、具体、贴着事实说；"
+            "要求：只说一到两句，不超过 "
+            f"{'55' if context else '45'}"
+            " 个字；口语、具体、贴着事实说；"
             "不要客套开头，不要用「您好」「请问」，不要解释自己为什么说话，不要加表情符号。\n"
         )
+        if context:
+            system += (
+                "下面几件旧事和它连着线（同一个人或同一类事）。最多挑一条自然地带上，"
+                "让这句话听像是记得，而不是提醒音；用不上就一条都别硬塞：\n"
+                + "\n".join(f"- {line}" for line in context) + "\n"
+            )
         if persona:
             system += f"你的说话风格参考：{persona[:200]}\n"
         msg = [SystemMessage(content=system),
@@ -218,7 +240,7 @@ def _polish(cand: Dict[str, Any], persona: str = "") -> str:
 
 
 def tick_once(store, wm_store, user_id: str, now: Optional[float] = None,
-              dry_run: bool = False, persona: str = "") -> List[Dict[str, Any]]:
+              dry_run: bool = False, persona: str = "", graph=None) -> List[Dict[str, Any]]:
     """跑一轮判定。dry_run=True 时只返回"将要说什么"，不写库。"""
     now = now or time.time()
     settings = store.get_settings(user_id)
@@ -236,14 +258,14 @@ def tick_once(store, wm_store, user_id: str, now: Optional[float] = None,
     if now - store.last_fired_at(user_id) < MIN_GAP_SECONDS:
         return []
 
-    candidates = collect(store, wm_store, user_id, now)
+    candidates = collect(store, wm_store, user_id, now, graph=graph)
     if not candidates:
         return []
 
     cand = candidates[0]  # 一次只说一件事，别刷屏
     text = _template(cand) if dry_run else _polish(cand, persona)
     result = {"kind": cand["kind"], "ref_id": cand["ref_id"], "title": cand["title"],
-              "why": cand["why"], "text": text}
+              "why": cand["why"], "text": text, "context": cand.get("context") or []}
     if dry_run:
         return [result]
 
@@ -255,13 +277,20 @@ def tick_once(store, wm_store, user_id: str, now: Optional[float] = None,
 
 
 async def care_loop(store, wm_store, user_id: str, interval: int = 60,
-                    persona_getter=None) -> None:
-    """后端常驻心跳：每 interval 秒判定一次。"""
+                    persona_getter=None, graph=None, memory_manager=None) -> None:
+    """后端常驻心跳：每 interval 秒判定一次。
+
+    顺带刷关联图：按水位增量补边（只有改过的事项/记忆才重新抽枢纽），
+    所以事件关联晚一分钟出现没关系，代价不该摊到每条对话上。
+    """
     logger.info("[主动关心] 心跳启动，每 %ss 判定一次（用户 %s）", interval, user_id)
     while True:
         try:
+            if graph is not None:
+                await asyncio.to_thread(graph.sync_all, store, memory_manager, user_id)
             persona = persona_getter() if persona_getter else ""
-            await asyncio.to_thread(tick_once, store, wm_store, user_id, None, False, persona)
+            await asyncio.to_thread(tick_once, store, wm_store, user_id, None, False,
+                                    persona, graph)
         except asyncio.CancelledError:
             raise
         except Exception as e:

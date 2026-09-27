@@ -721,6 +721,128 @@ def keyword_parity_check():
     return "; ".join(diffs[:4]) if diffs else True
 
 
+def care_link_graph_check():
+    """事件关联：到点提醒时得能把"和这件事连着线的旧事"一起想起来。
+
+    钉住四件产品上不能坏的事：
+    1. 「妈妈生日」能连到「妈妈喜欢养花」，靠的是同一个人，不是碰巧的词；
+    2. 抽人不能误伤（"小姐姐""我小憩了一下"都不算人）；
+    3. 到处都出现的词不许当桥梁（80 条都含"体检"时不该互相连出来）；
+    4. 用户删了事项/清空记忆以后，关联必须跟着没——不能从图里翻出已经抹掉的旧事。
+    """
+    import shutil
+    import tempfile
+    import types
+
+    from care_graph import ITEM, MEMORY, CareGraph, extract_persons
+    from care_store import CareStore
+    import care_engine as E
+
+    bad = []
+    d = tempfile.mkdtemp(prefix="moz-selftest-graph-")
+    user = "__selftest_links__"
+    mm = None
+    try:
+        import memory_manager as MM
+        store = CareStore(os.path.join(d, "moz.db"))
+        graph = CareGraph(os.path.join(d, "moz.db"))
+        mm = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "moz.db"))
+        mm.embedding_service.get_embedding = lambda text: None
+        mm.embedding_service.get_embeddings_batch = lambda texts: [None] * len(texts)
+        mom = store.add_item(user, "妈妈生日", kind="birthday", source="auto")
+        claim = store.add_item(user, "项目答辩", kind="event", source="auto")
+        store.add_item(user, "姥姥体检", kind="health", source="manual")
+        yanghua = mm.add_memory(user, "用户的妈妈喜欢养花", confidence=0.9)
+        mm.add_memory(user, "用户下周三的项目答辩在总部三楼，负责人是老郑", confidence=0.9)
+        hua = mm.add_memory(user, "用户的猫叫团子，五岁橘猫", confidence=0.9)
+
+        graph.sync_all(store, mm, user)
+        linked = {r["label"]: r for r in graph.related(user, ITEM, mom["id"], limit=5)}
+        if not any("养花" in label for label in linked):
+            bad.append(f"「妈妈生日」没连到「妈妈喜欢养花」：{list(linked)}")
+        if any("团子" in label for label in linked):
+            bad.append("不相干的记忆（猫）被连进了妈妈生日的邻居")
+        if not any("答辩" in r["label"] for r in graph.related(user, ITEM, claim["id"], limit=5)):
+            bad.append("「项目答辩」没连到答辩那条记忆")
+        if not any(("关于" in line or "相关" in line or "还记着" in line)
+                   for line in graph.context_lines(user, ITEM, mom["id"])):
+            bad.append("关联没换算成能进提示词的一句话")
+
+        if extract_persons("小姐姐你好，我小憩了一会儿") != []:
+            bad.append("抽人误伤了：小姐姐/小憩 不算新的人物")
+        if extract_persons("我妈生日是10月5日") != ["妈妈"]:
+            bad.append(f"「我妈」没归成「妈妈」：{extract_persons('我妈生日是10月5日')}")
+
+        before = graph.stats(user)["edges"]
+        graph.sync_all(store, mm, user)
+        after = graph.stats(user)["edges"]
+        if after != before:
+            bad.append(f"重复同步不幂等：边数 {before} → {after}")
+
+        # 热枢纽：所有事项都含"体检"时，它们不该互相连成一片
+        hot_store = CareStore(os.path.join(d, "hot.db"))
+        hot = CareGraph(os.path.join(d, "hot.db"))
+        ids = [hot_store.add_item(user, f"第{i}次体检", kind="health", source="manual")["id"]
+               for i in range(80)]
+        hot.sync_all(hot_store, None, user)
+        if hot.related(user, ITEM, ids[0], limit=3):
+            bad.append("80 条都含「体检」时仍然互相连出邻居（热枢纽没降权）")
+
+        # 用户抹掉的事不能从图里漏回来：删记忆（软删）和删事项都要断边
+        soft = mm.add_memory(user, "用户的妈妈爱看京剧", confidence=0.9)
+        graph.sync_all(store, mm, user)
+        if not any("京剧" in r["label"] for r in graph.related(user, ITEM, mom["id"], limit=5)):
+            bad.append("新加的记忆没进图")
+        mm.soft_delete_memory(user, soft.id)
+        graph.sync_all(store, mm, user)
+        if any("京剧" in r["label"] for r in graph.related(user, ITEM, mom["id"], limit=5)):
+            bad.append("记忆被用户删掉后还当邻居（等于 moz 替用户记得他已经抹掉的东西）")
+        store.delete_item(user, mom["id"])
+        graph.sync_all(store, mm, user)
+        if any(r["id"] == mom["id"] for r in graph.related(user, MEMORY, yanghua.id, limit=5)):
+            bad.append("删掉事项后它还被当成邻居（用户抹掉的事会从图里漏回来）")
+
+        # 清空 = 事项、记忆、关联一起没
+        gone = graph.clear_user(user)
+        if gone <= 0 or graph.stats(user)["edges"]:
+            bad.append(f"clear_user 没清干净关联（清了 {gone} 条，还剩 {graph.stats(user)['edges']}）")
+
+        # 到点提醒的候选要带上关联上下文，并且真的进了措辞提示词
+        today_noon = dt.datetime.now().replace(hour=13, minute=0, second=0, microsecond=0)
+        due = store.add_item(user, "妈妈生日", kind="birthday", repeat="yearly",
+                             due_at=today_noon.timestamp(), source="auto")
+        graph.sync_all(store, mm, user)
+        cands = E.collect(store, None, user, today_noon.timestamp() + 60, graph=graph)
+        mine = [c for c in cands if c.get("ref_id") == due["id"]]
+        if not mine:
+            bad.append(f"生日事项当天没进主动关心候选：{[c.get('title') for c in cands]}")
+        elif not mine[0].get("context"):
+            bad.append(f"候选没带关联上下文：{mine[0]}")
+        captured = {}
+
+        class FakeLLM:
+            def invoke(self, msgs):
+                captured["system"] = msgs[0].content
+                return types.SimpleNamespace(content="妈妈生日呀，她那几盆花最近怎么样？")
+
+        real_llm = E.get_llm_client
+        try:
+            E.get_llm_client = lambda **kw: FakeLLM()
+            said = E._polish(mine[0] if mine else {}, persona="")
+        finally:
+            E.get_llm_client = real_llm
+        if "养花" not in captured.get("system", ""):
+            bad.append("关联事实没进措辞提示词（模型压根看不到，等于白建图）")
+        elif "花" not in said:
+            bad.append(f"润色后的话没落回结果：{said!r}")
+    finally:
+        conn = getattr(mm._local, "conn", None) if mm is not None else None
+        if conn is not None:
+            conn.close()
+        shutil.rmtree(d, ignore_errors=True)
+    return "; ".join(bad[:3]) if bad else True
+
+
 def css_uses_dvh():
     """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。
 
@@ -1018,6 +1140,7 @@ def main():
     check("数据库不变量", db_invariants)
     check("记忆容量不悄悄删", capacity_policy_check)
     check("检索提速不改排序", keyword_parity_check)
+    check("事件关联成图", care_link_graph_check)
     check("探针清理器不错杀", probe_cleaner_works)
     check("天气源可用", weather_probe)
     check("头像字节流", avatar_probe)

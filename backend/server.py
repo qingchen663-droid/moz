@@ -43,6 +43,7 @@ from memory_consolidation import MemoryConsolidator
 from file_processor import is_multimodal_model
 from care_store import CareStore
 import care_engine
+import care_graph
 from conversation_store import ConversationStore
 
 # ================================================================
@@ -203,11 +204,15 @@ async def lifespan(app: FastAPI):
 
     # 主动关心心跳：只有后端常驻才有"时间流逝"，托盘和前端都只读队列
     _app_state["care_store"] = CareStore()
+    # 事件关联图：把"记下的事"和"记得的事实"用人/主题连起来，心跳顺带增量刷新
+    _app_state["care_graph"] = care_graph.CareGraph()
     care_task = asyncio.create_task(care_engine.care_loop(
         _app_state["care_store"],
         _app_state["working_memory_store"],
         DEFAULT_USER_ID,
         persona_getter=get_dialogue_prompt,
+        graph=_app_state["care_graph"],
+        memory_manager=_app_state["memory_manager"],
     ))
 
     logger.info("moz 后端服务已启动")
@@ -681,9 +686,13 @@ async def clear_memories(user_id: str):
     # 主动关心记下的事也在 moz.db 里；不清的话"全部清空"会留下生日和提醒
     care: Optional[CareStore] = _app_state.get("care_store")
     removed_care = care.clear_user(user_id) if care else 0
+    # 事项没了，它们之间的关联也必须跟着没，否则清空后还能从图里翻出旧事
+    links = _app_state.get("care_graph")
+    removed_links = links.clear_user(user_id) if links else 0
 
     logger.info("已清空用户 %s 的记忆/总结/工作记忆/档案卡/关心事项", user_id)
-    return {"ok": True, "summaries_removed": removed_summaries, "care_removed": removed_care}
+    return {"ok": True, "summaries_removed": removed_summaries, "care_removed": removed_care,
+            "links_removed": removed_links}
 
 # ================================================================
 # API: 用户档案卡
@@ -970,6 +979,7 @@ async def add_care_item(user_id: str, req: CareItemRequest):
                               due_at=req.due_at, repeat=req.repeat)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _sync_care_node(user_id, item)
     return {"ok": True, "item": item}
 
 
@@ -980,6 +990,7 @@ async def patch_care_item(user_id: str, item_id: str, req: CareItemPatch):
     item = store.update_item(user_id, item_id, req.dict(exclude_none=True))
     if not item:
         raise HTTPException(status_code=404, detail="事项不存在")
+    _sync_care_node(user_id, item)
     return {"ok": True, "item": item}
 
 
@@ -987,7 +998,52 @@ async def patch_care_item(user_id: str, item_id: str, req: CareItemPatch):
 async def remove_care_item(user_id: str, item_id: str):
     user_id = normalize_user_id(user_id)
     store: CareStore = _app_state["care_store"]
-    return {"ok": store.delete_item(user_id, item_id)}
+    deleted = store.delete_item(user_id, item_id)
+    link_graph = _app_state.get("care_graph")
+    if deleted and link_graph:
+        link_graph.forget(user_id, care_graph.ITEM, item_id)
+    return {"ok": deleted}
+
+
+def _sync_care_node(user_id: str, item: dict) -> None:
+    """手动录的事当场就该能连上：等心跳要最多一分钟，用户会觉得"我明明刚说过"。"""
+    link_graph = _app_state.get("care_graph")
+    if not link_graph:
+        return
+    try:
+        if item.get("status", "active") == "active":
+            link_graph.sync_item(user_id, item)
+        else:
+            link_graph.forget(user_id, care_graph.ITEM, item["id"])
+    except Exception as e:
+        logger.warning("[事件关联] 同步事项失败（不影响事项本身）: %s", e)
+
+
+@app.get("/api/care/related", dependencies=[Depends(verify_access_key)])
+async def list_care_related(user_id: str, type: str = Query("item"), id: str = Query(...),
+                            limit: int = Query(5, ge=1, le=20)):
+    """一件事的相关事/相关事实：前端"这件事还连着什么"就吃这个接口。"""
+    user_id = normalize_user_id(user_id)
+    link_graph = _app_state.get("care_graph")
+    if not link_graph:
+        return {"related": []}
+    return {"related": link_graph.related(user_id, type, id, limit=limit)}
+
+
+@app.get("/api/care/graph", dependencies=[Depends(verify_access_key)])
+async def get_care_graph(user_id: str):
+    """关联图快照（调试用）：枢纽、边、增量水位。"""
+    user_id = normalize_user_id(user_id)
+    link_graph: care_graph.CareGraph = _app_state["care_graph"]
+    return {"stats": link_graph.stats(user_id), **link_graph.describe(user_id)}
+
+
+@app.post("/api/care/graph/sync", dependencies=[Depends(verify_access_key)])
+async def sync_care_graph(user_id: str):
+    user_id = normalize_user_id(user_id)
+    link_graph: care_graph.CareGraph = _app_state["care_graph"]
+    return await asyncio.to_thread(
+        link_graph.sync_all, _app_state["care_store"], _app_state.get("memory_manager"), user_id)
 
 
 @app.get("/api/care/settings", dependencies=[Depends(verify_access_key)])
@@ -1034,9 +1090,14 @@ async def ack_proactive(user_id: str, req: CareAckRequest):
 async def dry_run_care(user_id: str):
     """演练：返回此刻够格说的第一句话，不写库、不打扰用户。"""
     user_id = normalize_user_id(user_id)
+    link_graph = _app_state.get("care_graph")
+    if link_graph:
+        # 先把关联补齐，演练才和真实心跳时说的一样
+        await asyncio.to_thread(link_graph.sync_all, _app_state["care_store"],
+                                _app_state.get("memory_manager"), user_id)
     out = care_engine.tick_once(
         _app_state["care_store"], _app_state.get("working_memory_store"), user_id,
-        dry_run=True, persona=get_dialogue_prompt(),
+        dry_run=True, persona=get_dialogue_prompt(), graph=link_graph,
     )
     return {"would_say": out, "budget_today": _app_state["care_store"].daily_budget(user_id)}
 
