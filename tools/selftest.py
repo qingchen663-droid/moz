@@ -34,6 +34,32 @@ DB = ROOT / "backend" / "moz.db"
 results = []
 
 
+def close_db_conn(obj) -> None:
+    """关掉自测临时库的 sqlite 连接——连接不关，Windows 上目录就删不掉（§7 第 18 条）。
+
+    `CareStore` / `CareGraph` / `SaveQueue` 有 `_conn()`；**MemoryManager 没有这个方法**，
+    它把连接挂在 `self._local` 上。以前凡是建 MemoryManager 的项都照着 CareStore 写
+    `m._conn().close()`，外面再套一层 `except Exception: pass`——于是连接其实一直没关过，
+    `shutil.rmtree` 在 Windows 上静默失败。第十四轮清点 `/tmp`：攒了 **95 个** `moz-*` 临时库
+    （`moz-selftest-graph-*` 44、`moz-selftest-chain-*` 34、`moz-turn-queue-*` 12 …），根因就是这个。
+    """
+    conn = None
+    getter = getattr(obj, "_conn", None)
+    if callable(getter):
+        try:
+            conn = getter()
+        except Exception:
+            conn = None
+    if conn is None:
+        conn = getattr(getattr(obj, "_local", None), "conn", None)
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 def check(name, fn, tier="fast"):
     """跑一项检查；返回 True/False/None(=warn)。"""
     t0 = time.time()
@@ -968,6 +994,7 @@ def keyword_parity_check():
         if any(i.id == ids[1] for i in joy):
             diffs.append("作废不彻底：改成 SAD 后仍被 HAPPY 过滤检索命中")
     finally:
+        close_db_conn(m)
         shutil.rmtree(d, ignore_errors=True)
 
     return "; ".join(diffs[:4]) if diffs else True
@@ -993,7 +1020,7 @@ def care_link_graph_check():
     bad = []
     d = tempfile.mkdtemp(prefix="moz-selftest-graph-")
     user = "__selftest_links__"
-    mm = None
+    mm = store = graph = hot_store = hot = None
     try:
         import memory_manager as MM
         store = CareStore(os.path.join(d, "moz.db"))
@@ -1088,9 +1115,8 @@ def care_link_graph_check():
         elif "花" not in said:
             bad.append(f"润色后的话没落回结果：{said!r}")
     finally:
-        conn = getattr(mm._local, "conn", None) if mm is not None else None
-        if conn is not None:
-            conn.close()
+        for obj in (store, graph, hot_store, hot, mm):
+            close_db_conn(obj)
         shutil.rmtree(d, ignore_errors=True)
     return "; ".join(bad[:3]) if bad else True
 
@@ -1114,6 +1140,7 @@ def care_chain_link_check():
     bad = []
     d = tempfile.mkdtemp(prefix="moz-selftest-chain-")
     user = "__selftest_chain__"
+    store = graph = solo = solo_graph = None
     try:
         store = CareStore(os.path.join(d, "c.db"))
         graph = CareGraph(os.path.join(d, "c.db"))
@@ -1218,6 +1245,8 @@ def care_chain_link_check():
         if any(c["kind"] == "chain" for c in E.collect(store, None, user, now)):
             bad.append("没接关联图时也会冒链候选（不该悄悄改变老行为）")
     finally:
+        for obj in (store, graph, solo, solo_graph):
+            close_db_conn(obj)
         shutil.rmtree(d, ignore_errors=True)
     return "; ".join(bad[:4]) if bad else True
 
@@ -1393,13 +1422,22 @@ def memory_quality_floor():
         m.extract_and_store_facts(u, "我家猫叫什么来着？几岁了？", "团子呀，五岁了",
                                   category=MM.MemoryCategory.FACT)
         added = [x.content for x in m._get_user_memories(u).values() if x.content not in stored]
-        if any(c.startswith("[对话摘要] 用户说：") for c in added):
-            bad.append(f"提问被记成了长期记忆：{[c for c in added if '用户说' in c]}")
-        if not any("AI回复要点" in c for c in added):
-            bad.append(f"AI 的回复一条没落，回落分支被改坏了：{added}")
-        ai = [x for x in m._get_user_memories(u).values() if "AI回复要点" in x.content]
-        if ai and ai[0].source_type != "ai_reply":
-            bad.append(f"AI 回复没单独标 source_type（{ai[0].source_type}），检索时降不了权")
+        if added:
+            # 这一条第十四轮改过口径：以前断言"AI 的回复必须落一条"，
+            # 实测那种回声占检索前 5 名 12/30、把真答案压到第 3，所以改成一句都不许落
+            bad.append(f"一问一答不该留下任何记忆（回答是她自己的话）：{added}")
+
+        m.extract_and_store_facts(u, "我最近在学做酸菜鱼", "先少放点辣椒，别辣到胃",
+                                  category=MM.MemoryCategory.FACT)
+        pair = [x for x in m._get_user_memories(u).values()
+                if x.content not in stored]
+        if not any(c.content.startswith("[对话摘要] 用户说：") for c in pair):
+            bad.append(f"陈述那句连用户的话都没落：{[c.content for c in pair]}")
+        echo = [x for x in pair if "AI回复要点" in x.content]
+        if not echo:
+            bad.append("陈述那句该成对落下她的要点（回落分支不能整个哑掉）")
+        elif echo[0].source_type != "ai_reply":
+            bad.append(f"AI 回复没单独标 source_type（{echo[0].source_type}），检索时降不了权")
 
         m.add_memory(u, "[关于用户] 我妈喜欢养花", category=MM.MemoryCategory.FACT)
         m.add_memory(u, "[对话摘要] AI回复要点：你喜欢养花呀", category=MM.MemoryCategory.FACT,
@@ -1417,6 +1455,7 @@ def memory_quality_floor():
         elif min(mine) <= max(others):
             bad.append(f"用户自己的事实没排在提问/AI回复之上：{scored}")
     finally:
+        close_db_conn(m)
         shutil.rmtree(d, ignore_errors=True)
 
     return "; ".join(bad) or True
@@ -1466,10 +1505,45 @@ def system_copy_not_memory():
         # 数字（3 句落几条）写在 RUNLOG 里；门禁约定只有 True 才算过（§7 第 15 条）
         return "; ".join(bad) or True
     finally:
-        try:
-            m._conn().close()
-        except Exception:
-            pass
+        close_db_conn(m)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def question_answer_not_memory():
+    """用户问一句、她答一句，那句回答不配单独占一条"关于用户的事实"。
+
+    第十四轮实测（临时库灌进上一轮沙箱那 11 条原文）：这种 `[对话摘要] AI回复要点：…`
+    占检索前 5 名的 12/30（库里只占 4/14），问「有什么吃的我不能吃来着」时
+    真答案被压到第 3，前两名是猫的玩笑和老郑那句。
+    """
+    import shutil
+    import tempfile
+
+    import memory_manager as MM
+
+    d = tempfile.mkdtemp(prefix="moz-selftest-echo-")
+    bad = []
+    try:
+        m = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "echo.db"))
+        m.embedding_service.get_embedding = lambda text: None
+        m._extract_facts = lambda *a, **k: []      # 快检门禁不许碰大模型
+        m.extract_and_store_facts("echoq", "我家猫叫什么来着？几岁了？",
+                                  "团子呀，五岁的橘猫～ 怎么，团子的名字都能忘？",
+                                  category=MM.MemoryCategory.FACT)
+        stored = [x.content for x in m._get_user_memories("echoq").values()]
+        if stored:
+            bad.append(f"一问一答存下 {len(stored)} 条：{stored}")
+
+        m.extract_and_store_facts("echos", "我最近在学做酸菜鱼", "先少放点辣椒，别辣到胃",
+                                  category=MM.MemoryCategory.FACT)
+        got = [x.content for x in m._get_user_memories("echos").values()]
+        if not any("酸菜鱼" in c for c in got):
+            bad.append(f"陈述那句连用户的话都没记下：{got}")
+        if not any("AI回复要点" in c for c in got):
+            bad.append(f"陈述那句该成对存（用户说 + 她的要点），实际：{got}")
+        return "; ".join(bad) or True
+    finally:
+        close_db_conn(m)
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -1991,6 +2065,7 @@ def main():
     check("落库队列重启不丢", save_queue_survives_restart)
     check("记忆质量底线", memory_quality_floor)
     check("系统文案不进长期记忆", system_copy_not_memory)
+    check("提问的回答不单独存成事实", question_answer_not_memory)
     check("事件关联成图", care_link_graph_check)
     check("事件先后链", care_chain_link_check)
     check("探针清理器不错杀", probe_cleaner_works)

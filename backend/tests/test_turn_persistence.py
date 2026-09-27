@@ -78,14 +78,17 @@ def test_successful_turn_registers_once(monkeypatch):
 def test_queue_accepts_empty_reply_but_not_empty_message():
     from save_queue import SaveQueue
 
-    # Windows：sqlite 连接是线程复用的，目录删不掉，只能尽力清（HANDOFF §7 第 18 条）
+    # Windows：sqlite 连接不关，目录就删不掉（HANDOFF §7 第 18 条）——第十四轮起真的关掉再删
     d = tempfile.mkdtemp(prefix="moz-turn-queue-")
+    q = None
     try:
         q = SaveQueue(os.path.join(d, "moz.db"))
         assert q.enqueue("u1", FACT, "") is not None, "moz 没答上来那一轮也要排队"
         assert q.enqueue("u1", "", "她自己说了一堆") is None, "用户什么都没说不占队列"
         assert q.pending_for("u1") == 1
     finally:
+        if q is not None:
+            q._conn().close()
         shutil.rmtree(d, ignore_errors=True)
 
 
