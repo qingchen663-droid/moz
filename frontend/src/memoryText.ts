@@ -32,7 +32,10 @@ export function humanMemory(content: string): { text: string; chip: string } {
   const tag = (raw.match(INTERNAL_TAG) || ['', ''])[1]
   const lead = (raw.replace(INTERNAL_TAG, '').match(LEAD_IN) || ['', ''])[1]
   let text = stripInternal(raw)
-  // [关于用户] 讲的就是正在看这一页的人，第三称的"用户"最不像人话
-  if (tag === '关于用户') text = text.replace(/^用户/, '你')
+  // [关于用户] 讲的就是正在看这一页的人，第三称的"用户"最不像人话；
+  // 而开头那个"我"是**用户**说的我（模型有时照抄原话），留着就读起来像她自己在挑食
+  if (tag === '关于用户') {
+    text = text.replace(/^我们/, '你们').replace(/^用户/, '你').replace(/^我/, '你')
+  }
   return { text, chip: LEAD_CHIPS[lead] || TAG_CHIPS[tag] || '' }
 }

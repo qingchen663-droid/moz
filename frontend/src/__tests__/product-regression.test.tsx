@@ -642,6 +642,7 @@ describe('「moz 记得什么」里的措辞', () => {
               row('m1', '[关于用户] 用户的妈妈喜欢养花'),
               row('m2', '[对话摘要] AI回复要点：团子呀，五岁的橘猫'),
               row('m3', '[对话摘要] 用户说：我下周三下午两点要去做项目答辩'),
+              row('m4', '[关于用户] 我讨厌吃香菜'),
             ],
           },
         })
@@ -653,12 +654,14 @@ describe('「moz 记得什么」里的措辞', () => {
       render(<MemoryViewerModal onClose={() => {}} />)
       await waitFor(() => expect(document.querySelector('.mem-viewer-tabs')).toBeTruthy())
       fireEvent.click(screen.getByText('记忆'))
-      await waitFor(() => expect(document.querySelectorAll('.mem-card').length).toBe(3))
+      await waitFor(() => expect(document.querySelectorAll('.mem-card').length).toBe(4))
       const body = document.body.textContent || ''
       expect(body).not.toContain('[关于用户]')
       expect(body).not.toContain('[对话摘要]')
       expect(body).not.toContain('AI回复要点：')
       expect(body).toContain('你的妈妈喜欢养花')   // 第三称的"用户"改成"你"
+      expect(body).toContain('你讨厌吃香菜')       // 第一人称的"我"也得改：那页是她的记忆
+      expect(body).not.toContain('我讨厌吃香菜')   // 否则读起来像她自己不吃香菜
       expect(body).toContain('她自己的话')
       expect(body).toContain('那次聊天里你说的')
     } finally {
