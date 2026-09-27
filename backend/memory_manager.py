@@ -22,7 +22,7 @@ import logging
 import sqlite3
 import threading
 import re
-from functools import wraps
+from functools import lru_cache, wraps
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
@@ -321,6 +321,11 @@ class EmbeddingService:
 
     _instance = None
     _client = None
+    # 失败冷却：这台机器上的向量服务是过期令牌，每次调用都要走完一次 401 才降级。
+    # 没有冷却的话，每轮对话要为"整库补向量"打三次注定失败的 HTTP，白付 300ms+。
+    _failure_cooldown = float(os.environ.get("MOZ_EMBED_FAILURE_COOLDOWN", "120"))
+    _disabled_until = 0.0
+    _last_failure_log = 0.0
 
     def __new__(cls):
         if cls._instance is None:
@@ -341,23 +346,40 @@ class EmbeddingService:
             logger.warning(f"[EmbeddingService] 初始化失败: {e}, 将降级到关键词匹配")
             self._client = None
 
+    def available(self) -> bool:
+        """向量服务当前是否值得再试一次（冷却期内直接走关键词）。"""
+        return self._client is not None and time.monotonic() >= self._disabled_until
+
+    def _note_failure(self, error: Exception) -> None:
+        now = time.monotonic()
+        self._disabled_until = now + self._failure_cooldown
+        if now - self._last_failure_log >= self._failure_cooldown:
+            self._last_failure_log = now
+            logger.warning(
+                "[EmbeddingService] 向量服务不可用，%.0f 秒内不再尝试（检索走关键词）：%s",
+                self._failure_cooldown, error,
+            )
+
     def get_embedding(self, text: str) -> Optional[List[float]]:
         """获取文本的语义向量。"""
-        if self._client is None:
+        if not self.available():
             return None
         try:
             resp = self._client.embeddings.create(
                 model=self._model,
                 input=text,
             )
+            self._disabled_until = 0.0
             return resp.data[0].embedding
         except Exception as e:
-            logger.warning(f"[EmbeddingService] 获取向量失败: {e}")
+            self._note_failure(e)
             return None
 
     def get_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         """批量获取文本的语义向量。"""
-        if self._client is None:
+        if not texts:
+            return []
+        if not self.available():
             return [None] * len(texts)
         try:
             resp = self._client.embeddings.create(
@@ -365,9 +387,10 @@ class EmbeddingService:
                 input=texts,
             )
             sorted_data = sorted(resp.data, key=lambda x: x.index)
+            self._disabled_until = 0.0
             return [d.embedding for d in sorted_data]
         except Exception as e:
-            logger.warning(f"[EmbeddingService] 批量获取向量失败: {e}")
+            self._note_failure(e)
             return [None] * len(texts)
 
     @staticmethod
@@ -655,6 +678,9 @@ class MemoryManager:
         self._dirty: set = set()
         # Search caches are process-local: persisted memories remain the source of truth.
         self._search_index_cache: Dict[str, Dict] = {}
+        self._keyword_index_cache: Dict[str, Dict] = {}
+        self._keyword_derived: Dict[str, Dict[str, tuple]] = {}
+        self._index_generation: Dict[str, int] = {}
         self._query_embedding_cache: Dict[str, Tuple[float, List[float]]] = {}
         self._query_embedding_cache_ttl = float(os.environ.get("MOZ_QUERY_EMBED_CACHE_TTL", "60"))
         self._query_embedding_cache_max = int(os.environ.get("MOZ_QUERY_EMBED_CACHE_SIZE", "128"))
@@ -682,6 +708,12 @@ class MemoryManager:
         """Initialize search-only state for lightweight test/factory instances."""
         if not hasattr(self, "_search_index_cache"):
             self._search_index_cache = {}
+        if not hasattr(self, "_keyword_index_cache"):
+            self._keyword_index_cache = {}
+        if not hasattr(self, "_keyword_derived"):
+            self._keyword_derived = {}
+        if not hasattr(self, "_index_generation"):
+            self._index_generation = {}
         if not hasattr(self, "_query_embedding_cache"):
             self._query_embedding_cache = {}
         if not hasattr(self, "_query_embedding_cache_ttl"):
@@ -996,7 +1028,8 @@ class MemoryManager:
         old_grade = memory.grade
         memory.grade = decision.new_grade
         memory.layer = decision.new_grade.legacy_layer
-        if memory.status == MemoryStatus.CANDIDATE and memory.grade >= MemoryGrade.REGULAR:
+        status_changed = memory.status == MemoryStatus.CANDIDATE and memory.grade >= MemoryGrade.REGULAR
+        if status_changed:
             memory.status = MemoryStatus.ACTIVE
         if decision.changed:
             memory.promotion_streak = 1 if decision.new_grade > old_grade else 0
@@ -1010,6 +1043,9 @@ class MemoryManager:
         memory.version += 1
         memory.updated_at = now
         self._dirty.add((user_id, memory_id))
+        if status_changed:
+            # 进入可检索集合了，缓存里的文档列表不再对
+            self._invalidate_search_cache(user_id)
         self._save_to_disk()
         self._record_grade_event(
             user_id,
@@ -1070,6 +1106,7 @@ class MemoryManager:
         memory.version += 1
         memory.updated_at = time.time()
         self._dirty.add((user_id, memory_id))
+        self._invalidate_search_cache(user_id)
         self._save_to_disk()
         self._record_grade_event(
             user_id,
@@ -1216,7 +1253,9 @@ class MemoryManager:
             semantic_elapsed += (time.perf_counter() - semantic_started) * 1000
             # 关键词检索
             keyword_started = time.perf_counter()
-            keyword_results = self._keyword_search_raw(user_memories, q, emotion_filter, min_importance)
+            keyword_results = self._keyword_search_raw(
+                user_memories, q, emotion_filter, min_importance, user_id=user_id,
+            )
             keyword_elapsed += (time.perf_counter() - keyword_started) * 1000
 
             # RRF: score = 1 / (k + rank + 1)
@@ -1270,53 +1309,73 @@ class MemoryManager:
 
         return selected
 
+    def _index_signature(self, user_id: str, user_memories: Dict[str, MemoryItem]) -> tuple:
+        """O(1) 的索引新鲜度标记：条数 + 写操作代数。任何改动记忆的地方都要 bump。"""
+        return (len(user_memories), self._index_generation.get(user_id, 0))
+
     def _build_search_index(self, user_id: str) -> tuple:
         """Build (or reuse cached) normalized embedding matrix for batch search.
-        
+
         Returns (ids_list, normalized_matrix). Matrix rows align with ids_list.
         Cache invalidated when any memory for this user is modified.
         """
         self._ensure_search_state()
         with self._state_lock:
             cached = self._search_index_cache.get(user_id)
+            # 锁内拷一份引用：矩阵在锁外遍历，别的线程正在写记忆就不会炸
             user_memories = dict(self._get_user_memories(user_id))
-        signature = tuple(sorted(
-            (m.id, m.status.value, id(m.embedding), len(m.embedding) if m.embedding is not None else 0)
-            for m in user_memories.values() if m.active() and m.embedding is not None
-        ))
-        if cached is not None and cached["signature"] == signature:
-            with self._state_lock:
+            signature = self._index_signature(user_id, user_memories)
+            if cached is not None and cached["signature"] == signature:
                 self._search_metrics["cache_hits"] += 1
-            return cached["ids"], cached["matrix"]
-        with self._state_lock:
+                return cached["ids"], cached["matrix"]
             self._search_metrics["cache_misses"] += 1
-        
+
         ids = []
         vectors = []
         for m in user_memories.values():
             if m.active() and m.embedding is not None:
                 ids.append(m.id)
                 vectors.append(m.embedding)
-        
+
         if not vectors:
-            with self._state_lock:
-                self._search_index_cache[user_id] = {"ids": [], "matrix": None, "signature": signature}
-            return [], None
-        
-        matrix = np.array(vectors, dtype=np.float32)
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        matrix /= norms
-        
+            matrix = None
+        else:
+            matrix = np.array(vectors, dtype=np.float32)
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            matrix /= norms
+
         with self._state_lock:
             self._search_index_cache[user_id] = {"ids": ids, "matrix": matrix, "signature": signature}
-        logger.debug("[SearchIndex] rebuilt for %s: %d vectors", user_id, len(ids))
+            logger.debug("[SearchIndex] rebuilt for %s: %d vectors", user_id, len(ids))
         return ids, matrix
 
     def _invalidate_search_cache(self, user_id: str):
+        """作废该用户的检索缓存。
+
+        语义矩阵整份丢掉；关键词索引只丢聚合（DF/文档列表要和新的记忆集合对齐），
+        每条记忆的派生数据留着接着用，所以下次检索只为新增的那几条分词。
+        """
         self._ensure_search_state()
         with self._state_lock:
             self._search_index_cache.pop(user_id, None)
+            self._keyword_index_cache.pop(user_id, None)
+            self._index_generation[user_id] = self._index_generation.get(user_id, 0) + 1
+            derived = self._keyword_derived.get(user_id)
+            if derived and len(derived) > 2 * max(len(self._get_user_memories(user_id)), 8):
+                # 删掉的记忆会留下没人用的派生数据，攒够了就整份重来
+                self._keyword_derived.pop(user_id, None)
+
+    @_synchronized
+    def get_keyword_index_stats(self) -> Dict:
+        """关键词索引缓存的快照（自测用来确认缓存真的建起来了、写操作能作废它）。"""
+        self._ensure_search_state()
+        return {
+            "users": sorted(self._keyword_index_cache),
+            "cached_docs": sum(len(d) for d in self._keyword_derived.values()),
+            "aggregates": sum(len(c["aggregates"]) for c in self._keyword_index_cache.values()),
+            "max_docs": self.KEYWORD_INDEX_MAX_DOCS,
+        }
 
     def _record_search_metrics(
         self,
@@ -1373,27 +1432,31 @@ class MemoryManager:
         query_embedding: Optional[List[float]] = None,
     ) -> List[Tuple[float, MemoryItem]]:
         """语义匹配检索（NumPy 批量矩阵运算，O(1) 矩阵乘替代 O(n) 循环）。"""
-        # 补算缺失 embedding
-        memories_without_embedding = [
-            m for m in user_memories.values()
-            if m.embedding is None and m.importance >= min_importance and m.active()
-        ]
-        if memories_without_embedding:
-            texts = [m.content for m in memories_without_embedding]
-            embeddings = self.embedding_service.get_embeddings_batch(texts)
-            backfilled = []
-            for m, emb in zip(memories_without_embedding, embeddings):
-                if emb is not None:
-                    m.embedding = emb
-                    backfilled.append(m)
-            if user_id and backfilled:
-                with self._state_lock:
-                    self._dirty.update((user_id, m.id) for m in backfilled)
-                    self._save_to_disk()
-
-        if memories_without_embedding:
-            if user_id:
-                self._invalidate_search_cache(user_id)
+        # 补算缺失 embedding：向量服务在冷却期就直接跳过，别为了"整库补向量"
+        # 反复打一个注定失败的接口（这台机器上这一步曾占掉每轮对话 300ms+）。
+        if self.embedding_service.available():
+            missing = [
+                m for m in user_memories.values()
+                if m.embedding is None and m.importance >= min_importance and m.active()
+            ]
+            if missing:
+                # 一次最多补一批，按重要性先补最值钱的：整库一把梭会在 5000 条时
+                # 发出一个 5000 条文本的请求，还没降级就先把自己卡住。
+                missing.sort(key=lambda m: m.importance, reverse=True)
+                batch = missing[:self.EMBED_BACKFILL_BATCH]
+                embeddings = self.embedding_service.get_embeddings_batch([m.content for m in batch])
+                backfilled = []
+                for m, emb in zip(batch, embeddings):
+                    if emb is not None:
+                        m.embedding = emb
+                        backfilled.append(m)
+                if backfilled:
+                    with self._state_lock:
+                        if user_id:
+                            self._dirty.update((user_id, m.id) for m in backfilled)
+                        self._save_to_disk()
+                    if user_id:
+                        self._invalidate_search_cache(user_id)
         ids, matrix = self._build_search_index(user_id) if user_id else self._build_search_index_from(user_memories)
         if matrix is None or len(ids) == 0:
             return []
@@ -1446,15 +1509,84 @@ class MemoryManager:
         matrix /= norms
         return ids, matrix
 
+    KEYWORD_INDEX_MAX_DOCS = int(os.environ.get("MOZ_KEYWORD_INDEX_MAX_DOCS", "20000"))
+    EMBED_BACKFILL_BATCH = int(os.environ.get("MOZ_EMBED_BACKFILL_BATCH", "64"))
+
     def _keyword_search_raw(
         self,
         user_memories: Dict[str, MemoryItem],
         query: str,
         emotion_filter: Optional[EmotionType],
         min_importance: float,
+        user_id: Optional[str] = None,
     ) -> List[Tuple[float, MemoryItem]]:
         """关键词匹配检索（无副作用），返回 (匹配分, MemoryItem) 列表。"""
-        documents = []
+        documents, df, total_docs, avgdl = self._keyword_index(
+            user_memories, emotion_filter, min_importance, user_id
+        )
+        if not documents:
+            return []
+
+        prepared = self._prepare_query(query)
+        query_tokens = prepared["tokens"]
+        k1, b = 1.2, 0.75
+        # idf 只跟语料和查询词表有关，跟具体某条记忆无关：先算好，别在几万条里重复 math.log
+        idf = {
+            token: math.log(1 + (total_docs - df.get(token, 0) + 0.5) / (df.get(token, 0) + 0.5))
+            for token in set(query_tokens)
+        }
+        score_denom = max(len(query_tokens), 1)
+        length_denom = max(avgdl, 1)
+        results = []
+        for memory, counts, dl, clean_content in documents:
+            bm25 = 0.0
+            for token in query_tokens:
+                tf = counts.get(token)
+                if tf is None:
+                    continue
+                bm25 += idf[token] * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / length_denom))
+            lexical = self._match_prepared(memory, prepared, clean_content)
+            score = lexical + min(0.4, bm25 / score_denom)
+            if score > 0:
+                results.append((score, memory))
+        results.sort(key=lambda x: x[0], reverse=True)
+        return results
+
+    def _keyword_index(
+        self,
+        user_memories: Dict[str, MemoryItem],
+        emotion_filter: Optional[EmotionType],
+        min_importance: float,
+        user_id: Optional[str],
+    ) -> tuple:
+        """取 (可打分的文档, DF 表, 文档数, 平均长度)。
+
+        分词、词频、清洗后的正文只跟语料有关、跟查询无关，所以每个用户缓存一份，
+        一次对话的三条改写查询共用；写操作会经 _invalidate_search_cache 作废聚合，
+        但"每条记忆的派生数据"留着接着用（正文是不可变字符串，靠对象身份兜底），
+        所以加一条记忆之后的首次检索只为新记忆分词。
+        超过 KEYWORD_INDEX_MAX_DOCS 条就不缓存：实测派生数据 ~4KB/条（词元字符串占大头），
+        5000 条约 20MB 很划算，20 万条就是 800MB——那已经不是这个应用会到的地方。
+        """
+        self._ensure_search_state()
+        key = (emotion_filter, min_importance)
+        cacheable = user_id is not None and len(user_memories) <= self.KEYWORD_INDEX_MAX_DOCS
+        derived: Optional[Dict[str, tuple]] = None
+        signature = None
+        if cacheable:
+            with self._state_lock:
+                signature = self._index_signature(user_id, user_memories)
+                cached = self._keyword_index_cache.get(user_id)
+                derived = self._keyword_derived.get(user_id)
+            if derived is None:
+                derived = {}
+            if cached is not None and cached["signature"] == signature:
+                aggregate = cached["aggregates"].get(key)
+                if aggregate is not None:
+                    return aggregate
+        documents: List[tuple] = []
+        df: Dict[str, int] = {}
+        total_len = 0
         for memory in user_memories.values():
             if memory.status != MemoryStatus.ACTIVE:
                 continue
@@ -1462,37 +1594,62 @@ class MemoryManager:
                 continue
             if emotion_filter and memory.emotion != emotion_filter:
                 continue
-            documents.append(memory)
-        if not documents:
-            return []
-
-        query_tokens = self._search_tokens(query)
-        doc_tokens = {memory.id: self._search_tokens(memory.content) for memory in documents}
-        df: Dict[str, int] = {}
-        for tokens in doc_tokens.values():
-            for token in set(tokens):
+            entry = None if derived is None else derived.get(memory.id)
+            if entry is None or entry[3] is not memory.content:
+                counts: Dict[str, int] = {}
+                for token in self._search_tokens(memory.content):
+                    counts[token] = counts.get(token, 0) + 1
+                entry = (
+                    counts,
+                    sum(counts.values()),
+                    "".join(c for c in memory.content.lower() if c.isalnum()),
+                    memory.content,
+                )
+                if derived is not None:
+                    derived[memory.id] = entry
+            counts, dl, clean_content, _ = entry
+            for token in counts:
                 df[token] = df.get(token, 0) + 1
-        avgdl = sum(len(tokens) for tokens in doc_tokens.values()) / max(len(documents), 1)
-        k1, b = 1.2, 0.75
-        results = []
-        for memory in documents:
-            tokens = doc_tokens[memory.id]
-            counts = {}
-            for token in tokens:
-                counts[token] = counts.get(token, 0) + 1
-            bm25 = 0.0
-            for token in query_tokens:
-                if token not in counts:
-                    continue
-                idf = math.log(1 + (len(documents) - df.get(token, 0) + 0.5) / (df.get(token, 0) + 0.5))
-                tf = counts[token]
-                bm25 += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * len(tokens) / max(avgdl, 1)))
-            lexical = self._match_score(memory, query)
-            score = lexical + min(0.4, bm25 / max(len(query_tokens), 1))
-            if score > 0:
-                results.append((score, memory))
-        results.sort(key=lambda x: x[0], reverse=True)
-        return results
+            total_len += dl
+            documents.append((memory, counts, dl, clean_content))
+        aggregate = (documents, df, len(documents), total_len / max(len(documents), 1))
+        if cacheable:
+            with self._state_lock:
+                self._keyword_derived[user_id] = derived
+                cached = self._keyword_index_cache.get(user_id)
+                if cached is None or cached["signature"] != signature:
+                    cached = {"signature": signature, "aggregates": {}}
+                    self._keyword_index_cache[user_id] = cached
+                cached["aggregates"][key] = aggregate
+        return aggregate
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _prepare_query(query: str) -> Dict:
+        """查询侧只需算一次的派生数据（原来每条记忆都要重切一遍子串）。
+
+        带缓存：同一个查询要给几万条记忆逐条打分，重算切片表就白付几万遍。
+        返回值按只读约定使用，别改里面的 list/set。
+        """
+        query_lower = (query or "").lower()
+        clean_query = "".join(c for c in query_lower if c.isalnum())
+        substrings = [
+            clean_query[i:i + word_len]
+            for word_len in range(2, min(5, len(clean_query) + 1))
+            for i in range(len(clean_query) - word_len + 1)
+        ]
+        return {
+            "lower": query_lower,
+            "clean_query": clean_query,
+            "substrings": substrings,
+            "query_words": MemoryManager._split_words(query_lower),
+            "tokens": MemoryManager._search_tokens(query),
+        }
+
+    @staticmethod
+    def _split_words(text_lower: str) -> set:
+        return set(text_lower.replace("，", " ").replace("。", " ")
+                   .replace("！", " ").replace("？", " ").split())
 
     @staticmethod
     def _search_tokens(text: str) -> List[str]:
@@ -1580,15 +1737,15 @@ class MemoryManager:
 
     def _match_score(self, memory: MemoryItem, query: str) -> float:
         """计算记忆与查询的匹配度。"""
-        query_lower = query.lower()
-        content_lower = memory.content.lower()
+        return self._match_prepared(memory, self._prepare_query(query),
+                                    "".join(c for c in memory.content.lower() if c.isalnum()))
 
-        # 中文字符级子串匹配（优先级最高）
-        # 移除空格和标点，逐字符匹配
-        clean_query = "".join(c for c in query_lower if c.isalnum())
-        clean_content = "".join(c for c in content_lower if c.isalnum())
+    @staticmethod
+    def _match_prepared(memory: MemoryItem, prepared: Dict, clean_content: str) -> float:
+        """同上，但复用查询侧派生数据和已清洗的正文（检索时每条记忆都要算一次）。"""
+        clean_query = prepared["clean_query"]
 
-        # 1. 查询中的连续关键词在内容中出现
+        # 1. 查询中的连续关键词在内容中出现（中文字符级子串匹配，优先级最高）
         if len(clean_query) >= 2 and clean_query in clean_content:
             return 0.8
         if len(clean_content) >= 2 and clean_content in clean_query:
@@ -1596,22 +1753,19 @@ class MemoryManager:
 
         # 2. 提取查询中的中文词（2-4字组合）进行匹配
         common_count = 0
-        for word_len in range(2, min(5, len(clean_query) + 1)):
-            for i in range(len(clean_query) - word_len + 1):
-                sub = clean_query[i:i+word_len]
-                if sub in clean_content:
-                    common_count += 1
+        for sub in prepared["substrings"]:
+            if sub in clean_content:
+                common_count += 1
 
         if common_count > 0:
             ratio = common_count / max(len(clean_query), 1)
             return ratio * (0.6 + memory.importance * 0.4)
 
         # 3. 英文词匹配（回退）
-        query_words = set(query_lower.replace("，", " ").replace("。", " ").replace("！", " ").replace("？", " ").split())
-        content_words = set(content_lower.replace("，", " ").replace("。", " ").replace("！", " ").replace("？", " ").split())
-        common = query_words & content_words
+        content_words = MemoryManager._split_words(memory.content.lower())
+        common = prepared["query_words"] & content_words
         if common:
-            union = query_words | content_words
+            union = prepared["query_words"] | content_words
             jaccard = len(common) / len(union)
             return jaccard * (0.6 + memory.importance * 0.4)
 
@@ -1624,6 +1778,7 @@ class MemoryManager:
             user_memories[memory_id].emotion = emotion
             user_memories[memory_id].emotion_intensity = intensity
             self._dirty.add((user_id, memory_id))
+            self._invalidate_search_cache(user_id)
             self._save_to_disk()
 
     @_synchronized
@@ -1636,6 +1791,7 @@ class MemoryManager:
             memory.last_accessed = time.time()
             memory.importance = min(1.0, memory.importance + 0.05)
             self._dirty.add((user_id, memory_id))
+            self._invalidate_search_cache(user_id)
             self._save_to_disk()
             return True
         return False
@@ -1662,13 +1818,15 @@ class MemoryManager:
 
         if to_archive:
             self._save_to_disk()
+        # 上面给每条记忆都乘了一遍遗忘曲线：importance 是检索过滤器的一部分，缓存作废
+        self._invalidate_search_cache(user_id)
         return to_archive
 
     # 活跃记忆上限。以前是 300：一个每天聊十几句的人几周就撞顶，
     # 之后最低分的旧记忆会被静默归档（界面上只表现为"长期记忆 · 300 条"不再涨），
     # 归档再堆到 600 条还会被物理删除——用户故事就这么悄悄没了。
-    # 实测检索代价是线性的（约 65µs/条/查询），5000 条时单次检索 ~0.3s、
-    # 线上那种 3 路查询 ~1s，相比模型回一句 25~35s 完全可忽略，所以放宽到 5000。
+    # 检索代价原本是线性的（~44µs/条/查询，缓存作废后每次重算）；关键词索引缓存
+    # 起来以后 5000 条一轮 3 路查询 ~0.11s，相比模型回一句 25~35s 完全可忽略，所以放宽到 5000。
     MAX_ACTIVE_MEMORIES = int(os.environ.get("MOZ_MAX_ACTIVE_MEMORIES", "5000"))
     # 巩固会同步调用模型（每次最多 5 个簇），触发点必须明显低于上限，也别低到天天触发
     CONSOLIDATION_TRIGGER = int(os.environ.get("MOZ_CONSOLIDATION_TRIGGER", "3000"))
@@ -1736,6 +1894,8 @@ class MemoryManager:
                 conn.commit()
                 logger.info("[自动维护] 删除 %d 条过期归档记忆, user=%s", len(to_delete), user_id)
 
+        self._invalidate_search_cache(user_id)
+
     @_synchronized
     def export_memories(self, user_id: str) -> List[Dict]:
         """Export all memories for a user as a list of dicts (no embeddings)."""
@@ -1772,6 +1932,7 @@ class MemoryManager:
             except Exception as e:
                 logger.warning("[导入] 跳过无效记忆: %s", e)
         if count:
+            self._invalidate_search_cache(user_id)
             self._save_to_disk()
         return count
 
@@ -1931,6 +2092,14 @@ class MemoryManager:
                     pass
         except sqlite3.OperationalError:
             pass
+        # 整批换掉了 MemoryItem 对象，任何检索缓存都不再对应
+        self._ensure_search_state()
+        with self._state_lock:
+            self._search_index_cache.clear()
+            self._keyword_index_cache.clear()
+            self._keyword_derived.clear()
+            for user_id in self.memories:
+                self._index_generation[user_id] = self._index_generation.get(user_id, 0) + 1
 
     @_synchronized
     def get_all_user_ids(self) -> List[str]:
@@ -1949,6 +2118,7 @@ class MemoryManager:
         conn = self._get_conn()
         conn.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
         conn.commit()
+        self._invalidate_search_cache(user_id)
 
     # ================================================================
     # 事实提取与存储

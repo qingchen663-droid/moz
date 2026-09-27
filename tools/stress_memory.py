@@ -31,6 +31,9 @@ if "--no-cap" in sys.argv:
     os.environ["MOZ_MAX_ACTIVE_MEMORIES"] = os.environ.get("MOZ_STRESS_CAP", "200000")
     os.environ["MOZ_CONSOLIDATION_TRIGGER"] = "99999999"
 
+# --real-embed：不给 embedding 打桩，量线上真实路径（含向量服务 401 与失败冷却）
+REAL_EMBED = "--real-embed" in sys.argv
+
 from memory_manager import MemoryCategory, MemoryManager  # noqa: E402
 
 # 自动维护会一条一条打 INFO 日志，会把表格冲掉
@@ -124,6 +127,9 @@ def questions(rng: random.Random, n: int = 12):
 
 def new_manager(dirpath: str) -> MemoryManager:
     m = MemoryManager(storage_path=dirpath, db_path=os.path.join(dirpath, "memory.db"))
+    if REAL_EMBED:
+        # 不打桩：量的就是线上真实路径（向量服务是过期令牌 → 看失败冷却省下多少）
+        return m
     # 这台机器 embedding 不可用：线上走的就是关键词那一路，打桩保持一致
     m.embedding_service.get_embedding = lambda text: None
     m.embedding_service.get_embeddings_batch = lambda texts: [None] * len(texts)
@@ -246,6 +252,11 @@ def run(levels, seed=7, prod_queries=3, sample=12, bulk=False):
         sys.stdout.flush()
 
     print(f"\n最后规模：{stored} 条记忆，库文件 {db.stat().st_size / 1048576:.1f} MB")
+    stage = manager.get_search_metrics()["avg_stage_ms"]
+    print("每次检索的阶段均值（ms，含 3 条改写）："
+          + "  ".join(f"{k}={v}" for k, v in stage.items() if k != "total")
+          + f"  合计={stage['total']}")
+    print(f"关键词索引：{manager.get_keyword_index_stats()}")
     print(f"沙箱留在 {tmp}（真实库全程没被写过；这个目录可以直接删）")
 
 
@@ -258,6 +269,9 @@ def main():
                     help="抬掉活跃上限，量检索本身的天花板")
     ap.add_argument("--bulk", action="store_true",
                     help="直接写库灌数据（绕开 add_memory 的写入开销），用来冲大库")
+    # 真正生效的地方在文件顶部（import memory_manager 之前），这里只是让 argparse 认它
+    ap.add_argument("--real-embed", action="store_true",
+                    help="不给 embedding 打桩：量线上真实路径（含向量服务失败冷却）")
     a = ap.parse_args()
     levels = [int(x) for x in re.split(r"[,\s]+", a.levels) if x.strip()]
     run(sorted(levels), seed=a.seed, bulk=a.bulk)

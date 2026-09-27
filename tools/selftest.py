@@ -14,6 +14,7 @@
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import re
 import sqlite3
@@ -581,6 +582,145 @@ def capacity_policy_check():
     return "; ".join(bad) or (soft[0] if soft else True)
 
 
+def keyword_parity_check():
+    """检索提速的红线：结果必须和"每次查询全库重算"的老写法逐条、逐分值一模一样。
+
+    老算法在这里重写一遍当标尺（含它自带的匹配分函数），因为排序走的是 RRF 名次，
+    末位浮点差都可能换掉用户看到的那 5 条记忆。顺带钉住两件事：
+    索引缓存真的建起来了，且改情感/改状态会让它作废。
+    """
+    import shutil
+    import tempfile
+
+    import memory_manager as MM
+
+    st = MM.MemoryManager._search_tokens
+
+    def ref_match(memory, query):
+        query_lower = query.lower()
+        content_lower = memory.content.lower()
+        clean_query = "".join(c for c in query_lower if c.isalnum())
+        clean_content = "".join(c for c in content_lower if c.isalnum())
+        if len(clean_query) >= 2 and clean_query in clean_content:
+            return 0.8
+        if len(clean_content) >= 2 and clean_content in clean_query:
+            return 0.8
+        common_count = 0
+        for word_len in range(2, min(5, len(clean_query) + 1)):
+            for i in range(len(clean_query) - word_len + 1):
+                if clean_query[i:i + word_len] in clean_content:
+                    common_count += 1
+        if common_count > 0:
+            return common_count / max(len(clean_query), 1) * (0.6 + memory.importance * 0.4)
+        qw = set(query_lower.replace("，", " ").replace("。", " ")
+                 .replace("！", " ").replace("？", " ").split())
+        cw = set(content_lower.replace("，", " ").replace("。", " ")
+                 .replace("！", " ").replace("？", " ").split())
+        common = qw & cw
+        if common:
+            return len(common) / len(qw | cw) * (0.6 + memory.importance * 0.4)
+        return 0.0
+
+    def ref_search(memories, query, emotion_filter, min_importance):
+        docs = [m for m in memories.values()
+                if m.status == MM.MemoryStatus.ACTIVE
+                and m.importance >= min_importance
+                and not (emotion_filter and m.emotion != emotion_filter)]
+        if not docs:
+            return []
+        query_tokens = st(query)
+        doc_tokens = {m.id: st(m.content) for m in docs}
+        df = {}
+        for tokens in doc_tokens.values():
+            for token in set(tokens):
+                df[token] = df.get(token, 0) + 1
+        avgdl = sum(len(t) for t in doc_tokens.values()) / max(len(docs), 1)
+        k1, b = 1.2, 0.75
+        out = []
+        for memory in docs:
+            tokens = doc_tokens[memory.id]
+            counts = {}
+            for token in tokens:
+                counts[token] = counts.get(token, 0) + 1
+            bm25 = 0.0
+            for token in query_tokens:
+                if token not in counts:
+                    continue
+                idf = math.log(1 + (len(docs) - df.get(token, 0) + 0.5) / (df.get(token, 0) + 0.5))
+                tf = counts[token]
+                bm25 += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * len(tokens) / max(avgdl, 1)))
+            score = ref_match(memory, query) + min(0.4, bm25 / max(len(query_tokens), 1))
+            if score > 0:
+                out.append((score, memory.id))
+        out.sort(key=lambda x: x[0], reverse=True)
+        return out
+
+    corpus = [
+        ("用户叫林清，住在杭州", None, 0.95),
+        ("用户最喜欢的花是紫鸢尾，谁都不能碰", MM.EmotionType.HAPPY, 0.8),
+        ("用户说妈妈下周三要做白内障手术", MM.EmotionType.ANXIOUS, 0.9),
+        ("User prefers dark roast coffee and hates small talk at meetings", None, 0.7),
+        ("那条没确认的传闻：可能换工作", None, 0.3),
+        ("！！", None, 0.6),
+        ("用户提过一次驾照换证，后来办了", None, 0.65),
+    ]
+    # 再垫一批：DF/平均长度/idf 只在语料大了以后才有区分度，排序差异也出在这里
+    bits = ["春天", "跑步", "咖啡", "代码", "周末", "妈妈", "手术", "钥匙", "雨伞", "夜班"]
+    for i in range(60):
+        corpus.append((f"用户说{bits[i % 10]}那件事和{i}有关，另外 {bits[(i * 3) % 10]} 他不喜欢",
+                       None if i % 4 else MM.EmotionType.SAD, 0.5 + (i % 5) / 10))
+    queries = ["用户叫什么名字", "紫鸢尾", "白内障手术什么时候", "coffee", "妈妈",
+               "！", "", "换工作", "用户提过一次驾照换证，后来办了", "dark roast coffee",
+               "春天和咖啡", "和3有关", "夜班 钥匙"]
+    filters = [(None, 0.0), (MM.EmotionType.HAPPY, 0.0), (None, 0.5), (None, 0.95)]
+
+    d = tempfile.mkdtemp()
+    diffs = []
+    try:
+        m = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "parity.db"))
+        m.embedding_service.get_embedding = lambda text: None
+        m.embedding_service.get_embeddings_batch = lambda texts: [None] * len(texts)
+        ids = []
+        for content, emotion, confidence in corpus:
+            kwargs = {"confidence": confidence}
+            if emotion:
+                kwargs["emotion"] = emotion
+            ids.append(m.add_memory("parity-user", content, **kwargs).id)
+        # 软删一条：状态变了但条数没变，只有正确的作废逻辑能看出来
+        m.soft_delete_memory("parity-user", ids[-1])
+        store = m._get_user_memories("parity-user")
+
+        for query in queries:
+            for emotion_filter, min_importance in filters:
+                want = ref_search(store, query, emotion_filter, min_importance)
+                got = [(score, memory.id) for score, memory in
+                       m._keyword_search_raw(store, query, emotion_filter, min_importance,
+                                             user_id="parity-user")]
+                if got != want:
+                    diffs.append(f"「{query}」filter={emotion_filter}/min={min_importance}："
+                                 f"{len(got)} 条 vs 老算法 {len(want)} 条")
+                    for a, b in zip(got, want):
+                        if a != b:
+                            diffs[-1] += f" 首个差异 {a} ≠ {b}"
+                            break
+
+        active_docs = sum(1 for x in store.values() if x.status == MM.MemoryStatus.ACTIVE)
+        stats = m.get_keyword_index_stats()
+        if stats["cached_docs"] < active_docs:
+            diffs.append(f"关键词索引没生效：cached_docs={stats['cached_docs']}/{active_docs}")
+        sig = m._keyword_index_cache["parity-user"]["signature"]
+        m.update_emotion("parity-user", ids[1], MM.EmotionType.SAD, 0.5)
+        if m._keyword_index_cache.get("parity-user", {}).get("signature") == sig:
+            diffs.append("改情感标签没作废索引缓存（用户改了情绪标注，检索还是旧结果）")
+        joy = m.search_memories("parity-user", "紫鸢尾", emotion_filter=MM.EmotionType.HAPPY)
+        if any(i.id == ids[1] for i in joy):
+            diffs.append("作废不彻底：改成 SAD 后仍被 HAPPY 过滤检索命中")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    return "; ".join(diffs[:4]) if diffs else True
+
+
 def css_uses_dvh():
     """PWA 窗口矮时输入框被顶掉：布局高度必须用 dvh，vh 含地址栏。
 
@@ -877,6 +1017,7 @@ def main():
     check("关心两开关独立", care_switch_logic)
     check("数据库不变量", db_invariants)
     check("记忆容量不悄悄删", capacity_policy_check)
+    check("检索提速不改排序", keyword_parity_check)
     check("探针清理器不错杀", probe_cleaner_works)
     check("天气源可用", weather_probe)
     check("头像字节流", avatar_probe)
