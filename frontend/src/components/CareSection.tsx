@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { api } from '../api'
-import type { CareItem, CareKind, CareSettings } from '../types'
+import type { CareEdge, CareItem, CareKind, CareRelatedNode, CareSettings } from '../types'
 import './CareSection.css'
 
 const KIND_LABELS: Record<CareKind, string> = {
@@ -30,10 +30,34 @@ function fromEpoch(sec: number): string {
   )}`
 }
 
+function viaNote(via: string): string {
+  if (via === 'together') return '同一句话记着'
+  const [kind, hub] = via.split(':')
+  if (kind === 'person') return `关于${hub}`
+  return `和「${hub}」有关`
+}
+
+/** 先后链：src 是晚发生的那件，dst 是早的那件。挂在事项后面显示给用户的就一句话。 */
+function chainNotes(items: CareItem[], edges: CareEdge[]): Record<string, string> {
+  const titles = new Map(items.map((i) => [i.id, i.title]))
+  const out: Record<string, string> = {}
+  for (const e of edges) {
+    if (e.rel !== 'after') continue
+    const days = Math.max(1, Math.round(e.offset_days || 0))
+    const later = titles.get(e.src_id) || e.label
+    const earlier = titles.get(e.dst_id)
+    if (earlier && !out[e.dst_id]) out[e.dst_id] = `${days} 天后 ${later} 有下文`
+    if (later && !out[e.src_id]) out[e.src_id] = `来自 ${earlier || '前面那件事'}之后`
+  }
+  return out
+}
+
 export default function CareSection() {
   const userId = useStore((s) => s.userId)
   const [settings, setSettings] = useState<CareSettings | null>(null)
   const [items, setItems] = useState<CareItem[]>([])
+  const [links, setLinks] = useState<Record<string, CareRelatedNode[]>>({})
+  const [chains, setChains] = useState<Record<string, string>>({})
   const [notice, setNotice] = useState('')
   const [dryRun, setDryRun] = useState('')
   const [busy, setBusy] = useState(false)
@@ -41,9 +65,20 @@ export default function CareSection() {
 
   const reload = useCallback(async () => {
     const [s, i] = await Promise.all([api.getCareSettings(userId), api.getCareItems(userId)])
+    const list = i?.items ?? []
     setSettings(s)
-    setItems(i?.items ?? [])
+    setItems(list)
     setLoadFailed(false)
+
+    const graph = await api.getCareGraph(userId).catch(() => null)
+    setChains(chainNotes(list, graph?.edges ?? []))
+    const pairs = await Promise.all(
+      list.slice(0, 24).map(async (it) => {
+        const res = await api.getCareRelated(userId, it.id).catch(() => ({ related: [] }))
+        return [it.id, res.related ?? []] as const
+      })
+    )
+    setLinks(Object.fromEntries(pairs))
   }, [userId])
 
   useEffect(() => {
@@ -227,6 +262,19 @@ export default function CareSection() {
                     {it.repeat === 'yearly' ? ' · 每年' : it.repeat === 'daily' ? ' · 每天' : ''}
                     {it.source === 'auto' ? ' · 自动记下' : ''}
                   </span>
+                  {(chains[it.id] || links[it.id]?.length) && (
+                    <span className="care-item-links">
+                      <span className="care-links-label">这件事还连着</span>
+                      {(links[it.id] ?? []).map((r) => (
+                        <em key={`${r.via}-${r.id}`} className="care-link-chip">
+                          {viaNote(r.via)} · {r.label}
+                        </em>
+                      ))}
+                      {chains[it.id] && (
+                        <em className="care-link-chip care-link-chip--chain">{chains[it.id]}</em>
+                      )}
+                    </span>
+                  )}
                 </div>
                 <button
                   className="care-item-del"

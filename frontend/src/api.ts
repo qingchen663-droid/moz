@@ -10,6 +10,8 @@ import type {
   MemoryDetailResponse,
   UserProfileResponse,
   CareItem,
+  CareRelatedNode,
+  CareEdge,
   CareSettings,
   ProactiveItem,
 } from './types'
@@ -249,8 +251,9 @@ export const api = {
     const res = await fetch(`${BASE}/avatar/${encodeURIComponent(userId)}`, {
       headers: buildHeaders({ Accept: 'image/*' }),
     })
-    if (res.status === 404) return null
     if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+    // 没设头像时后端回的是 {"avatar": null}，不是图片字节
+    if ((res.headers.get('content-type') || '').includes('application/json')) return null
     return res.blob()
   },
 
@@ -275,6 +278,15 @@ export const api = {
   // ── 主动关心 / 个人关心数据库 ─────────────────────────
   getCareItems(userId: string, status = 'active'): Promise<{ items: CareItem[] }> {
     return request(`/care/items?user_id=${encodeURIComponent(userId)}&status=${status}`)
+  },
+
+  getCareRelated(userId: string, itemId: string, limit = 3): Promise<{ related: CareRelatedNode[] }> {
+    const q = `user_id=${encodeURIComponent(userId)}&type=item&id=${encodeURIComponent(itemId)}&limit=${limit}`
+    return request(`/care/related?${q}`)
+  },
+
+  getCareGraph(userId: string): Promise<{ edges: CareEdge[]; hubs: Record<string, number> }> {
+    return request(`/care/graph?user_id=${encodeURIComponent(userId)}`)
   },
 
   deleteCareItem(userId: string, itemId: string): Promise<{ ok: boolean }> {

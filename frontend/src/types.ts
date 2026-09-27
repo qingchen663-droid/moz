@@ -65,6 +65,28 @@ export type CareKind = 'birthday' | 'event' | 'promise' | 'checkin' | 'health' |
 
 export type CareRepeat = 'none' | 'daily' | 'weekly' | 'yearly'
 
+export interface CareRelatedNode {
+  type: string
+  id: string
+  label: string
+  kind: string
+  via: string
+  score: number
+}
+
+export interface CareEdge {
+  src_type: string
+  src_id: string
+  rel: string
+  dst_type: string
+  dst_id: string
+  weight: number
+  label: string
+  kind: string
+  offset_days: number
+  source: string
+}
+
 export interface CareItem {
   id: string
   user_id: string
