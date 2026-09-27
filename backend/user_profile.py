@@ -278,6 +278,8 @@ def merge_profile_value(old: Any, new: Any) -> Any:
     （实测：连说三个爱好，档案卡里只剩最后一个；说两位家人，只剩一位）。
     标量仍然覆盖：改了名字、换了工作，新的才算。
     """
+    if isinstance(old, list) and not isinstance(new, list):
+        new = [new]          # 模型偶尔把数组字段回成单个值，那也算追加，不是替换整张表
     if isinstance(new, list):
         out = list(old) if isinstance(old, list) else ([] if old in (None, "", {}) else [old])
         for item in new:

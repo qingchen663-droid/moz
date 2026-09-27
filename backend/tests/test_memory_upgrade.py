@@ -359,9 +359,6 @@ class TestMigration:
             os.unlink(db_path)
 
 
-if __name__ == "__main__":
-    import pytest
-    pytest.main([__file__, "-v"])
 
 
 class TestProfileAccumulation:
@@ -415,3 +412,18 @@ class TestProfileAccumulation:
                 os.unlink(db_path)
             except PermissionError:
                 pass
+
+
+def test_scalar_back_into_a_list_field_appends():
+    """模型有时把 hobbies 回成单个字符串，那也算追加，不许把整张表换掉。"""
+    from user_profile import merge_profile_value
+
+    assert merge_profile_value(["编程", "旅行"], "钓鱼") == ["编程", "旅行", "钓鱼"]
+    assert merge_profile_value(["编程"], "编程") == ["编程"]
+
+
+
+
+if __name__ == "__main__":
+    import pytest
+    pytest.main([__file__, "-v"])
