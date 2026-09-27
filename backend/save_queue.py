@@ -69,9 +69,11 @@ class SaveQueue:
         emotion_type: Optional[str] = None,
         emotion_intensity: Optional[float] = None,
     ) -> Optional[int]:
-        """登记一轮落库；空回复/空消息不值得占用队列。"""
-        if not (user_message or "").strip() or not (reply or "").strip():
+        """登记一轮落库。只有用户那句话是空的才不占队列：
+        moz 没答上来（中转 500）那一轮，用户说过的话照样得记住。"""
+        if not (user_message or "").strip():
             return None
+        reply = (reply or "").strip()
         now = time.time()
         conn = self._conn()
         cur = conn.execute(

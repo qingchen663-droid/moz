@@ -482,6 +482,7 @@ async def chat(user_id: str, req: ChatRequest):
 
     async def event_stream():
         lock = _turn_lock(user_id)
+        errored = False     # 中转报错那一轮：记到该记的为止，最后不发 done
         if lock.locked():
             # 排队是常态（连点两次、托盘也发一条），别让界面看起来像卡死
             yield f"data: {json.dumps({'type': 'status', 'text': '上一条还在收尾，等一下'})}\n\n"
@@ -513,7 +514,9 @@ async def chat(user_id: str, req: ChatRequest):
                     yield f"data: {json.dumps({'type': 'reply', 'text': reply})}\n\n"
                 elif chunk_type == "error":
                     yield f"data: {json.dumps({'type': 'error', 'text': chunk.get('text', '')})}\n\n"
-                    return
+                    # 别在这里 return：中转挂了这一轮也算说过话，用户那句得留在对话记录里
+                    errored = True
+                    break
 
             store: ConversationStore = _app_state["conversation_store"]
             with store.locked(user_id):
@@ -534,7 +537,8 @@ async def chat(user_id: str, req: ChatRequest):
                     # 存缩略图，原始大图只用于这一轮请求：否则会话文件很快就几十 MB
                     user_msg["image"] = _thumbnail_data_url(req.image_data)
                 conv["messages"].append(user_msg)
-                conv["messages"].append({"role": "assistant", "content": reply})
+                if reply.strip():
+                    conv["messages"].append({"role": "assistant", "content": reply})
 
                 if len(conv["messages"]) > MAX_MESSAGES_PER_CONVERSATION:
                     conv["messages"] = conv["messages"][-MAX_MESSAGES_PER_CONVERSATION:]
@@ -546,6 +550,8 @@ async def chat(user_id: str, req: ChatRequest):
 
             if reply.strip():
                 care_engine.note_bot_reply(user_id)  # 用户接话快不快，从这里起算
+            if errored:
+                return   # 客户端已经收到 error，不再补 done，免得前端当成正常收工
             yield f"data: {json.dumps({'type': 'done', 'conversation_id': active_cid})}\n\n"
 
         except Exception as e:

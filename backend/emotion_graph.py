@@ -40,6 +40,7 @@ from working_memory import WorkingMemoryStore, update_working_memory
 import care_extractor
 from llm_errors import friendly_llm_error
 from summary_service import SummaryService
+from temporal_metadata import TemporalExtractor
 
 load_dotenv()
 
@@ -719,7 +720,8 @@ async def run_save_job(deps: SaveDeps, job: Dict) -> None:
 
     旧实现是四步串行，实测 3~7 分钟。这里四步并行，只保留一条真依赖：
     时间标签靠"刚创建 10 秒内"认领记忆，所以必须紧跟在长期记忆之后、且不能并行。
-    每步各自吞异常（与旧行为一致）——否则整轮重试会把已存好的记忆存成重复条目。
+    部分步骤失败就吞掉（重跑会把已存好的记忆存成重复条目），
+    但四步全挂必须抛回去让队列重试——那等于这一轮什么都没落下。
     """
     import asyncio
 
@@ -787,14 +789,21 @@ async def run_save_job(deps: SaveDeps, job: Dict) -> None:
         ("档案卡更新", deps.profile_manager, _profile_card),
         ("关心抽取", deps.care_store, _care_harvest),
     ]
-    coros = [fn() for label, manager, fn in steps if manager]
-    if not coros:
+    live = [(label, fn) for label, manager, fn in steps if manager]
+    if not live:
         return
     t0 = time.time()
-    outcomes = await asyncio.gather(*coros, return_exceptions=True)
-    for (label, manager, _fn), outcome in zip(steps, outcomes):
-        if isinstance(outcome, BaseException) and manager:
+    outcomes = await asyncio.gather(*[fn() for _label, fn in live], return_exceptions=True)
+    failed = 0
+    for (label, _fn), outcome in zip(live, outcomes):
+        if isinstance(outcome, BaseException):
+            failed += 1
             logger.warning(f"[{label}] 失败: {outcome}")
+    if failed == len(live):
+        # 全挂等于这一轮什么都没落下（中转整条 500 时最常见）。
+        # 认 done 就是"聊完白聊"，退回队列让它重试；只有一部分挂掉时仍不重跑，
+        # 免得把已经存好的记忆存成重复条目。
+        raise RuntimeError(f"这一轮 {failed} 步全失败，退回队列重试")
     logger.info("🧠 [后台落库] 四步并行完成，耗时 %.1fs", time.time() - t0)
 
 
@@ -846,6 +855,30 @@ def run_emotion_workflow_streaming(
         "workflow_log": [],
     }
 
+    state: Dict = dict(initial_state)
+    registered = [False]
+
+    def _register_turn(reply_text: str) -> None:
+        """把这一轮登记进持久化队列。moz 没接上话也算一轮——用户说过的话
+        不该跟着中转一起消失（实测一轮 6 句里丢了 2 句，那两句里的"老郑""滨江车管所"就没记住）。
+        报错那轮传空串：半截回复不该被当成"她说过的事实"存进长期记忆。"""
+        if save_queue is None or registered[0]:
+            return
+        registered[0] = True
+        emotion_analysis = state.get("emotion_analysis") or {}
+        try:
+            if save_queue.enqueue(
+                user_id=state.get("user_id", "default"),
+                user_message=state.get("user_message", ""),
+                reply=reply_text,
+                conversation_id=state.get("conversation_id"),
+                emotion_type=str(emotion_analysis.get("current_emotion") or ""),
+                emotion_intensity=emotion_analysis.get("emotion_intensity"),
+            ) and save_worker is not None:
+                save_worker.submit()
+        except Exception as e:
+            logger.warning(f"[落库队列] 本轮登记失败: {e}")
+
     async def _stream():
         try:
             yield {'type': 'status', 'text': 'moz 正在感受你的情绪并回忆...'}
@@ -854,7 +887,8 @@ def run_emotion_workflow_streaming(
                 asyncio.to_thread(emotion_analysis_node, initial_state),
                 asyncio.to_thread(_run_memory_retrieval, initial_state, memory_manager, working_memory_store),
             )
-            state = {**initial_state, **emotion_result, **memory_result}
+            state.update(emotion_result)
+            state.update(memory_result)
 
             yield {'type': 'status', 'text': 'moz 正在组织语言...'}
 
@@ -896,28 +930,18 @@ def run_emotion_workflow_streaming(
             yield {'type': 'reply', 'text': reply}
 
             # 这一轮要记的东西先落进持久化队列：后端重启也丢不掉
-            emotion_analysis = state.get("emotion_analysis") or {}
-            try:
-                if save_queue.enqueue(
-                    user_id=state.get("user_id", "default"),
-                    user_message=state.get("user_message", ""),
-                    reply=reply,
-                    conversation_id=state.get("conversation_id"),
-                    emotion_type=str(emotion_analysis.get("current_emotion") or ""),
-                    emotion_intensity=emotion_analysis.get("emotion_intensity"),
-                ):
-                    save_worker.submit()
-            except Exception as e:
-                logger.warning(f"[落库队列] 本轮登记失败: {e}")
+            _register_turn(reply)
 
             total_time = time.time() - (state.get("workflow_start_time") or time.time())
             logger.info(f"📊 流式工作流完成 (总耗时: {total_time:.2f}s)")
 
         except asyncio.TimeoutError:
             logger.error("流式工作流超时")
+            _register_turn("")      # 她没答上来，但用户那句话还是得记住
             yield {'type': 'error', 'text': friendly_llm_error(TimeoutError(), bool(state.get("image_data")))}
         except Exception as e:
             logger.error(f"流式工作流失败: {e}", exc_info=True)
+            _register_turn("")
             yield {'type': 'error', 'text': friendly_llm_error(e, bool(state.get("image_data")))}
 
     return _stream()
