@@ -223,3 +223,40 @@ class TestLogsEndpoint:
     def test_create_user_rejects_invalid_id(self, client):
         response = client.post("/api/users", params={"user_id": "bad user"})
         assert response.status_code == 400
+
+
+class TestProfileRoundTrip:
+    """档案卡那条 PUT 从第十三轮起被前端真用上了（点 × 划掉一条 → 回写整段）。
+
+    vitest 只能钉住前端发出的请求体，这里钉住服务端真的按段合并：
+    只发 preferences 不许把 identity 清空——整段替换是 PUT 的语义，别记错。
+    """
+
+    def test_put_one_section_keeps_the_others(self, app, client, tmp_path):
+        from server import _app_state
+        from user_profile import ProfileManager, UserProfile
+
+        pm = ProfileManager(str(tmp_path / "profiles.db"))
+        pm.save_profile(UserProfile(
+            user_id="test_user",
+            identity={"name": "小明", "occupation": "程序员"},
+            preferences={"hobbies": ["编程", "旅行"], "food": ["美式"]},
+        ))
+        keep = _app_state.get("profile_manager")
+        _app_state["profile_manager"] = pm
+        try:
+            # 这就是"划掉旅行"之后 api.updateProfile 发出去的东西
+            r = client.put("/api/profile/test_user",
+                           json={"preferences": {"hobbies": ["编程"], "food": ["美式"]}})
+            assert r.status_code == 200, r.text
+            got = client.get("/api/profile/test_user").json()["profile"]
+            assert got["preferences"]["hobbies"] == ["编程"]
+            assert got["identity"]["name"] == "小明", "只回写一段不该牵连别段"
+            assert "编程" in client.get("/api/profile/test_user").json()["prompt_context"]
+            assert client.put("/api/profile/test_user", json={"hacked": {}}).status_code == 400
+            # 划到空：前端会删掉那个键，整段清空也走得通
+            assert client.put("/api/profile/test_user", json={"preferences": {}}).status_code == 200
+            assert client.get("/api/profile/test_user").json()["profile"]["preferences"] == {}
+        finally:
+            _app_state["profile_manager"] = keep
+            pm.close()

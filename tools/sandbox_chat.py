@@ -381,6 +381,10 @@ def main():
               f"\n这个数{verdict}")
 
         print("\n== 它到底存成了什么 ==")
+        prof = api(port, f"/profile/{user}").get("profile") or {}
+        for section, values in prof.items():
+            if values:
+                print(f"  [档案:{section}] {json.dumps(values, ensure_ascii=False)[:150]}")
         detail = api(port, f"/memory/{user}/detail")
         for layer, items in (detail.get("layers") or {}).items():
             for m in items[:40]:
