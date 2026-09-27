@@ -156,9 +156,24 @@ export default function MemoryViewerModal({ onClose }: Props) {
     return haystack.includes(keyword)
   })
 
-  /** 档案卡上的"这条不对，划掉"。后端 PUT 是整段替换，所以删一条要回写一整段。 */
+  /** 让用户在确认框里看到"要划掉的是哪一条"，而不是一个键名 */
+  const describeDrop = (section: string, key: string, index: number): string => {
+    const raw = (profile as any)?.[section]?.[key]
+    const item = index < 0 ? raw : (Array.isArray(raw) ? raw[index] : raw)
+    if (item && typeof item === 'object') {
+      const bits = ['name', 'relation', 'title', 'topic', 'description', 'detail']
+        .map((k) => (item[k] || '').toString().trim())
+        .filter(Boolean)
+      return bits.join(' · ') || key
+    }
+    return String(item ?? key)
+  }
+
   const dropProfileEntry = async (section: string, key: string, index = -1) => {
     if (!profile) return
+    // 后端 PUT 是整段替换、没有撤销，所以手滑一下就真没了——和「忘掉」那条一样先问一句
+    const what = describeDrop(section, key, index)
+    if (!window.confirm(`划掉这条？\n\n「${what}」\n划掉了就没了，想让她重新记，直接在对话里说一句“你记错了，……”`)) return
     const bucket: Record<string, any> = { ...(profile as any)[section] }
     if (index < 0) {
       delete bucket[key]

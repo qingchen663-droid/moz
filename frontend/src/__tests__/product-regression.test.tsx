@@ -694,8 +694,34 @@ describe('档案卡上能把记错的划掉', () => {
     }) as typeof fetch
     render(<MemoryViewerModal onClose={() => {}} />)
     await waitFor(() => expect(document.querySelectorAll('.mem-tag-x').length).toBeGreaterThan(0))
-    return { puts, cleanupFetch: () => (globalThis.fetch = base) }
+    // 划掉有确认框（jsdom 里 window.confirm 默认返回 undefined = 取消），测试里默认答"确定"
+    const spy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    return {
+      puts,
+      cleanupFetch: () => {
+        spy.mockRestore()
+        globalThis.fetch = base
+      },
+    }
   }
+
+  it('划掉之前先问一句，取消就一条请求都不发（PUT 是整段替换、没有撤销）', async () => {
+    const { puts, cleanupFetch } = await openProfile()
+    let asked = ''
+    const spy = vi.spyOn(window, 'confirm').mockImplementation((m) => {
+      asked = String(m)
+      return false
+    })
+    const hobby = [...document.querySelectorAll('.mem-pref-tag')].filter((e) =>
+      e.textContent?.includes('旅行')
+    )[0].querySelector('.mem-tag-x')!
+    fireEvent.click(hobby)
+    expect(puts).toHaveLength(0)
+    expect(asked).toContain('旅行')          // 确认框里得看清划掉的是哪一条
+    expect(document.body.textContent).toContain('旅行')
+    spy.mockRestore()
+    cleanupFetch()
+  })
 
   it('后端早就有 PUT /api/profile，本轮第一次把它接上', async () => {
     const { puts, cleanupFetch } = await openProfile()
