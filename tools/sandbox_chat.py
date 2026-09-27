@@ -18,6 +18,7 @@
 """
 
 import json
+import http.client
 import os
 import shutil
 import socket
@@ -76,30 +77,38 @@ def api(port, path, method="GET", body=None, timeout=120):
 
 
 def chat(port, user, text, timeout=200):
-    """走真实 /api/chat 的 SSE，取回完整回复文本。"""
+    """走真实 /api/chat 的 SSE，取回完整回复文本。
+
+    连接被中途掐断（第十三轮实测：第 4 句流到一半 socket 断了）不算崩溃：
+    统一折算成「«错误：…»」那种回复，交给上层当"没回话"处理并重试一次。
+    """
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/chat/{user}",
         data=json.dumps({"message": text, "conversation_history": []}).encode(),
         method="POST", headers={"Content-Type": "application/json"},
     )
     out, reply = [], ""
-    with urllib.request.urlopen(req, timeout=timeout) as res:
-        for raw in res:
-            line = raw.decode("utf-8", "ignore").strip()
-            if not line.startswith("data: "):
-                continue
-            try:
-                ev = json.loads(line[6:])
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "token":
-                out.append(ev.get("text", ""))
-            elif ev.get("type") == "reply":
-                reply = ev.get("text") or reply
-            elif ev.get("type") == "error":
-                return "«错误：" + str(ev.get("text")) + "»"
-            elif ev.get("type") == "done":
-                break
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            for raw in res:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    ev = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") == "token":
+                    out.append(ev.get("text", ""))
+                elif ev.get("type") == "reply":
+                    reply = ev.get("text") or reply
+                elif ev.get("type") == "error":
+                    return "«错误：" + str(ev.get("text")) + "»"
+                elif ev.get("type") == "done":
+                    break
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+        got = (reply or "".join(out)).strip()
+        return f"«错误：连接中途断了（{type(e).__name__}），已收到 {len(got)} 个字»"
     return (reply or "".join(out)).strip()
 
 
