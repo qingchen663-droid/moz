@@ -1834,6 +1834,121 @@ def followup_not_a_prompt():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def first_token_path_clear():
+    """首字路径上不许有上游往返（docs/情感预热系统设计.md 的唯一硬指标）。
+
+    真中转今天既可能 4 秒也可能 125 秒不吐字，靠它量延迟会得出随机结论；
+    这里全部打桩，钉的是**结构**：普通句子根本不调情感模型、也不调"记忆摘要"，
+    敏感句子才调一次，而且超时就先开口。
+    """
+    import asyncio
+    import shutil
+    import tempfile
+    from types import SimpleNamespace
+
+    import emotion_graph as EG
+    import memory_manager as MM
+
+    bad = []
+    calls = {"emotion_node": 0, "invoke": 0, "stream": 0}
+    fake_node_original = EG.emotion_analysis_node
+    real_get_client = EG.get_chat_client
+
+    class FakeResponse:
+        def __init__(self, text):
+            self.content = text
+
+    class FakeClient:
+        def __init__(self, sleep):
+            self._sleep = sleep
+
+        def invoke(self, messages):
+            calls["invoke"] += 1
+            time.sleep(self._sleep)
+            return FakeResponse('{"memory_context": "- x", "memory_summary": "y"}')
+
+        def stream(self, messages):
+            calls["stream"] += 1
+            # 生产里 langchain 吐的是带 .content 的 chunk，打桩必须照这个形状来
+            return iter([SimpleNamespace(content=t) for t in ("嗯", "，", "我在")])
+
+    def fake_node(state):
+        calls["emotion_node"] += 1
+        time.sleep(0.05)
+        return {
+            "emotion_analysis": {"current_emotion": "anxious", "emotion_intensity": 0.8,
+                                 "emotion_change": "首次", "emotion_summary": "模型给的档"},
+            "emotion_summary": "模型给的档", "workflow_log": []}
+
+    d = tempfile.mkdtemp()
+    try:
+        mm = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "q.db"))
+        mm.embedding_service.get_embedding = lambda text: None
+        mm.embedding_service.get_embeddings_batch = lambda texts: [None] * len(texts)
+        for text in ["用户习惯周六早上去滨江那家馆子", "用户的妈妈喜欢养花",
+                     "用户的项目在总部三楼评审", "用户讨厌吃香菜"]:
+            mm.add_memory("path-user", text, category=MM.MemoryCategory.FACT)
+
+        EG.emotion_analysis_node = fake_node
+        EG.get_chat_client = lambda **kw: FakeClient(0.0)
+        # 查询改写走的是 llm_config 的客户端，上面的打桩盖不住它 —— 不打掉的话
+        # 这条快检会真打一次中转（铁律：快检不许碰大模型）
+        real_rewrite = EG.rewrite_query
+        EG.rewrite_query = lambda q: [q]
+
+        async def collect(message, wait_cap):
+            EG.SENSITIVE_WAIT_SECONDS = wait_cap
+            events, t0 = [], time.time()
+            gen = EG.run_emotion_workflow_streaming(
+                memory_manager=mm, user_id="path-user", user_message=message,
+                conversation_history=[], conversation_id="c1")
+            async for ev in gen:
+                events.append((round(time.time() - t0, 2), ev.get("type"), ev.get("text", "")[:12]))
+            return events
+
+        # ① 普通句子：一次情感模型调用都不该有，也不该有"记忆摘要"那次 invoke
+        calls.update({"emotion_node": 0, "invoke": 0, "stream": 0})
+        ev1 = asyncio.run(collect("我今天加班到十点才回家，好累", 1.0))
+        if calls["emotion_node"]:
+            bad.append(f"普通句子仍然调了情感模型 {calls['emotion_node']} 次")
+        if calls["invoke"]:
+            bad.append(f"首字之前还有 {calls['invoke']} 次同步模型往返（记忆摘要没摘干净）")
+        first_token_at = next((t for t, k, _ in ev1 if k == "token"), None)
+        if first_token_at is None:
+            bad.append("一个 token 都没收到")
+        elif first_token_at > 3.0:
+            bad.append(f"普通句子首字要 {first_token_at}s，路径上还有别的东西在等")
+        if not any(k == "reply" for _t, k, _x in ev1):
+            bad.append("普通句子没走完 reply 事件")
+
+        # ② 敏感句子：允许等一次（用户拍板），但必须有上限——打桩成绝不回话
+        calls.update({"emotion_node": 0, "invoke": 0, "stream": 0})
+        EG.emotion_analysis_node = lambda state: (time.sleep(3.0), fake_node(state))[1]
+        ev2 = asyncio.run(collect("我妈下周要去医院做复查，我有点担心", 0.6))
+        waited = next((t for t, k, _ in ev2 if k == "token"), None)
+        if not calls["emotion_node"]:
+            bad.append("敏感句子没有等模型（用户要的是这类等一次）")
+        if waited is None:
+            bad.append("敏感句子超时后没开口，等于把等变成卡死")
+        elif waited > 3.0:
+            bad.append(f"敏感句子等了 {waited}s 才开口，45 秒那种上限没起作用")
+
+        # ③ 规则档要能读：内部键名不许漏进给她看的那句话
+        from emotion_state import live_signal
+        sig = live_signal("中午和同事吵了一架，有点堵")
+        if not sig["sensitive"] or "conflict" in sig["emotion_summary"]:
+            bad.append(f"敏感判档或措辞不对：{sig}")
+        if "stressed" in live_signal("今天加班到十点，好累")["emotion_summary"]:
+            bad.append("英文标签漏进了中文措辞里")
+    finally:
+        EG.emotion_analysis_node = fake_node_original
+        EG.get_chat_client = real_get_client
+        EG.rewrite_query = real_rewrite
+        shutil.rmtree(d, ignore_errors=True)
+
+    return "; ".join(bad) or True
+
+
 def frontend_no_junk():
     """孤儿样式/备份文件：曾经因为弹窗样式只在 ModelDialog.new.css 里而整块裸奔。"""
     comp = ROOT / "frontend" / "src" / "components"
@@ -2143,6 +2258,7 @@ def main():
     check("检索提速不改排序", keyword_parity_check)
     check("落库队列重启不丢", save_queue_survives_restart)
     check("记忆质量底线", memory_quality_floor)
+    check("首字路径没有上游往返", first_token_path_clear)
     check("系统文案不进长期记忆", system_copy_not_memory)
     check("提问的回答不单独存成事实", question_answer_not_memory)
     check("同一句话不存两条重复事实", same_turn_no_duplicate_facts)

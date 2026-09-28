@@ -38,6 +38,7 @@ from langgraph.graph import StateGraph, END
 from memory_manager import MemoryManager, MemoryCategory, EmotionAnalyzer, EmotionType, rewrite_query
 from working_memory import WorkingMemoryStore, update_working_memory
 import care_extractor
+import emotion_state
 from llm_errors import friendly_llm_error
 from summary_service import SummaryService
 from temporal_metadata import TemporalExtractor
@@ -55,6 +56,11 @@ logger = logging.getLogger(__name__)
 # ================================================================
 # LLM 客户端
 # ================================================================
+
+# 敏感主题值得多等一次模型（用户 2026-09-28 决定"等"），但"等"必须有上限：
+# 实测那次调用 27.8~90.8 秒，不设上限就等于把"贴"换成"卡死"。
+SENSITIVE_WAIT_SECONDS = float(os.environ.get("MOZ_SENSITIVE_WAIT_SECONDS", "45"))
+
 
 def get_chat_client(temperature: float = 0.7, top_p: float = None, use_thinking: bool = True):
     """
@@ -881,19 +887,39 @@ def run_emotion_workflow_streaming(
 
     async def _stream():
         try:
-            yield {'type': 'status', 'text': 'moz 正在感受你的情绪并回忆...'}
+            # L0 先判档（毫秒级）：那一次情感模型调用要 27.8~90.8 秒，而生成本身只 4~8 秒，
+            # 把它留在首字路径上等于让用户白等（2026-09-28 沙箱实测，见 docs/情感预热系统设计.md）。
+            live = emotion_state.live_signal(user_message)
+            state["emotion_analysis"] = live
+            state["emotion_summary"] = live["emotion_summary"]
 
-            emotion_result, memory_result = await asyncio.gather(
-                asyncio.to_thread(emotion_analysis_node, initial_state),
-                asyncio.to_thread(_run_memory_retrieval, initial_state, memory_manager, working_memory_store),
-            )
-            state.update(emotion_result)
-            state.update(memory_result)
+            retrieval_task = asyncio.create_task(asyncio.to_thread(
+                _run_memory_retrieval, initial_state, memory_manager, working_memory_store))
+
+            if emotion_state.worth_waiting(live):
+                # 用户 2026-09-28 拍板：医院/忌日/起冲突/落榜/马上答辩这几类，本轮值得等一次模型。
+                # 但等要有上限——超时就先带着 L0 开口，别把"贴"变成"卡死"。
+                yield {'type': 'status', 'text': '这事我认真想一想再说…'}
+                try:
+                    corrected = await asyncio.wait_for(
+                        asyncio.to_thread(emotion_analysis_node, dict(initial_state)),
+                        timeout=SENSITIVE_WAIT_SECONDS)
+                    if corrected.get("emotion_summary"):
+                        state.update(corrected)
+                except asyncio.TimeoutError:
+                    logger.info("[情感] 敏感主题等了 %.0fs 没等到，先用规则档开口", SENSITIVE_WAIT_SECONDS)
+                except Exception as e:
+                    logger.warning("[情感] 敏感主题校正失败，先用规则档开口: %s", e)
+            else:
+                yield {'type': 'status', 'text': 'moz 正在回忆…'}
+
+            state.update(await retrieval_task)
 
             yield {'type': 'status', 'text': 'moz 正在组织语言...'}
 
             llm = get_chat_client(temperature=0.8, top_p=0.9)
             messages = _build_dialogue_messages(state)
+            stream_started = time.time()
 
             full_reply = ""
             token_queue: asyncio.Queue = asyncio.Queue()
@@ -918,6 +944,10 @@ def run_emotion_workflow_streaming(
                 token = await asyncio.wait_for(token_queue.get(), timeout=120.0)
                 if token is None:
                     break
+                if stream_started is not None:
+                    # 首字延迟是这套改动的唯一硬指标：改造前 27.9~90.8 秒，目标 P50 ≤ 4 秒
+                    emotion_state.record_ttft(time.time() - stream_started)
+                    stream_started = None
                 yield {'type': 'token', 'text': token}
 
             await stream_task
@@ -979,24 +1009,13 @@ def _run_memory_retrieval(
 
     memory_texts = [r.get("memory", "") for r in retrieved if r.get("memory")]
 
-    llm = get_chat_client(temperature=0.3, use_thinking=False)
+    # 这里原来还要再请模型写一段"记忆摘要"，而且**没有超时**：2026-09-28 沙箱实测
+    # 有 4 条记忆时那一步吃掉 178 秒，等于把整轮回复拖死。摘掉记忆本来就是按相关性
+    # 排好序的原话，直接给对话模型看更好（也等于沿用它原本异常时的回落写法）。
+    # 设计原则见 docs/情感预热系统设计.md：首字路径上不许有上游往返。
     if memory_texts:
-        memory_content = "\n".join([f"- {m}" for m in memory_texts])
-        system_msg = SystemMessage(content=MEMORY_AGENT_PROMPT)
-        user_msg = HumanMessage(content=f"以下是检索到的记忆，请生成记忆摘要：\n\n{memory_content}")
-        try:
-            response = llm.invoke([system_msg, user_msg])
-            content = response.content.strip()
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            result = json.loads(content)
-            memory_context = result.get("memory_context", memory_content)
-            memory_summary = result.get("memory_summary", "")
-        except Exception:
-            memory_context = memory_content
-            memory_summary = f"共 {len(memory_texts)} 条相关记忆"
+        memory_context = "\n".join([f"- {m}" for m in memory_texts])
+        memory_summary = f"想起 {len(memory_texts)} 件相关的事"
     else:
         memory_context = "暂无相关记忆"
         memory_summary = "新用户，暂无历史记忆"

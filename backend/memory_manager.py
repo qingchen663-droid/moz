@@ -607,7 +607,10 @@ QUERY_REWRITE_PROMPT = """你是一个搜索查询改写专家。请将用户的
 # 查询改写共用一个线程池：每次新建一个池的话，超时后 with 退出还要等那次请求跑完，
 # "5 秒上限"就形同虚设（实测模型 8 秒回，调用方等了 8.00 秒）。
 _REWRITE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="query-rewrite")
-QUERY_REWRITE_TIMEOUT = float(os.environ.get("MOZ_QUERY_REWRITE_TIMEOUT", "5"))
+# 查询改写是"多想起几条"的加分项，不是必需品：它跑在首字路径上，
+# 原来给 5 秒等于每轮先白等 5 秒（2026-09-28 实测：正常窗口也要 2~5 秒）。
+# 超了就先用原始查询——召回少一点，但开口快。
+QUERY_REWRITE_TIMEOUT = float(os.environ.get("MOZ_QUERY_REWRITE_TIMEOUT", "1.2"))
 
 
 def rewrite_query(query: str) -> List[str]:

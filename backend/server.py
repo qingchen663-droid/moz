@@ -40,6 +40,7 @@ from working_memory import WorkingMemoryStore
 from emotion_graph import build_emotion_graph, run_emotion_workflow_streaming, load_prompt_config, save_prompt_config, get_dialogue_prompt, DIALOGUE_AGENT_PROMPT
 from emotion_graph import SaveDeps, run_save_job
 from save_queue import SaveQueue, SaveWorker
+import emotion_state
 from summary_service import SummaryService
 from memory_consolidation import MemoryConsolidator
 from file_processor import is_multimodal_model
@@ -1391,6 +1392,8 @@ async def get_metrics():
                 _metrics["llm_calls_duration_sum"] / _metrics["llm_calls_total"] * 1000, 1
             ) if _metrics["llm_calls_total"] > 0 else 0,
         },
+        # 首字延迟：情感预热唯一的硬指标（改造前实测 27.9~90.8 秒）
+        "first_token": emotion_state.ttft_stats(),
     }
 
 # ================================================================
