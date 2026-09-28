@@ -100,6 +100,7 @@ class AgentState(TypedDict):
     # 情感分析 Agent 输出
     emotion_analysis: Optional[Dict]                # 情感分析结果
     emotion_summary: Optional[str]                  # 情感摘要（供对话 Agent 使用）
+    baseline_context: Optional[str]                 # L1 情感基线（从她说过的事里总结的）
 
     # 记忆 Agent 输出
     retrieved_memories: Optional[List[Dict]]        # 检索到的相关记忆
@@ -443,6 +444,9 @@ def _build_dialogue_messages(state: AgentState) -> list:
         context_parts.append(f"用户现在的心情：{emotion_summary}")
         if emotion_change and emotion_change != "首次":
             context_parts.append(f"（情感变化趋势：{emotion_change}）")
+    baseline_context = state.get("baseline_context", "")
+    if baseline_context:
+        context_parts.append(f"和她相处下来的感觉：{baseline_context}")
     if memory_context:
         context_parts.append(f"你记得关于用户的事：{memory_context}")
     followup_text = ""
@@ -826,6 +830,7 @@ def run_emotion_workflow_streaming(
     care_graph=None,
     save_queue=None,
     save_worker=None,
+    emotion_store=None,
 ):
     """
     流式工作流：情感分析+记忆检索同步执行，对话生成逐 token 流式输出。
@@ -892,6 +897,9 @@ def run_emotion_workflow_streaming(
             live = emotion_state.live_signal(user_message)
             state["emotion_analysis"] = live
             state["emotion_summary"] = live["emotion_summary"]
+            if emotion_store is not None:
+                # L1：一次本地读，不调模型；没有基线就是空串（新用户就该什么都不加）
+                state["baseline_context"] = emotion_store.prompt_line(user_id)
 
             retrieval_task = asyncio.create_task(asyncio.to_thread(
                 _run_memory_retrieval, initial_state, memory_manager, working_memory_store))
@@ -905,6 +913,8 @@ def run_emotion_workflow_streaming(
                         asyncio.to_thread(emotion_analysis_node, dict(initial_state)),
                         timeout=SENSITIVE_WAIT_SECONDS)
                     if corrected.get("emotion_summary"):
+                        model_label = str((corrected.get("emotion_analysis") or {}).get("current_emotion", ""))
+                        emotion_state.record_agreement(live["current_emotion"], model_label)
                         state.update(corrected)
                 except asyncio.TimeoutError:
                     logger.info("[情感] 敏感主题等了 %.0fs 没等到，先用规则档开口", SENSITIVE_WAIT_SECONDS)

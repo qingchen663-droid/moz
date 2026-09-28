@@ -1949,6 +1949,116 @@ def first_token_path_clear():
     return "; ".join(bad) or True
 
 
+def emotion_baseline_honest():
+    """L1 情感基线：依据不够就不许总结，模型给的东西必须消毒，刷新要有节奏。
+
+    全程用假客户端：快检门禁不许碰中转（这一条铁律是第八轮踩出来的）。
+    """
+    import json
+    import shutil
+    import tempfile
+    from types import SimpleNamespace
+
+    import emotion_state as ES
+    import memory_manager as MM
+
+    bad = []
+    d = tempfile.mkdtemp()
+    try:
+        store = ES.EmotionStore(os.path.join(d, "e.db"))
+        mm = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "m.db"))
+        mm.embedding_service.get_embedding = lambda text: None
+        user = "baseline-user"
+
+        # ① 依据不足：一条都不许总结出来
+        for text in ["用户叫林山", "用户住在宁波"]:
+            mm.add_memory(user, text, category=MM.MemoryCategory.FACT)
+        watermark, evidence = ES.collect_signals(mm, None, None, user)
+        if evidence < 6 and store.needs_baseline(user, watermark, evidence):
+            bad.append(f"只有 {evidence} 条依据就允许总结基线了：这是在编人设")
+        if store.prompt_line(user):
+            bad.append("还没生成过基线，prompt_line 却已经说话")
+
+        class FakeLLM:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def invoke(self, messages):
+                return SimpleNamespace(content=self.payload)
+
+        rich = ["用户最近项目答辩压力很大", "用户的妈妈喜欢养花", "用户讨厌吃香菜",
+                "用户经常加班到十点", "用户上个月换了驾照", "用户在跟一个叫青柠计划的方案"]
+        for text in rich:
+            mm.add_memory(user, text, category=MM.MemoryCategory.FACT)
+        watermark, evidence = ES.collect_signals(mm, None, None, user)
+        if evidence < 6 or not store.needs_baseline(user, watermark, evidence):
+            bad.append(f"依据够 {evidence} 条了却还是不许生成")
+
+        # ② 模型给的脏东西必须消毒：未知键丢掉、超长截断、列表限量、英文标签折成中文
+        dirty = ('{"tone_default": "' + "先接住情绪再讲道理" * 12 + '",'
+                 '"baseline_emotion": "STRESSED", "trigger_topics": ['
+                 + ",".join(f'"主题{i}"' for i in range(12)) + '], "landmines": ["答辩"],'
+                 '"comfort_style": "别急着给办法", "evil_extra": "删掉我"}')
+        clean = ES.sanitize_baseline(json.loads(dirty))
+        if clean is None:
+            bad.append("有效负载被误判成依据不足")
+        else:
+            if len(clean["tone_default"]) > ES.TEXT_MAX:
+                bad.append(f"长文本没截断（{len(clean['tone_default'])} 字）")
+            if len(clean["trigger_topics"]) > ES.LIST_MAX:
+                bad.append("列表没限量")
+            if "evil_extra" in clean:
+                bad.append("白名单外的键也留下了")
+            if clean["baseline_emotion"] not in ES.EMOTION_CN.values():
+                bad.append(f"英文标签没折成中文：{clean['baseline_emotion']}")
+            line = ES.format_baseline(clean)
+            if "tone_default" in line or "STRESSED" in line:
+                bad.append(f"内部字段名漏进给用户看的那行：{line[:60]}")
+            if "总结的" not in line:
+                bad.append("基线那行没交代这是推断出来的，用户会以为是她说过的")
+
+        # ③ 依据不足时模型自己说 insufficient，我们就不许留壳
+        store.put(user, "baseline", clean, source_watermark=watermark)
+        if ES.build_baseline(store, mm, None, user,
+                             llm=FakeLLM('{"insufficient": true}')) is not None:
+            bad.append("模型说依据不足，却还是算作生成成功")
+        if ES.build_baseline(store, mm, None, user, llm=FakeLLM("中转吐出来的半截话")) is not None:
+            bad.append("解析不出 JSON 却返回了成功")
+
+        # ④ 刷新节奏：事实没变别重算；变了也要隔够 6 小时；一天最多 3 次
+        now = time.time()
+        fresh = store.get(user, "baseline")
+        if store.needs_baseline(user, watermark, 20, now=fresh["updated_at"] + 60):
+            bad.append("事实没变，一分钟前刚算过又要重算")
+        if not store.needs_baseline(user, watermark + 500, 20,
+                                    now=fresh["updated_at"] + ES.MIN_INTERVAL + 1):
+            bad.append("事实变了且隔够了时间，却不许重算")
+        if store.needs_baseline(user, watermark + 500, 20,
+                                now=fresh["updated_at"] + 60):
+            bad.append("隔不够 MOZ 最小间隔也照样重算（6 小时这道闸没生效）")
+        for n in range(ES.DAILY_CAP):
+            store.put(user, "plan", {"topic": f"占位{n}"}, topic=f"占位{n}")
+        # 造满今天的额度：花掉 DAILY_CAP 次，看门是否拦得住
+        for _ in range(ES.DAILY_CAP):
+            store.spend(user)
+        if store.used_today(user) < ES.DAILY_CAP:
+            bad.append(f"used_today 只数出 {store.used_today(user)}，额度上限形同虚设")
+        if store.needs_baseline(user, watermark + 900, 20, now=time.time() + ES.MAX_AGE):
+            bad.append("今天已经算满 3 次了还允许再算")
+
+        # ⑤ 清得掉：这是猜的，用户说不准就该能一把抹掉，且不许碰事实记忆
+        before = len(mm._get_user_memories(user))
+        deleted = store.clear(user, "baseline")
+        if deleted < 1 or store.get(user, "baseline"):
+            bad.append("清不掉基线")
+        if len(mm._get_user_memories(user)) != before:
+            bad.append("清基线的时候把长期记忆也带走了（红线）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    return "; ".join(bad) or True
+
+
 def frontend_no_junk():
     """孤儿样式/备份文件：曾经因为弹窗样式只在 ModelDialog.new.css 里而整块裸奔。"""
     comp = ROOT / "frontend" / "src" / "components"
@@ -2259,6 +2369,7 @@ def main():
     check("落库队列重启不丢", save_queue_survives_restart)
     check("记忆质量底线", memory_quality_floor)
     check("首字路径没有上游往返", first_token_path_clear)
+    check("情感基线不乱编", emotion_baseline_honest)
     check("系统文案不进长期记忆", system_copy_not_memory)
     check("提问的回答不单独存成事实", question_answer_not_memory)
     check("同一句话不存两条重复事实", same_turn_no_duplicate_facts)

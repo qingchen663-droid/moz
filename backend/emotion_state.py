@@ -8,11 +8,22 @@
 设计文档：`docs/情感预热系统设计.md`（三层信号：L0 规则 / L1 基线 / L2 临时对策）。
 """
 
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+import threading
 import time
 from collections import deque
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from memory_manager import EmotionAnalyzer, EmotionType
+
+logger = logging.getLogger(__name__)
+DB_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)), "moz.db")
 
 # 标签→中文：给 prompt 用，别让"stressed"这种英文 key 漏进她嘴里
 EMOTION_CN: Dict[str, str] = {
@@ -174,6 +185,90 @@ def worth_waiting(signal: Dict[str, Any]) -> bool:
     return bool(signal.get("sensitive"))
 
 
+# ── L1 情感基线：从她自己说过的话里攒出"这个人平时什么样" ────────────────
+# 用户 2026-09-28 把刷新节奏交给我定，下面这几个数就是我定的，写死在这里而不是散在代码里。
+MIN_EVIDENCE = 6          # 依据少于 6 条就宁可不总结：编出来的"性格"比没有更糟
+MIN_INTERVAL = 6 * 3600.0  # 两次生成之间至少隔 6 小时，别为聊天窗口里三句话反复重算
+MAX_AGE = 7 * 86400.0      # 事实没变但太久没重算，也允许再算一次
+DAILY_CAP = 3              # 一天最多算 3 次，不拿额度去赌
+LIST_MAX = 6
+TEXT_MAX = 40
+
+BASELINE_PROMPT = """你是"相处总结"模块。下面给的是关于这个人的既有记录，
+其中第一行【她说这些事时的情绪】是按话题聚合过的情绪档和强度——那是你总结的主要依据。
+请据此总结她平时的情绪相处方式，供陪伴型 AI 决定语气。
+
+严格输出 JSON，不要多余文字：
+{
+  "tone_default": "平时该用什么语气，6~12字，中文",
+  "baseline_emotion": "happy/sad/anxious/angry/lonely/stressed/hopeful/neutral 里选一个",
+  "trigger_topics": ["容易被什么牵着情绪，最多6个，每个2~8字，用中文话题名"],
+  "landmines": ["不能拿来打趣或轻描淡写的，最多6个"],
+  "comfort_style": "她吃哪一套安慰方式，10字以内",
+  "insufficient": false
+}
+
+规则：
+- 只许用给到的记录，一条都不许编；看不出来的字段留空字符串或空数组。
+- 只有在【她说这些事时的情绪】那一行完全没有内容、且记录里也读不出任何情绪线索时，
+  才输出 {"insufficient": true}。有几条情绪档就照着总结，别客气也别夸大。
+- 字段值一律写成中文自然语言，不要出现英文键名、不要写"用户"这种第三人称。"""
+
+_ALLOWED_KEYS = ("tone_default", "baseline_emotion", "trigger_topics", "landmines",
+                 "comfort_style")
+
+
+def _clean_text(value: Any, limit: int = TEXT_MAX) -> str:
+    text = str(value or "").strip().replace("\n", " ")
+    return text[:limit]
+
+
+def sanitize_baseline(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """模型给的字段一律消毒：只留白名单、限长、去空；依据不足就返回 None。"""
+    if not raw or raw.get("insufficient"):
+        return None
+    out: Dict[str, Any] = {}
+    for key in _ALLOWED_KEYS:
+        value = raw.get(key)
+        if isinstance(value, list):
+            items = []
+            for item in value:
+                text = _clean_text(item, 12)
+                if text and text not in items:
+                    items.append(text)
+            out[key] = items[:LIST_MAX]
+        else:
+            out[key] = _clean_text(value)
+    raw_label = str(out.get("baseline_emotion", "")).strip().lower()
+    # 模型可能给英文 key（"stressed"），也可能直接给中文（"焦虑"）；两个都要认
+    out["baseline_emotion"] = (EMOTION_CN.get(raw_label)
+                               or (raw_label if raw_label in EMOTION_CN.values() else "平静"))
+    # 一句实在话都没有 → 当作没总结出来，别留一个空壳让用户以为她懂他
+    if not any(out.get(k) for k in ("tone_default", "trigger_topics", "landmines", "comfort_style")):
+        return None
+    return out
+
+
+def format_baseline(data: Dict[str, Any]) -> str:
+    """把基线写成一行给对话模型看的中文（内部键名一律不许出现在这里）。"""
+    if not data:
+        return ""
+    bits = []
+    if data.get("tone_default"):
+        bits.append(f"平时用{data['tone_default']}的语气接她")
+    if data.get("baseline_emotion"):
+        bits.append(f"底色偏{data['baseline_emotion']}")
+    if data.get("trigger_topics"):
+        bits.append("容易被" + "、".join(data["trigger_topics"]) + "牵着情绪")
+    if data.get("landmines"):
+        bits.append("别拿来打趣的有" + "、".join(data["landmines"]))
+    if data.get("comfort_style"):
+        bits.append(f"她吃「{data['comfort_style']}」这一套")
+    if not bits:
+        return ""
+    return "；".join(bits) + "（这是从她说过的事里总结的，说错了她会纠正）"
+
+
 # ── 首字延迟取样（只读指标用，不放任何用户内容）────────────────────────
 TTFT_WINDOW = 200
 _ttft_samples: deque = deque(maxlen=TTFT_WINDOW)
@@ -195,3 +290,328 @@ def ttft_stats() -> Dict[str, Optional[float]]:
 
     return {"samples": len(ordered), "p50": pct(0.5), "p95": pct(0.95),
             "max": round(ordered[-1], 2)}
+
+
+# ── 规则档 vs 模型档的一致率（P1 的退路判据）───────────────────────────
+# 用户把"低到多少就回滚"交给我定：我定的口径是**连续两轮沙箱样本 <0.6 就修规则表，
+# 而不是把阻塞调用加回来**（回滚动作见 RUNLOG，P1 提交是 159cd9f）。
+_AGREE_WINDOW = 200
+_agree_samples: deque = deque(maxlen=_AGREE_WINDOW)
+
+
+def record_agreement(rule_emotion: str, model_emotion: str) -> None:
+    if rule_emotion and model_emotion:
+        _agree_samples.append(1.0 if rule_emotion == model_emotion else 0.0)
+
+
+def agreement_stats() -> Dict[str, Any]:
+    if not _agree_samples:
+        return {"samples": 0, "rate": None}
+    return {"samples": len(_agree_samples),
+            "rate": round(sum(_agree_samples) / len(_agree_samples), 3)}
+
+
+class EmotionStore:
+    """情感基线 / 临时对策的存储（moz.db 里的 `emotion_state` 表，与 care_store 同一套连接约定）。
+
+    为什么必须落库：`--reload` 一改 .py 就把进程内状态清零（HANDOFF §1），
+    只放内存等于每天重启一次就把"她了解你"忘掉一遍。
+    """
+
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self._local = threading.local()
+        self._init_db()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+        return conn
+
+    def _init_db(self) -> None:
+        self._conn().executescript(
+            """
+            CREATE TABLE IF NOT EXISTS emotion_state (
+                user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                topic TEXT NOT NULL DEFAULT '',
+                data TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                source_watermark REAL NOT NULL DEFAULT 0,
+                expires_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                PRIMARY KEY (user_id, kind, topic)
+            );
+            CREATE TABLE IF NOT EXISTS emotion_budget (
+                user_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                n INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            );
+            """
+        )
+        self._conn().commit()
+
+    # ── 读写 ─────────────────────────────────────────────
+    def get(self, user_id: str, kind: str, topic: str = "") -> Optional[Dict[str, Any]]:
+        row = self._conn().execute(
+            "SELECT * FROM emotion_state WHERE user_id=? AND kind=? AND topic=?",
+            (user_id, kind, topic),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["data"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return {
+            "data": payload, "revision": int(row["revision"]),
+            "source_watermark": float(row["source_watermark"]),
+            "expires_at": float(row["expires_at"]), "updated_at": float(row["updated_at"]),
+            "confidence": float(row["confidence"]),
+        }
+
+    def put(self, user_id: str, kind: str, payload: Dict[str, Any], *, topic: str = "",
+            source_watermark: float = 0.0, expires_at: float = 0.0,
+            confidence: float = 0.5) -> int:
+        prev = self.get(user_id, kind, topic)
+        revision = (prev["revision"] + 1) if prev else 1
+        self._conn().execute(
+            """INSERT OR REPLACE INTO emotion_state
+               (user_id, kind, topic, data, revision, source_watermark, expires_at, updated_at, confidence)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (user_id, kind, topic, json.dumps(payload, ensure_ascii=False), revision,
+             source_watermark, expires_at, time.time(), confidence),
+        )
+        self._conn().commit()
+        return revision
+
+    def clear(self, user_id: str, kind: Optional[str] = None) -> int:
+        sql = "DELETE FROM emotion_state WHERE user_id=?"
+        args: List[Any] = [user_id]
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        cur = self._conn().execute(sql, args)
+        self._conn().commit()
+        return cur.rowcount
+
+    def list_rows(self, user_id: str, kind: str) -> List[Dict[str, Any]]:
+        rows = self._conn().execute(
+            "SELECT topic, data, expires_at, updated_at, confidence FROM emotion_state"
+            " WHERE user_id=? AND kind=? ORDER BY updated_at DESC",
+            (user_id, kind),
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                out.append({"topic": r["topic"], "data": json.loads(r["data"]),
+                            "expires_at": float(r["expires_at"]),
+                            "updated_at": float(r["updated_at"]),
+                            "confidence": float(r["confidence"])})
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return out
+
+    # ── 该不该重算（刷新节奏全在这几个判断里）─────────────────────────
+    def used_today(self, user_id: str) -> int:
+        day = time.strftime("%Y-%m-%d")
+        row = self._conn().execute(
+            "SELECT n FROM emotion_budget WHERE user_id=? AND day=?", (user_id, day)
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def spend(self, user_id: str) -> int:
+        """记一次生成。基线每个用户只有一行，所以**不能**拿行数当额度计数。"""
+        day = time.strftime("%Y-%m-%d")
+        self._conn().execute(
+            "INSERT INTO emotion_budget (user_id, day, n) VALUES (?, ?, 1)"
+            " ON CONFLICT(user_id, day) DO UPDATE SET n = n + 1",
+            (user_id, day),
+        )
+        self._conn().commit()
+        return self.used_today(user_id)
+
+    def needs_baseline(self, user_id: str, watermark: float, evidence: int,
+                       now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        if evidence < MIN_EVIDENCE:
+            return False          # 依据太少就别总结，宁缺毋滥
+        if self.used_today(user_id) >= DAILY_CAP:
+            return False          # 今天已经算了 3 次，别再拿额度赌
+        row = self.get(user_id, "baseline")
+        if row is None:
+            return True
+        age = now - row["updated_at"]
+        changed = abs(row["source_watermark"] - watermark) > 1e-6
+        if not changed and age < MAX_AGE:
+            return False
+        return age >= MIN_INTERVAL  # 事实刚动过也要隔够 6 小时再算，别为三句话反复重算
+
+    def prompt_line(self, user_id: str) -> str:
+        row = self.get(user_id, "baseline")
+        return format_baseline(row["data"]) if row else ""
+
+    def stats(self, user_id: str) -> Dict[str, Any]:
+        base = self.get(user_id, "baseline")
+        plans = self.list_rows(user_id, "plan")
+        return {
+            "baseline_present": bool(base),
+            "baseline_age_seconds": round(time.time() - base["updated_at"], 1) if base else None,
+            "plans": len(plans),
+            "plans_live": sum(1 for p in plans if p["expires_at"] > time.time()),
+            "daily_baseline": self.used_today(user_id),
+        }
+
+
+def collect_signals(memory_manager, care_store, profile_manager, user_id: str) -> Tuple[float, int]:
+    """(水位, 依据条数)。水位=各来源最大时间戳之和；任何一处变了它就变。
+
+    故意**不要求**每个写入点都记得来通知（那种"必须记得调一下"的坑 HANDOFF §7.1 记过），
+    改成每次自己扫一遍取最大值：漏改的可能没有。
+    """
+    stamps: List[float] = []
+    count = 0
+    active = active_memories(memory_manager, user_id)
+    if memory_manager is not None:
+        count += len(active)
+        stamps.append(max((getattr(m, "updated_at", 0.0) or getattr(m, "created_at", 0.0)
+                           for m in active), default=0.0))
+    if care_store is not None:
+        try:
+            items = care_store.list_items(user_id, status=None)
+            count += len(items)
+            stamps.append(max((float(i.get("updated_at") or 0.0) for i in items), default=0.0))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[情感基线] 读关心事项失败: %s", e)
+    if profile_manager is not None:
+        try:
+            profile = profile_manager.get_profile(user_id) if hasattr(profile_manager, "get_profile") else None
+            if isinstance(profile, dict):
+                fields = profile.get("fields") or profile
+                count += sum(1 for v in fields.values() if v)
+                stamps.append(float(profile.get("updated_at") or 0.0))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[情感基线] 读档案卡失败: %s", e)
+    evidence = count
+    watermark = sum(s for s in stamps if s)
+    return watermark, evidence
+
+
+def active_memories(memory_manager, user_id: str) -> List[Any]:
+    if memory_manager is None:
+        return []
+    try:
+        return [m for m in memory_manager._get_user_memories(user_id).values() if m.active()]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[情感基线] 读记忆失败: %s", e)
+        return []
+
+
+def topic_of(text: str) -> str:
+    for name, cues in TOPIC_HINTS.items():
+        if any(c and c in text for c in cues):
+            return name
+    return "其他"
+
+
+def emotion_tally(memory_manager, user_id: str) -> List[str]:
+    """把"她说哪些事时是什么情绪"聚成几行——这才是基线的证据，光列事实推不出脾气。
+
+    （用户 2026-09-28 说的"提前根据用户记忆总结出情感的区块链"，落地就是这个聚合。）
+    """
+    buckets: Dict[Tuple[str, str], List[float]] = {}
+    for m in active_memories(memory_manager, user_id):
+        emotion = getattr(getattr(m, "emotion", None), "value", None)
+        if not emotion:
+            continue
+        buckets.setdefault((topic_of(m.content), emotion), []).append(float(m.emotion_intensity or 0.0))
+    lines = []
+    for (topic, emotion), values in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+        lines.append(f"{topic}：{EMOTION_CN.get(emotion, emotion)}×{len(values)}（平均强度 "
+                     f"{sum(values) / len(values):.2f}）")
+    return lines[:12]
+
+
+def gather_evidence(memory_manager, care_store, user_id: str, limit: int = 40) -> List[str]:
+    lines: List[str] = []
+    tally = emotion_tally(memory_manager, user_id)
+    if tally:
+        lines.append("【她说这些事时的情绪】" + "；".join(tally))
+    for m in sorted(active_memories(memory_manager, user_id),
+                    key=lambda x: x.importance, reverse=True)[:limit]:
+        emotion = getattr(getattr(m, "emotion", None), "value", None)
+        tag = f"[{EMOTION_CN.get(emotion, emotion)}]" if emotion else ""
+        lines.append(f"{tag}{m.content}")
+    if care_store is not None:
+        try:
+            for item in care_store.list_items(user_id, status=None)[:20]:
+                title = (item.get("title") or "").strip()
+                if title:
+                    lines.append(f"[该惦记的事] {title}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[情感基线] 取事项失败: %s", e)
+    return [l for l in lines if l][:limit]
+
+
+def build_baseline(store: EmotionStore, memory_manager, care_store, user_id: str,
+                   llm=None, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """一次模型调用，把"和她相处下来的感觉"写回基线。依据不足就不写（返回 None）。"""
+    now = time.time() if now is None else now
+    evidence = gather_evidence(memory_manager, care_store, user_id)
+    if len(evidence) < MIN_EVIDENCE:
+        logger.info("[情感基线] 依据只有 %d 条，不足 %d 条，这次不总结",
+                    len(evidence), MIN_EVIDENCE)
+        return None
+    if llm is None:
+        from llm_config import get_llm_client
+        llm = get_llm_client(temperature=0.3, use_thinking=False)
+    try:
+        response = llm.invoke([SystemMessage(content=BASELINE_PROMPT),
+                               HumanMessage(content="既有记录：\n" + "\n".join(evidence))])
+        content = (response.content or "").strip()
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        raw = json.loads(content)
+    except Exception as e:  # noqa: BLE001 - 中转抽风是常态，别把预热变成故障
+        logger.warning("[情感基线] 生成失败（保持上一次基线）: %s", e)
+        return None
+    clean = sanitize_baseline(raw if isinstance(raw, dict) else {})
+    if clean is None:
+        logger.info("[情感基线] 模型说依据不足，保持空基线")
+        return None
+    watermark, _count = collect_signals(memory_manager, care_store, None, user_id)
+    store.put(user_id, "baseline", clean, source_watermark=watermark, confidence=0.6)
+    used = store.spend(user_id)
+    logger.info("[情感基线] 已更新（今天第 %d/%d 次）：%s",
+                used, DAILY_CAP, format_baseline(clean)[:80])
+    return clean
+
+
+async def emotion_heartbeat(store: EmotionStore, memory_manager, care_store,
+                            profile_manager, user_id: str, interval: int = 60,
+                            build=None) -> None:
+    """基线心跳：每 60 秒问一句"该重算了吗"，该算才算。
+
+    和 care_loop 一样的取向：代价不摊到每条对话上；生成失败静默，下一轮再试。
+    """
+    build = build or (lambda: build_baseline(store, memory_manager, care_store, user_id))
+    logger.info("[情感基线] 心跳启动，每 %ss 检查一次是否该重算", interval)
+    while True:
+        try:
+            watermark, evidence = collect_signals(memory_manager, care_store,
+                                                 profile_manager, user_id)
+            if store.needs_baseline(user_id, watermark, evidence):
+                await asyncio.to_thread(build)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[情感基线] 这轮检查失败（不影响回话）: %s", e)
+        await asyncio.sleep(interval)

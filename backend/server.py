@@ -226,6 +226,13 @@ async def lifespan(app: FastAPI):
     save_worker = SaveWorker(_app_state["save_queue"], lambda job: run_save_job(save_deps, job))
     _app_state["save_worker"] = save_worker
     save_task = asyncio.create_task(save_worker.run())
+
+    # L1 情感基线：每 60 秒只问一句"该重算了吗"，该算才调模型（节奏见 emotion_state 顶部常量）
+    _app_state["emotion_store"] = emotion_state.EmotionStore(db_path)
+    emotion_task = asyncio.create_task(emotion_state.emotion_heartbeat(
+        _app_state["emotion_store"], mm, _app_state["care_store"], profile_manager,
+        DEFAULT_USER_ID,
+    ))
     care_task = asyncio.create_task(care_engine.care_loop(
         _app_state["care_store"],
         _app_state["working_memory_store"],
@@ -239,6 +246,7 @@ async def lifespan(app: FastAPI):
     yield
 
     care_task.cancel()
+    emotion_task.cancel()
     save_worker.stop()
     save_task.cancel()
     # 新增：关闭档案卡管理器
@@ -503,6 +511,7 @@ async def chat(user_id: str, req: ChatRequest):
                 conversation_id=cid,
                 save_queue=_app_state.get("save_queue"),
                 save_worker=_app_state.get("save_worker"),
+                emotion_store=_app_state.get("emotion_store"),
             ):
                 chunk_type = chunk.get("type")
                 if chunk_type == "status":
@@ -1158,6 +1167,43 @@ async def care_save_queue(user_id: str = DEFAULT_USER_ID):
     return {"available": True, "pending_for_user": queue.pending_for(user_id), **queue.stats()}
 
 
+@app.get("/api/emotion/state", dependencies=[Depends(verify_access_key)])
+async def read_emotion_state(user_id: str = DEFAULT_USER_ID):
+    """她对你的"相处总结"（L1）和临时对策（L2）：只读，给用户核对。
+
+    用户 2026-09-28 明确要"露出来"——推断出来的东西不能只在暗处影响她说话。
+    """
+    user_id = normalize_user_id(user_id)
+    store: emotion_state.EmotionStore = _app_state["emotion_store"]
+    base = store.get(user_id, "baseline")
+    now = time.time()
+    return {
+        "baseline": base["data"] if base else None,
+        "baseline_line": store.prompt_line(user_id),
+        "baseline_age_seconds": round(now - base["updated_at"], 1) if base else None,
+        "revision": base["revision"] if base else 0,
+        "plans": [
+            {"topic": p["topic"], "data": p["data"],
+             "expires_at": p["expires_at"], "expired": p["expires_at"] <= now}
+            for p in store.list_rows(user_id, "plan")
+        ],
+        "stats": store.stats(user_id),
+        "agreement": emotion_state.agreement_stats(),
+    }
+
+
+@app.delete("/api/emotion/state", dependencies=[Depends(verify_access_key)])
+async def erase_emotion_state(user_id: str = DEFAULT_USER_ID, kind: str = Query(None)):
+    """划掉总结：这些是猜的，用户说不准就该能一键去掉，且不许影响已存的事实记忆。"""
+    user_id = normalize_user_id(user_id)
+    if kind not in (None, "baseline", "plan"):
+        raise HTTPException(status_code=400, detail="kind 只能是 baseline 或 plan")
+    store: emotion_state.EmotionStore = _app_state["emotion_store"]
+    deleted = store.clear(user_id, kind)
+    logger.info("[情感基线] 用户要求清掉 %s 的 %s（%d 行）", user_id, kind or "全部", deleted)
+    return {"ok": True, "deleted": deleted}
+
+
 # ================================================================
 # API: 用户头像
 # ================================================================
@@ -1394,6 +1440,8 @@ async def get_metrics():
         },
         # 首字延迟：情感预热唯一的硬指标（改造前实测 27.9~90.8 秒）
         "first_token": emotion_state.ttft_stats(),
+        "emotion": {**_app_state["emotion_store"].stats(DEFAULT_USER_ID),
+                    "agreement": emotion_state.agreement_stats()},
     }
 
 # ================================================================
