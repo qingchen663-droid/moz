@@ -2111,6 +2111,19 @@ def emotion_plan_double_gate():
             bad.append("过期的对策还在用")
         if ES.plan_stats()["expired_skipped"] <= skipped0:
             bad.append("过期被拦下却没计数，等于这项门禁是摆设")
+        # ②' 依据的事实变了就要闭嘴：删记忆、改档案都算
+        #（红线：用户删掉的东西不该还在影响措辞——TTL 30 分钟挡不住挂 7 天的基线）
+        stale_before = ES.plan_stats()["stale_skipped"]
+        if ES.plan_for(store, user, ["家人"], now=time.time(), watermark=999999.0):
+            bad.append("事实水位变了还在用旧对策")
+        if ES.plan_stats()["stale_skipped"] <= stale_before:
+            bad.append("水位拦下对策却没计数，等于不知道闸在不在闸")
+        thin = ES.sanitize_baseline({"tone_default": "轻一点", "baseline_emotion": "sad",
+                                     "trigger_topics": [], "landmines": [],
+                                     "comfort_style": "", "insufficient": False})
+        if not thin or thin["baseline_emotion"] != "难过":
+            bad.append(f"只有一句实在话的合法基线被误杀：{thin}")
+
         # ③ 依据不足 / 空对策不许留壳
         if ES.build_plan(store, mm, None, user, "宠物", llm=FakeLLM('{"insufficient": true}')):
             bad.append("模型说读不出细节，却还是存了对策")

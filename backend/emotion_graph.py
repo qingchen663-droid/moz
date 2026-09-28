@@ -903,10 +903,14 @@ def run_emotion_workflow_streaming(
             state["emotion_analysis"] = live
             state["emotion_summary"] = live["emotion_summary"]
             if emotion_store is not None:
+                # 本地扫一遍拿当前水位（不是上游往返）：用户删过记忆，旧总结和旧对策就该闭嘴
+                stamp, _evidence = emotion_state.collect_signals(memory_manager, care_store,
+                                                                None, user_id)
                 # L1：一次本地读，不调模型；没有基线就是空串（新用户就该什么都不加）
-                state["baseline_context"] = emotion_store.prompt_line(user_id)
-                # L2：上一轮备好的对策（过期或主题不对就不认），以及这一轮该新预热的主题
-                line = emotion_state.plan_for(emotion_store, user_id, live["topics"])
+                state["baseline_context"] = emotion_store.prompt_line(user_id, stamp)
+                # L2：备好的对策要过期没过期、主题对不对、依据还在不在，三关都过才用
+                line = emotion_state.plan_for(emotion_store, user_id, live["topics"],
+                                              watermark=stamp)
                 if line:
                     state["plan_context"] = line
                 emotion_state.schedule_prewarm(emotion_store, save_queue, save_worker,

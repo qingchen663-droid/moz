@@ -453,9 +453,18 @@ class EmotionStore:
             return False
         return age >= MIN_INTERVAL  # 事实刚动过也要隔够 6 小时再算，别为三句话反复重算
 
-    def prompt_line(self, user_id: str) -> str:
+    def prompt_line(self, user_id: str, watermark: Optional[float] = None) -> str:
+        """基线那行话。给了当前水位就对一下：事实变了就先别拿旧总结说话。
+
+        红线是"用户删掉的记忆不该还在影响措辞"——TTL 只管 30 分钟，基线能挂 7 天。
+        """
         row = self.get(user_id, "baseline")
-        return format_baseline(row["data"]) if row else ""
+        if not row:
+            return ""
+        if watermark is not None and abs(row["source_watermark"] - watermark) > 1e-6:
+            bump_counter("stale_skipped")
+            return ""
+        return format_baseline(row["data"])
 
     def stats(self, user_id: str) -> Dict[str, Any]:
         base = self.get(user_id, "baseline")
@@ -640,7 +649,7 @@ PLAN_PROMPT = """你是"临时对策"模块。她现在聊到了「{topic}」。
 - 全用中文自然语言，别出现英文键名、别写"用户"。"""
 
 _COUNTERS = {"asked": 0, "hit": 0, "expired_skipped": 0, "dup_skipped": 0,
-             "quota_skipped": 0, "built": 0, "failed": 0}
+             "quota_skipped": 0, "built": 0, "failed": 0, "stale_skipped": 0}
 
 
 def bump_counter(name: str, n: int = 1) -> None:
@@ -692,7 +701,8 @@ def plan_line(data: Dict[str, Any]) -> str:
 
 
 def topic_plan(store: EmotionStore, user_id: str, topic: str,
-               now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+               now: Optional[float] = None,
+               watermark: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """取这个主题的对策，**双闸**：过期不许用、主题不对不许用。"""
     now = time.time() if now is None else now
     row = store.get(user_id, "plan", topic)
@@ -701,14 +711,18 @@ def topic_plan(store: EmotionStore, user_id: str, topic: str,
     if row["expires_at"] <= now:
         bump_counter("expired_skipped")          # 拦住了才计数，用来证明闸门真的在闸
         return None
+    if watermark is not None and abs(row["source_watermark"] - watermark) > 1e-6:
+        bump_counter("stale_skipped")            # 它依据的事实已经变了，这条对策作废
+        return None
     return row["data"]
 
 
 def plan_for(store: EmotionStore, user_id: str, topics: List[str],
-             now: Optional[float] = None) -> str:
+             now: Optional[float] = None,
+             watermark: Optional[float] = None) -> str:
     """本轮要用的那行对策（读不到就空串，绝不因此耽误开口）。"""
     for topic in topics or []:
-        data = topic_plan(store, user_id, topic, now=now)
+        data = topic_plan(store, user_id, topic, now=now, watermark=watermark)
         if data:
             bump_counter("hit")
             return plan_line(data)
