@@ -213,6 +213,14 @@ def apply_(res, conn, db_path=DB, api=API, reset_talk_score=True):
         conn.execute("UPDATE working_memory SET summary='', open_topics='[]', updated_at=0 WHERE user_id=?", (u,))
     for table, u, _n in res["test_rows"]:
         conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (u,))
+    # 落库队列把每轮的原话都存过一行，探针那几轮同样会留下残渣（第八轮起新增）
+    junk = [jid for jid, uid, msg in conn.execute(
+        "SELECT id, user_id, user_message FROM save_jobs").fetchall()
+        if TEST_USER.match(uid or "") or PROBE_USER.search(msg or "")]
+    for jid in junk:
+        conn.execute("DELETE FROM save_jobs WHERE id = ?", (jid,))
+    if junk:
+        print(f"落库队列里删掉 {len(junk)} 条探针任务")
     # 话多话少是被测试对话喂出来的（探针全是一句话回答），一律回落到中性。
     # 自动清理（selftest --full）不该动这个值，它会自己把探针前的值写回去。
     if reset_talk_score:

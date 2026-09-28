@@ -683,8 +683,19 @@ def probe_cleaner_works():
                      "VALUES (?,?,?,?,?)", (USER, "用户反复追问这张图的颜色", "[]", "neutral", now))
         conn.commit()
 
+        conn.executemany(
+            "INSERT INTO save_jobs (user_id,user_message,reply,status,attempts,created_at,updated_at)"
+            " VALUES (?,?,?,'done',0,?,?)",
+            [(USER, "自测探针：请用一句话回答你好", "你好", now, now),
+             ("__selftest_queue", "我妈生日是10月5号", "记下了", now, now),
+             (USER, "用户真实说过的一句标记话", "记下了", now, now)],
+        )
+        conn.commit()
+
         CP.apply_(CP.scan(conn, now - 60), conn, db_path=tmp, api=None)
 
+        # 落库队列（save_jobs）也存原话，探针那几轮同样得清干净
+        queued = conn.execute("SELECT user_id, user_message FROM save_jobs").fetchall()
         left = [json.loads(r[0])["content"] for r in
                 conn.execute("SELECT data FROM memories WHERE user_id = ?", (USER,)).fetchall()]
         msgs = json.loads(conn.execute("SELECT data FROM conversations WHERE user_id = ?", (USER,))
@@ -705,6 +716,12 @@ def probe_cleaner_works():
             bad.append("工作记忆没清空")
         if fts:
             bad.append("全文检索还能搜到删掉的测试句")
+        if any("探针" in (m or "") for _u, m in queued):
+            bad.append("落库队列里还留着探针那几轮的原话")
+        if any(u == "__selftest_queue" for u, _m in queued):
+            bad.append("测试用户的落库任务没清")
+        if not any("标记话" in (m or "") for _u, m in queued):
+            bad.append("清理器把不像探针的落库任务也吃掉了")
         return "; ".join(bad) or True
     finally:
         conn.close()
