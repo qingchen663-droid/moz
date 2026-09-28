@@ -58,6 +58,7 @@ desktop.ini
 # 内部文档默认不入版本控制；架构文档单独保留
 docs/*
 !docs/MEMORY_FRAMEWORK.md
+!docs/情感预热系统设计.md
 
 # 整夜自测期间新增：杂物与本地状态不入版本控制
 frontend/node_modules-old/
