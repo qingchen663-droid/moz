@@ -9,12 +9,15 @@ interface Props {
   onClose: () => void
 }
 
-type TabKey = 'profile' | 'memories' | 'summaries'
+import type { EmotionStateResponse } from '../types'
+
+type TabKey = 'profile' | 'memories' | 'summaries' | 'inferred' | 'inferred'
 
 const TAB_LABELS: Record<TabKey, string> = {
   profile: '档案卡',
   memories: '记忆',
   summaries: '总结',
+  inferred: '她猜的',
 }
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -71,6 +74,7 @@ export default function MemoryViewerModal({ onClose }: Props) {
   const [query, setQuery] = useState('')
   const [layerFilter, setLayerFilter] = useState<'all' | 'core' | 'important' | 'regular'>('all')
   const [actionMsg, setActionMsg] = useState('')
+  const [inferred, setInferred] = useState<EmotionStateResponse | null>(null)
   const [summaries, setSummaries] = useState<
     Array<{
       id: number
@@ -85,16 +89,19 @@ export default function MemoryViewerModal({ onClose }: Props) {
     const load = async () => {
       try {
         const userId = useStore.getState().userId
-        const [memRes, profRes] = await Promise.all([
+        const [memRes, profRes, , emotionRes] = await Promise.all([
           api.getMemoryDetail(userId),
           api.getUserProfile(userId),
           api
             .getSummaries(userId)
             .then((res) => setSummaries(res.summaries))
             .catch(() => {}),
+          // 读不到就当我没这一页，别把档案卡也带崩
+          api.getEmotionState(userId).catch(() => null),
         ])
         setMemoryData(memRes)
         setProfile(profRes.profile)
+        if (emotionRes) setInferred(emotionRes)
       } catch (e) {
         setError(e instanceof Error ? e.message : '加载失败')
       } finally {
@@ -112,7 +119,7 @@ export default function MemoryViewerModal({ onClose }: Props) {
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  const tabs: TabKey[] = ['profile', 'memories', 'summaries']
+  const tabs: TabKey[] = ['profile', 'memories', 'summaries', 'inferred']
 
   const totalMemories = memoryData
     ? (memoryData.layers.core?.length ?? 0) +
@@ -167,6 +174,23 @@ export default function MemoryViewerModal({ onClose }: Props) {
       return bits.join(' · ') || prefText(item) || key
     }
     return prefText(item) || key
+  }
+
+  const dropInferred = async (kind: 'baseline' | 'plan', label: string) => {
+    const extra = kind === 'plan' ? '\n（近期备好的对策会一起撤掉，下次聊到再重新想。）' : ''
+    if (!window.confirm(`撤掉「${label}」？\n\n这些是她**猜**的相处分寸，不是你说过的话。${extra}`)) return
+    try {
+      await api.eraseEmotionState(useStore.getState().userId, kind)
+      setInferred((cur) => {
+        if (!cur) return cur
+        return kind === 'baseline'
+          ? { ...cur, baseline: null, baseline_line: '', baseline_age_seconds: null }
+          : { ...cur, plans: [] }
+      })
+      setActionMsg(kind === 'baseline' ? '撤掉了。她还会再总结，但得再聊一阵。' : '对策撤掉了，下次聊到这事她重新想。')
+    } catch (e) {
+      setActionMsg(`没撤掉：${e instanceof Error ? e.message : '后端没在跑'}，还在原地`)
+    }
   }
 
   const dropProfileEntry = async (section: string, key: string, index = -1) => {
@@ -330,6 +354,10 @@ export default function MemoryViewerModal({ onClose }: Props) {
                 onWrong={sayWrong}
               />
             </>
+          )}
+
+          {!loading && !error && activeTab === 'inferred' && (
+            <InferredView inferred={inferred} onErase={dropInferred} />
           )}
 
           {!loading && !error && activeTab === 'summaries' && (
@@ -772,4 +800,75 @@ function prefLabel(key: string): string {
     other: '其他',
   }
   return map[key] || key
+}
+
+
+/** 她"猜"出来的东西单独一页：看得见、能撤，且不混进她说过的事实里 */
+function InferredView({
+  inferred,
+  onErase,
+}: {
+  inferred: EmotionStateResponse | null
+  onErase: (kind: 'baseline' | 'plan', label: string) => void
+}) {
+  const b = inferred?.baseline ?? null
+  const plans = (inferred?.plans ?? []).filter((p) => !p.expired)
+  const minsLeft = (sec: number) => Math.max(0, Math.round((sec * 1000 - Date.now()) / 60000))
+  if (!b && !plans.length) {
+    return (
+      <div className="mem-empty">
+        这一页还空着。聊得多了，她会总结出"平时该用什么语气接你"，也会在你提到医院、答辩这类事时
+        提前把分寸想好——这些都是**猜的**，不是你说过的话，看着不对就划掉。
+      </div>
+    )
+  }
+  return (
+    <div className="mem-profile">
+      <div className="mem-hint">
+        这一页全是她猜的。划掉不影响她记得的事实；想让她换个说法，直接在对话里说一句「你记错了，……」。
+      </div>
+      {b && (
+        <div className="mem-emo-row">
+          <span className="mem-emo-key">相处总结</span>
+          <div className="mem-pref-tags">
+            {b.tone_default && <span className="mem-pref-tag">{b.tone_default}</span>}
+            {b.baseline_emotion && <span className="mem-pref-tag">底色{b.baseline_emotion}</span>}
+            {(b.trigger_topics ?? []).map((t, i) => (
+              <span key={`t${i}`} className="mem-pref-tag mem-pref-tag--warn">
+                易被{t}牵着
+              </span>
+            ))}
+            {(b.landmines ?? []).map((t, i) => (
+              <span key={`l${i}`} className="mem-pref-tag mem-pref-tag--warn">
+                避开{t}
+              </span>
+            ))}
+            {b.comfort_style && <span className="mem-pref-tag">吃「{b.comfort_style}」这一套</span>}
+            <button className="mem-tag-x" title="这条不对，划掉" onClick={() => onErase('baseline', '相处总结')}>
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+      {plans.map((p) => (
+        <div className="mem-emo-row" key={p.topic}>
+          <span className="mem-emo-key">「{p.topic}」这会儿的分寸</span>
+          <div className="mem-pref-tags">
+            {p.data.say && <span className="mem-pref-tag">先提：{p.data.say}</span>}
+            {p.data.followup && <span className="mem-pref-tag">可问：{p.data.followup}</span>}
+            {(p.data.avoid ?? []).map((t, i) => (
+              <span key={i} className="mem-pref-tag mem-pref-tag--warn">
+                避开：{t}
+              </span>
+            ))}
+            {p.data.tone && <span className="mem-pref-tag">语气{p.data.tone}</span>}
+            <span className="mem-pref-tag">{minsLeft(p.expires_at)} 分钟内有效</span>
+            <button className="mem-tag-x" title="这次猜得不对，划掉" onClick={() => onErase('plan', p.topic)}>
+              ×
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
 }

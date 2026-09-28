@@ -2116,6 +2116,14 @@ def emotion_plan_double_gate():
             bad.append("模型说读不出细节，却还是存了对策")
         if ES.sanitize_plan({"say": "", "followup": ""}, "健康"):
             bad.append("空对策被消毒成可用（宁可没有）")
+        # 模型爱写"别打趣她妈妈养花"，前面再挂"这会儿避开"就是双重否定（真界面抓到过）
+        dirty = ES.sanitize_plan({"say": "先问睡眠", "followup": "", "tone": "轻一点",
+                                  "avoid": ["别打趣她妈妈养花的事", "不要追问失眠原因",
+                                            "勿提生日还早"]}, "家人")
+        if not dirty or any(a.startswith(("别", "不要", "勿")) for a in dirty["avoid"]):
+            bad.append(f'avoid 开头的"别"没剥掉，读起来是双重否定：{(dirty or {}).get("avoid")}')
+        if "、".join(dirty["avoid"]) != "打趣她妈妈养花的事、追问失眠原因、提生日还早":
+            bad.append(f"剥完的样子不对：{dirty['avoid']}")
         # ④ 红线：这一切不许碰长期记忆，也不许被检索命中
         if len(mm._get_user_memories(user)) != before:
             bad.append("预热往 memories 里写了行——推断冒充事实")

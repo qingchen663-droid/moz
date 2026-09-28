@@ -10,6 +10,7 @@ import type {
   MemoryDetailResponse,
   UserProfileResponse,
   CareItem,
+  EmotionStateResponse,
   CareRelatedNode,
   CareEdge,
   CareSettings,
@@ -305,6 +306,16 @@ export const api = {
   getCareRelated(userId: string, itemId: string, limit = 3): Promise<{ related: CareRelatedNode[] }> {
     const q = `user_id=${encodeURIComponent(userId)}&type=item&id=${encodeURIComponent(itemId)}&limit=${limit}`
     return request(`/care/related?${q}`)
+  },
+
+  getEmotionState(userId: string): Promise<EmotionStateResponse> {
+    return request(`/emotion/state?user_id=${encodeURIComponent(userId)}`)
+  },
+
+  eraseEmotionState(userId: string, kind: 'baseline' | 'plan'): Promise<{ ok: boolean; deleted: number }> {
+    return request(`/emotion/state?user_id=${encodeURIComponent(userId)}&kind=${kind}`, {
+      method: 'DELETE',
+    })
   },
 
   getCareGraph(userId: string): Promise<{ edges: CareEdge[]; hubs: Record<string, number> }> {

@@ -65,6 +65,29 @@ export type CareKind = 'birthday' | 'event' | 'promise' | 'checkin' | 'health' |
 
 export type CareRepeat = 'none' | 'daily' | 'weekly' | 'yearly'
 
+export interface EmotionPlanEntry {
+  topic: string
+  data: { say?: string; avoid?: string[]; tone?: string; followup?: string }
+  expires_at: number
+  expired: boolean
+}
+
+export interface EmotionStateResponse {
+  baseline: {
+    tone_default?: string
+    baseline_emotion?: string
+    trigger_topics?: string[]
+    landmines?: string[]
+    comfort_style?: string
+  } | null
+  baseline_line: string
+  baseline_age_seconds: number | null
+  revision: number
+  plans: EmotionPlanEntry[]
+  stats: { baseline_present: boolean; plans: number; plans_live: number; daily_baseline: number }
+  agreement: { samples: number; rate: number | null }
+}
+
 export interface CareRelatedNode {
   type: string
   id: string
