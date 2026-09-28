@@ -135,3 +135,9 @@ cd frontend && npm test
 - 对话与记忆全部保存在本地 `backend/conversations/` 与 `backend/memory_store/`，不会上传到任何第三方
 - 唯一的外部通信是你自己配置的 LLM 服务商 API
 - `.env`、数据目录均已列入 `.gitignore`，不会被提交
+- ## 致谢
+感谢 [f-api.site](https://www.f-api.site) 为本项目提供的接口服务与技术支持。
+感谢所有为本项目提交 Issue、PR 的贡献者，也感谢开源社区。
+如果本项目对你有帮助，欢迎 Star ⭐！
+
+
