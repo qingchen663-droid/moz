@@ -185,7 +185,7 @@ def tiny_jpeg():
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def relay_bench(sizes, with_extra=True):
+def relay_bench(sizes, with_extra=True, repeats=2):
     """含中转：每个条数起一个沙箱后端，量真 ttft。"""
     sys.path.insert(0, str(BACKEND))
     import memory_manager as MM
@@ -229,18 +229,20 @@ def relay_bench(sizes, with_extra=True):
             if not ready:
                 print(f"  记忆 {n} 条：沙箱没起来，看 {tmp / 'server.log'}")
                 continue
-            cold = chat_timed(port, PLAIN)          # 冷启动第一句（索引未缓存）
-            warm = chat_timed(port, PLAIN)          # 同一进程第二句
-            wait_queue_drained(port)
-            rows.append((n, "普通·冷启动", cold))
-            rows.append((n, "普通·热缓存", warm))
+            for i in range(repeats):
+                # 第 1 句含索引冷启动，后面的算热缓存；同一句重复量才能把中转噪声摊开
+                r = chat_timed(port, PLAIN)
+                rows.append((n, f"普通·第{i + 1}句", r))
+                wait_queue_drained(port)
             if with_extra and n == sizes[len(sizes) // 2]:
                 hist = []
                 for i in range(30):
                     hist.append({"role": "user", "content": f"第{i}句闲聊记录，说了一点工作{i}和家里{i}"})
                     hist.append({"role": "assistant", "content": f"嗯嗯收到{i}，那件事我记得{i}"})
                 r_hist = chat_timed(port, "我周末想回去看看她", history=hist)
+                wait_queue_drained(port)
                 r_sens = chat_timed(port, SENSITIVE)
+                wait_queue_drained(port)
                 r_img = chat_timed(port, "这张图是什么颜色？只回颜色名", image=tiny_jpeg())
                 rows.append((n, "30 条长历史", r_hist))
                 rows.append((n, "敏感（等一次）", r_sens))
@@ -272,13 +274,14 @@ def main():
     ap.add_argument("--local", action="store_true", help="只量本地部分（不发中转请求）")
     ap.add_argument("--sizes", default="", help="逗号分隔的记忆条数，如 0,10,100,1000")
     ap.add_argument("--no-extra", action="store_true", help="跳过敏感/长历史/带图三种情况")
+    ap.add_argument("--repeats", type=int, default=2, help="每档重复几句普通探针（摊开中转噪声）")
     a = ap.parse_args()
     sizes = [int(x) for x in a.sizes.split(",")] if a.sizes else (
         [0, 10, 100, 1000] if a.local else [0, 10, 100])
     if a.local:
         local_bench(sizes)
     else:
-        relay_bench(sizes, with_extra=not a.no_extra)
+        relay_bench(sizes, with_extra=not a.no_extra, repeats=a.repeats)
 
 
 if __name__ == "__main__":
