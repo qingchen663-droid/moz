@@ -53,11 +53,20 @@ class SaveQueue:
                 worker TEXT,
                 last_error TEXT,
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'turn',
+                topic TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_save_jobs_status ON save_jobs(status, created_at);
             """
         )
+        # 老库里已经有的 save_jobs 表：补两列（与 care_graph._migrate 同一套路，不靠人工迁移）
+        for column, declaration in (("kind", "TEXT NOT NULL DEFAULT 'turn'"),
+                                    ("topic", "TEXT NOT NULL DEFAULT ''")):
+            try:
+                self._conn().execute(f"ALTER TABLE save_jobs ADD COLUMN {column} {declaration}")
+            except sqlite3.OperationalError:
+                pass          # 已经在了
         self._conn().commit()
 
     def enqueue(
@@ -68,9 +77,15 @@ class SaveQueue:
         conversation_id: Optional[str] = None,
         emotion_type: Optional[str] = None,
         emotion_intensity: Optional[float] = None,
+        kind: str = "turn",
+        topic: str = "",
     ) -> Optional[int]:
         """登记一轮落库。只有用户那句话是空的才不占队列：
-        moz 没答上来（中转 500）那一轮，用户说过的话照样得记住。"""
+        moz 没答上来（中转 500）那一轮，用户说过的话照样得记住。
+
+        `kind='prewarm'` 是给情感预热用的：同一个单飞 worker 顺序消化，
+        免得另起线程把中转打出风暴（设计文档 §7）。
+        """
         if not (user_message or "").strip():
             return None
         reply = (reply or "").strip()
@@ -79,13 +94,29 @@ class SaveQueue:
         cur = conn.execute(
             """INSERT INTO save_jobs
                (user_id, conversation_id, user_message, reply, emotion_type,
-                emotion_intensity, status, attempts, created_at, updated_at)
-               VALUES (?,?,?,?,?,?, 'pending', 0, ?, ?)""",
+                emotion_intensity, status, attempts, created_at, updated_at, kind, topic)
+               VALUES (?,?,?,?,?,?, 'pending', 0, ?, ?, ?, ?)""",
             (user_id, conversation_id, user_message, reply, emotion_type,
-             emotion_intensity, now, now),
+             emotion_intensity, now, now, kind, topic),
         )
         conn.commit()
         return int(cur.lastrowid)
+
+    def queued_for(self, user_id: str, kind: str, topic: str) -> bool:
+        """这个主题的预热已经排在路上（或刚跑完没过期）——别再排第二遍。"""
+        row = self._conn().execute(
+            "SELECT 1 FROM save_jobs WHERE user_id=? AND kind=? AND topic=?"
+            " AND status IN ('pending','running','done') LIMIT 1",
+            (user_id, kind, topic),
+        ).fetchone()
+        return row is not None
+
+    def hourly_count(self, kind: str, within_seconds: float = 3600.0) -> int:
+        row = self._conn().execute(
+            "SELECT COUNT(*) AS n FROM save_jobs WHERE kind=? AND created_at > ?",
+            (kind, time.time() - within_seconds),
+        ).fetchone()
+        return int(row["n"]) if row else 0
 
     def claim(self, worker: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """取最早一条 pending 并原子地占为 running；没有则返回 None。"""

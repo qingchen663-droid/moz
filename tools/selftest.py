@@ -103,7 +103,7 @@ READ_ENDPOINTS = [
     "/health", f"/conversations/{USER}", f"/memory/{USER}/stats", f"/memory/{USER}/detail",
     "/config/model", "/config/model-presets", "/config/saved-models", "/config/prompt", "/users",
     f"/care/items?user_id={USER}", f"/care/settings?user_id={USER}", f"/care/pending?user_id={USER}",
-    f"/care/save-queue?user_id={USER}",
+    f"/care/save-queue?user_id={USER}", f"/emotion/state?user_id={USER}",
     f"/profile/{USER}", "/logs?limit=5", f"/export/{USER}",
 ]
 
@@ -2059,6 +2059,92 @@ def emotion_baseline_honest():
     return "; ".join(bad) or True
 
 
+def emotion_plan_double_gate():
+    """L2 临时对策：主题不对不许用、过期不许用，而且**绝不进长期记忆**。
+
+    全打桩：预热也是模型调用，快检门禁不许碰中转。
+    """
+    import json
+    import shutil
+    import tempfile
+    from types import SimpleNamespace
+
+    import emotion_state as ES
+    import memory_manager as MM
+    from save_queue import SaveQueue
+
+    bad = []
+    d = tempfile.mkdtemp()
+    try:
+        ES.reset_plan_stats()
+        store = ES.EmotionStore(os.path.join(d, "e.db"))
+        mm = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "m.db"))
+        mm.embedding_service.get_embedding = lambda t: None
+        user = "plan-user"
+        for text in ["用户的妈妈喜欢养花", "用户的妈妈生日是10月5号",
+                     "用户经常加班到十点才到家"]:
+            mm.add_memory(user, text, category=MM.MemoryCategory.FACT)
+        before = len(mm._get_user_memories(user))
+
+        class FakeLLM:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def invoke(self, messages):
+                return SimpleNamespace(content=self.payload)
+
+        payload = json.dumps({"say": "先问阿姨那盆花现在怎么样", "avoid": ["别拿加班打趣"],
+                              "tone": "轻一点", "followup": "这周还加班吗",
+                              "insufficient": False}, ensure_ascii=False)
+        plan = ES.build_plan(store, mm, None, user, "家人", llm=FakeLLM(payload))
+        if not plan:
+            bad.append("有效对策被判成不成立")
+        line = ES.plan_for(store, user, ["家人"], now=time.time())
+        if not line or "先问阿姨那盆花" not in line:
+            bad.append(f"备好且没过期的对策没被用上：{line!r}")
+        # ① 主题闸：家人备的对策不许串到工作上
+        if ES.plan_for(store, user, ["工作"], now=time.time()):
+            bad.append("工作那句话吃到了「家人」的对策（主题闸没关）")
+        # ② 时间闸：过期就作废，而且要计数（不计数等于闸门是否在闸都不知道）
+        skipped0 = ES.plan_stats()["expired_skipped"]
+        if ES.plan_for(store, user, ["家人"], now=time.time() + ES.PLAN_TTL + 60):
+            bad.append("过期的对策还在用")
+        if ES.plan_stats()["expired_skipped"] <= skipped0:
+            bad.append("过期被拦下却没计数，等于这项门禁是摆设")
+        # ③ 依据不足 / 空对策不许留壳
+        if ES.build_plan(store, mm, None, user, "宠物", llm=FakeLLM('{"insufficient": true}')):
+            bad.append("模型说读不出细节，却还是存了对策")
+        if ES.sanitize_plan({"say": "", "followup": ""}, "健康"):
+            bad.append("空对策被消毒成可用（宁可没有）")
+        # ④ 红线：这一切不许碰长期记忆，也不许被检索命中
+        if len(mm._get_user_memories(user)) != before:
+            bad.append("预热往 memories 里写了行——推断冒充事实")
+        hits = [m.content for m in mm.search_memories(user, "先问阿姨那盆花现在怎么样")]
+        if any("先问阿姨" in h for h in hits):
+            bad.append(f"对策能被检索当成事实召回：{hits}")
+        # ⑤ 排队：同主题不排第二遍；超过每小时额度直接不排
+        queue = SaveQueue(os.path.join(d, "q.db"))
+        topics = ES.schedule_prewarm(store, queue, None, user, "我妈生日快到了", ["家人"])
+        if topics:
+            bad.append("已经有活的对策还去排队预热")
+        queued = ES.schedule_prewarm(store, queue, None, user, "经常加班到十点", ["工作"])
+        if queued != ["工作"] or queue.hourly_count("prewarm") != 1:
+            bad.append(f"该排的没排进去：{queued}")
+        ES.schedule_prewarm(store, queue, None, user, "又提工作", ["工作"])
+        if queue.hourly_count("prewarm") != 1:
+            bad.append("同主题排了第二遍（去重没生效）")
+        many = ES.schedule_prewarm(store, queue, None, user, "加班和考试",
+                                   ["工作", "考试", "钱"], cap=1)
+        if many:
+            bad.append(f"每小时上限 1 却还排进了 {many}")
+        if ES.plan_stats()["quota_skipped"] < 1:
+            bad.append("额度拦下却没计数")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    return "; ".join(bad) or True
+
+
 def frontend_no_junk():
     """孤儿样式/备份文件：曾经因为弹窗样式只在 ModelDialog.new.css 里而整块裸奔。"""
     comp = ROOT / "frontend" / "src" / "components"
@@ -2370,6 +2456,7 @@ def main():
     check("记忆质量底线", memory_quality_floor)
     check("首字路径没有上游往返", first_token_path_clear)
     check("情感基线不乱编", emotion_baseline_honest)
+    check("临时对策双闸", emotion_plan_double_gate)
     check("系统文案不进长期记忆", system_copy_not_memory)
     check("提问的回答不单独存成事实", question_answer_not_memory)
     check("同一句话不存两条重复事实", same_turn_no_duplicate_facts)

@@ -101,6 +101,7 @@ class AgentState(TypedDict):
     emotion_analysis: Optional[Dict]                # 情感分析结果
     emotion_summary: Optional[str]                  # 情感摘要（供对话 Agent 使用）
     baseline_context: Optional[str]                 # L1 情感基线（从她说过的事里总结的）
+    plan_context: Optional[str]                     # L2 这一阵聊这件事的分寸（后台备好的对策）
 
     # 记忆 Agent 输出
     retrieved_memories: Optional[List[Dict]]        # 检索到的相关记忆
@@ -447,6 +448,9 @@ def _build_dialogue_messages(state: AgentState) -> list:
     baseline_context = state.get("baseline_context", "")
     if baseline_context:
         context_parts.append(f"和她相处下来的感觉：{baseline_context}")
+    plan_context = state.get("plan_context", "")
+    if plan_context:
+        context_parts.append(f"聊这件事这会儿的分寸（后台刚想过）：{plan_context}")
     if memory_context:
         context_parts.append(f"你记得关于用户的事：{memory_context}")
     followup_text = ""
@@ -707,12 +711,13 @@ class SaveDeps:
     """一轮后台落库要用的那几个管理器，由服务端启动时装配一次。"""
 
     def __init__(self, memory_manager=None, working_memory_store=None,
-                 profile_manager=None, care_store=None, care_graph=None):
+                 profile_manager=None, care_store=None, care_graph=None, emotion_store=None):
         self.memory_manager = memory_manager
         self.working_memory_store = working_memory_store
         self.profile_manager = profile_manager
         self.care_store = care_store
         self.care_graph = care_graph
+        self.emotion_store = emotion_store
 
 
 def _emotion_from_job(job: Dict):
@@ -900,6 +905,12 @@ def run_emotion_workflow_streaming(
             if emotion_store is not None:
                 # L1：一次本地读，不调模型；没有基线就是空串（新用户就该什么都不加）
                 state["baseline_context"] = emotion_store.prompt_line(user_id)
+                # L2：上一轮备好的对策（过期或主题不对就不认），以及这一轮该新预热的主题
+                line = emotion_state.plan_for(emotion_store, user_id, live["topics"])
+                if line:
+                    state["plan_context"] = line
+                emotion_state.schedule_prewarm(emotion_store, save_queue, save_worker,
+                                               user_id, user_message, live["topics"])
 
             retrieval_task = asyncio.create_task(asyncio.to_thread(
                 _run_memory_retrieval, initial_state, memory_manager, working_memory_store))

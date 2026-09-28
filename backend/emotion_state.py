@@ -615,3 +615,196 @@ async def emotion_heartbeat(store: EmotionStore, memory_manager, care_store,
         except Exception as e:  # noqa: BLE001
             logger.warning("[情感基线] 这轮检查失败（不影响回话）: %s", e)
         await asyncio.sleep(interval)
+
+
+# ── L2 临时情感对策：聊到某类事件时，提前在后台把那块的记忆想清楚 ──────────
+PLAN_TTL = 30 * 60.0
+PLAN_TTL_SENSITIVE = 5 * 60.0        # 医院/忌日这类话题改口快，对策只信 5 分钟以内的
+PREWARM_HOURLY_CAP = int(os.environ.get("MOZ_PREWARM_HOURLY_CAP", "6"))
+
+PLAN_PROMPT = """你是"临时对策"模块。她现在聊到了「{topic}」。
+下面是关于这件事的既有记录，以及她说这类事时的情绪档。请给出**这一阵**跟她聊这件事的分寸。
+
+严格输出 JSON，不要多余文字：
+{{
+  "say": "可以先提起的一句，不超过25字，必须落在给到的事实上",
+  "avoid": ["这会儿别说什么/别打趣什么，最多3条"],
+  "tone": "语气，6字以内，例如 轻一点、别追问",
+  "followup": "可以顺着问的一句，不超过20字",
+  "insufficient": false
+}}
+
+规则：
+- 只用给到的记录，不许编造人名、时间、病情。
+- 记录里读不出这件具体事的细节就输出 {{"insufficient": true}}。
+- 全用中文自然语言，别出现英文键名、别写"用户"。"""
+
+_COUNTERS = {"asked": 0, "hit": 0, "expired_skipped": 0, "dup_skipped": 0,
+             "quota_skipped": 0, "built": 0, "failed": 0}
+
+
+def bump_counter(name: str, n: int = 1) -> None:
+    _COUNTERS[name] = _COUNTERS.get(name, 0) + n
+
+
+def plan_stats() -> Dict[str, int]:
+    return dict(_COUNTERS)
+
+
+def reset_plan_stats() -> None:
+    for key in list(_COUNTERS):
+        _COUNTERS[key] = 0
+
+
+def sanitize_plan(raw: Dict[str, Any], topic: str) -> Optional[Dict[str, Any]]:
+    if not raw or raw.get("insufficient"):
+        return None
+    say = _clean_text(raw.get("say"), 40)
+    followup = _clean_text(raw.get("followup"), 34)
+    tone = _clean_text(raw.get("tone"), 12)
+    avoid = []
+    for item in (raw.get("avoid") or [])[:3]:
+        text = _clean_text(item, 26)
+        # 模型爱写成"别打趣她妈妈养花"，前面再挂一句"这会儿避开"就成了双重否定
+        for prefix in ("千万不要", "不要", "不可", "别", "勿"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip("，,、 ")
+                break
+        if text and text not in avoid:
+            avoid.append(text)
+    if not (say or followup):
+        return None            # 一句可说的话都没有就别留壳
+    return {"topic": _clean_text(topic, 12), "say": say, "avoid": avoid,
+            "tone": tone, "followup": followup}
+
+
+def plan_line(data: Dict[str, Any]) -> str:
+    bits = []
+    if data.get("say"):
+        bits.append(f"可以先提：{data['say']}")
+    if data.get("followup"):
+        bits.append(f"顺着可以问：{data['followup']}")
+    if data.get("avoid"):
+        bits.append("这会儿避开：" + "、".join(data["avoid"]))
+    if data.get("tone"):
+        bits.append(f"语气{data['tone']}")
+    return "；".join(bits)
+
+
+def topic_plan(store: EmotionStore, user_id: str, topic: str,
+               now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """取这个主题的对策，**双闸**：过期不许用、主题不对不许用。"""
+    now = time.time() if now is None else now
+    row = store.get(user_id, "plan", topic)
+    if row is None:
+        return None
+    if row["expires_at"] <= now:
+        bump_counter("expired_skipped")          # 拦住了才计数，用来证明闸门真的在闸
+        return None
+    return row["data"]
+
+
+def plan_for(store: EmotionStore, user_id: str, topics: List[str],
+             now: Optional[float] = None) -> str:
+    """本轮要用的那行对策（读不到就空串，绝不因此耽误开口）。"""
+    for topic in topics or []:
+        data = topic_plan(store, user_id, topic, now=now)
+        if data:
+            bump_counter("hit")
+            return plan_line(data)
+    return ""
+
+
+def gather_topic_evidence(memory_manager, care_store, user_id: str, topic: str) -> List[str]:
+    lines: List[str] = []
+    for m in active_memories(memory_manager, user_id):
+        if topic_of(m.content) == topic or topic in m.content:
+            emotion = getattr(getattr(m, "emotion", None), "value", None)
+            tag = f"[{EMOTION_CN.get(emotion, emotion)}]" if emotion else ""
+            lines.append(f"{tag}{m.content}")
+    if care_store is not None:
+        try:
+            for item in care_store.list_items(user_id, status=None):
+                title = (item.get("title") or "").strip()
+                if title and (topic in title or topic_of(title) == topic):
+                    lines.append(f"[她说过要惦记的] {title}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[情感对策] 读事项失败: %s", e)
+    tally = [t for t in emotion_tally(memory_manager, user_id) if t.startswith(f"{topic}：")]
+    if tally:
+        lines = [f"【她提这类事时的情绪】{'；'.join(tally)}"] + lines
+    return lines[:20]
+
+
+def build_plan(store: EmotionStore, memory_manager, care_store, user_id: str, topic: str,
+               sensitive: bool = False, llm=None, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """一次模型调用，把"这件事这会儿该怎么接"想清楚存下来。**绝不写进 memories。**"""
+    now = time.time() if now is None else now
+    evidence = gather_topic_evidence(memory_manager, care_store, user_id, topic)
+    if len(evidence) < 2:
+        logger.info("[情感对策] 「%s」只有 %d 条依据，这次不猜", topic, len(evidence))
+        return None
+    if llm is None:
+        from llm_config import get_llm_client
+        llm = get_llm_client(temperature=0.4, use_thinking=False)
+    try:
+        response = llm.invoke([
+            SystemMessage(content=PLAN_PROMPT.format(topic=topic)),
+            HumanMessage(content="现有记录：\n" + "\n".join(evidence)),
+        ])
+        content = (response.content or "").strip()
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        raw = json.loads(content)
+    except Exception as e:  # noqa: BLE001 - 预热失败不该影响任何人
+        bump_counter("failed")
+        logger.warning("[情感对策] 「%s」生成失败（跳过，不影响回话）: %s", topic, e)
+        return None
+    plan = sanitize_plan(raw if isinstance(raw, dict) else {}, topic)
+    if plan is None:
+        return None
+    ttl = PLAN_TTL_SENSITIVE if sensitive else PLAN_TTL
+    watermark, _ = collect_signals(memory_manager, care_store, None, user_id)
+    store.put(user_id, "plan", plan, topic=topic, source_watermark=watermark,
+              expires_at=now + ttl, confidence=0.5)
+    bump_counter("built")
+    logger.info("[情感对策] 「%s」备好，%d 分钟内有效：%s", topic, int(ttl // 60), plan_line(plan)[:70])
+    return plan
+
+
+async def run_prewarm(deps, job: Dict[str, Any]) -> None:
+    """单飞 worker 的预热入口（deps 是 SaveDeps，里面已经有记忆/事项/图那几个管理器）。"""
+    topic = (job.get("topic") or "").strip()
+    if not topic:
+        return
+    await asyncio.to_thread(
+        build_plan, deps.emotion_store, deps.memory_manager, deps.care_store,
+        job.get("user_id") or "default", topic,
+        bool((job.get("user_message") or "") and categorize(job["user_message"])["sensitive"]),
+    )
+def schedule_prewarm(store, queue, worker, user_id: str, user_message: str,
+                     topics: List[str], cap: Optional[int] = None) -> List[str]:
+    """把该预热的主题排进**已有的单飞队列**；返回真的排进去的主题。
+
+    去重（同主题已在路上/已有活的对策）、限流（每小时上限）、以及"绝不新开线程"
+    都收在这里——预热是锦上添花，不许把中转打出风暴（设计文档 §7）。
+    """
+    cap = PREWARM_HOURLY_CAP if cap is None else cap
+    queued: List[str] = []
+    if queue is None or not topics:
+        return queued
+    if queue.hourly_count("prewarm") >= cap:
+        bump_counter("quota_skipped", len(topics))
+        return queued
+    for topic in topics[:2]:
+        if topic_plan(store, user_id, topic) or queue.queued_for(user_id, "prewarm", topic):
+            bump_counter("dup_skipped")
+            continue
+        queue.enqueue(user_id, user_message, "", kind="prewarm", topic=topic)
+        bump_counter("asked")
+        queued.append(topic)
+    if queued and worker is not None:
+        worker.submit()
+    return queued

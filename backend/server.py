@@ -216,19 +216,30 @@ async def lifespan(app: FastAPI):
     _app_state["save_queue"].prune()
     if replayed:
         logger.info("发现 %d 轮上次没落完的对话，正在补记", replayed)
+    # L1/L2 情感预热存储（先建好，落库 worker 要拿它当依赖）
+    _app_state["emotion_store"] = emotion_state.EmotionStore(db_path)
     save_deps = SaveDeps(
         memory_manager=mm,
         working_memory_store=_app_state["working_memory_store"],
         profile_manager=profile_manager,
         care_store=_app_state["care_store"],
         care_graph=_app_state["care_graph"],
+        emotion_store=_app_state["emotion_store"],
     )
-    save_worker = SaveWorker(_app_state["save_queue"], lambda job: run_save_job(save_deps, job))
+
+    async def _dispatch_job(job):
+        """单飞队列消化两种任务：一轮落库、一次情感预热。
+        分派而不是另起线程——预热不许把中转打出风暴。"""
+        if job.get("kind") == "prewarm":
+            await emotion_state.run_prewarm(save_deps, job)
+        else:
+            await run_save_job(save_deps, job)
+
+    save_worker = SaveWorker(_app_state["save_queue"], _dispatch_job)
     _app_state["save_worker"] = save_worker
     save_task = asyncio.create_task(save_worker.run())
 
     # L1 情感基线：每 60 秒只问一句"该重算了吗"，该算才调模型（节奏见 emotion_state 顶部常量）
-    _app_state["emotion_store"] = emotion_state.EmotionStore(db_path)
     emotion_task = asyncio.create_task(emotion_state.emotion_heartbeat(
         _app_state["emotion_store"], mm, _app_state["care_store"], profile_manager,
         DEFAULT_USER_ID,
@@ -1441,7 +1452,8 @@ async def get_metrics():
         # 首字延迟：情感预热唯一的硬指标（改造前实测 27.9~90.8 秒）
         "first_token": emotion_state.ttft_stats(),
         "emotion": {**_app_state["emotion_store"].stats(DEFAULT_USER_ID),
-                    "agreement": emotion_state.agreement_stats()},
+                    "agreement": emotion_state.agreement_stats(),
+                    "prewarm": emotion_state.plan_stats()},
     }
 
 # ================================================================
