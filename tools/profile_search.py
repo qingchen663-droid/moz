@@ -122,6 +122,35 @@ def main():
     print(f"{'⑨ 写入新记忆后的首次检索':<40} {after_write:9.1f} {per(after_write):8.2f}"
           f"   ← 只为新记忆分词，老记忆复用派生数据")
 
+    print(f"{'⑩ 剪枝开/关配对对照（同一台子、同一句话，交替 6 次取中位）':<52}")
+    import memory_manager as MM
+    real_prep = MM.MemoryManager.__dict__["_prepare_query"].__func__
+
+    def prep_for(force_full: bool):
+        def prep(q):
+            out = dict(real_prep(q))
+            if force_full:
+                out["prunable"] = False      # 强制退回"每条都算一遍"的老路径
+            return out
+        return prep
+
+    samples = {"关掉剪枝（全扫）": True, "开着剪枝": False}
+    got = {name: [] for name in samples}
+    try:
+        for _ in range(6):
+            for name, force_full in samples.items():
+                MM.MemoryManager._prepare_query = staticmethod(prep_for(force_full))
+                t = time.perf_counter()
+                manager._keyword_search_raw(store, query, None, 0.0, user_id=USER)
+                got[name].append((time.perf_counter() - t) * 1000)
+    finally:
+        MM.MemoryManager._prepare_query = staticmethod(real_prep)
+    for name in samples:
+        v = sorted(got[name])
+        med = v[len(v) // 2]
+        print(f"  {name:<26} {med:9.1f} {per(med):8.2f}   "
+              f"（{v[0]:.1f}~{v[-1]:.1f}ms）")
+
     print("\n线上一次对话会拿 3 条改写各查一遍：")
     manager._invalidate_search_cache(USER)
     turn = once(lambda: [manager._keyword_search_raw(store, q, None, 0.0, user_id=USER)

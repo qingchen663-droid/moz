@@ -334,8 +334,17 @@ class EmbeddingService:
     # 失败冷却：这台机器上的向量服务是过期令牌，每次调用都要走完一次 401 才降级。
     # 没有冷却的话，每轮对话要为"整库补向量"打三次注定失败的 HTTP，白付 300ms+。
     _failure_cooldown = float(os.environ.get("MOZ_EMBED_FAILURE_COOLDOWN", "120"))
+    # 连续失败就退避着拉长（120 → 240 → 480 …… 封顶默认 30 分钟）：
+    # 固定 120 秒等于每两分钟就替用户付一次注定失败的往返，而那一下站在首字路径上。
+    # 一旦成功立刻复位——服务恢复时不该让用户多等半小时。
+    _failure_cooldown_max = float(os.environ.get("MOZ_EMBED_FAILURE_COOLDOWN_MAX", "1800"))
     _disabled_until = 0.0
     _last_failure_log = 0.0
+    _consecutive_failures = 0
+    # 给门禁和指标看的账：真打过几次、成/败各几次
+    tried = 0
+    succeeded = 0
+    failed = 0
 
     def __new__(cls):
         if cls._instance is None:
@@ -362,24 +371,36 @@ class EmbeddingService:
 
     def _note_failure(self, error: Exception) -> None:
         now = time.monotonic()
-        self._disabled_until = now + self._failure_cooldown
+        self.failed += 1
+        self._consecutive_failures += 1
+        # 2 的幂退避，封顶 _failure_cooldown_max
+        backoff = min(self._failure_cooldown * (2 ** (self._consecutive_failures - 1)),
+                      self._failure_cooldown_max)
+        self._disabled_until = now + backoff
         if now - self._last_failure_log >= self._failure_cooldown:
             self._last_failure_log = now
             logger.warning(
-                "[EmbeddingService] 向量服务不可用，%.0f 秒内不再尝试（检索走关键词）：%s",
-                self._failure_cooldown, error,
+                "[EmbeddingService] 向量服务不可用（连续第 %d 次），%.0f 秒内不再尝试（检索走关键词）：%s",
+                self._consecutive_failures, backoff, error,
             )
+
+    def _note_success(self) -> None:
+        """成功一次立刻复位：服务恢复之后不该让用户再多等一段退避。"""
+        self._disabled_until = 0.0
+        self._consecutive_failures = 0
+        self.succeeded += 1
 
     def get_embedding(self, text: str) -> Optional[List[float]]:
         """获取文本的语义向量。"""
         if not self.available():
             return None
+        self.tried += 1
         try:
             resp = self._client.embeddings.create(
                 model=self._model,
                 input=text,
             )
-            self._disabled_until = 0.0
+            self._note_success()
             return resp.data[0].embedding
         except Exception as e:
             self._note_failure(e)
@@ -391,13 +412,14 @@ class EmbeddingService:
             return []
         if not self.available():
             return [None] * len(texts)
+        self.tried += 1
         try:
             resp = self._client.embeddings.create(
                 model=self._model,
                 input=texts,
             )
             sorted_data = sorted(resp.data, key=lambda x: x.index)
-            self._disabled_until = 0.0
+            self._note_success()
             return [d.embedding for d in sorted_data]
         except Exception as e:
             self._note_failure(e)
@@ -1450,6 +1472,50 @@ class MemoryManager:
                     self._query_embedding_cache.pop(query, None)
         return result
 
+    # 整库补向量一次只允许一批在路上（非阻塞锁，照 SummaryService.maybe_cascade 的写法）
+    _backfill_lock = threading.Lock()
+
+    def _request_backfill_async(self, user_id: Optional[str], missing: List[MemoryItem]) -> bool:
+        """给还没有向量的记忆补算——在后台，本轮不等它。
+
+        本轮直接用已有的向量：语义那一路缺几条就少几条参与融合，关键词那一路完全不受影响。
+        补上了就存盘、作废该用户的索引缓存，**下一轮起语义检索自动生效**。
+        原来这一步是同步的，一批最多 `EMBED_BACKFILL_BATCH` 条文本打进一个请求，
+        而这台机器上的向量令牌是过期的：每过一次冷却就有一轮对话替整库付一次注定失败的往返。
+        """
+        if not missing or not self.embedding_service.available():
+            return False
+        if not self._backfill_lock.acquire(blocking=False):
+            return False          # 已经有一批在路上，不排第二遍
+        # 一次最多补一批，按重要性先补最值钱的：整库一把梭会在 5000 条时
+        # 发出一个 5000 条文本的请求，还没降级就先把自己卡住。
+        batch = sorted(missing, key=lambda m: m.importance, reverse=True)[:self.EMBED_BACKFILL_BATCH]
+
+        def _run():
+            try:
+                embeddings = self.embedding_service.get_embeddings_batch([m.content for m in batch])
+                backfilled = []
+                for m, emb in zip(batch, embeddings):
+                    if emb is not None:
+                        m.embedding = emb
+                        backfilled.append(m)
+                if not backfilled:
+                    return
+                with self._state_lock:
+                    if user_id:
+                        self._dirty.update((user_id, m.id) for m in backfilled)
+                    self._save_to_disk()
+                if user_id:
+                    self._invalidate_search_cache(user_id)
+                logger.info("[向量补算] 后台补好 %d 条，下一轮起语义检索生效", len(backfilled))
+            except Exception as e:
+                logger.warning("[向量补算] 后台这一批失败: %s", e)
+            finally:
+                self._backfill_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+
     def _semantic_search_raw(
         self,
         user_memories: Dict[str, MemoryItem],
@@ -1460,31 +1526,16 @@ class MemoryManager:
         query_embedding: Optional[List[float]] = None,
     ) -> List[Tuple[float, MemoryItem]]:
         """语义匹配检索（NumPy 批量矩阵运算，O(1) 矩阵乘替代 O(n) 循环）。"""
-        # 补算缺失 embedding：向量服务在冷却期就直接跳过，别为了"整库补向量"
-        # 反复打一个注定失败的接口（这台机器上这一步曾占掉每轮对话 300ms+）。
+        # 补算缺失 embedding 不在这里做网络请求，交给后台一条线程（见 _request_backfill_async）：
+        # 这一步原来就站在首字路径上，一批最多 64 条文本打进一个请求，而这台机器上
+        # 向量服务是过期令牌——每过一次冷却就有一轮替整库付一次注定失败的往返。
         if self.embedding_service.available():
             missing = [
                 m for m in user_memories.values()
                 if m.embedding is None and m.importance >= min_importance and m.active()
             ]
             if missing:
-                # 一次最多补一批，按重要性先补最值钱的：整库一把梭会在 5000 条时
-                # 发出一个 5000 条文本的请求，还没降级就先把自己卡住。
-                missing.sort(key=lambda m: m.importance, reverse=True)
-                batch = missing[:self.EMBED_BACKFILL_BATCH]
-                embeddings = self.embedding_service.get_embeddings_batch([m.content for m in batch])
-                backfilled = []
-                for m, emb in zip(batch, embeddings):
-                    if emb is not None:
-                        m.embedding = emb
-                        backfilled.append(m)
-                if backfilled:
-                    with self._state_lock:
-                        if user_id:
-                            self._dirty.update((user_id, m.id) for m in backfilled)
-                        self._save_to_disk()
-                    if user_id:
-                        self._invalidate_search_cache(user_id)
+                self._request_backfill_async(user_id, missing)
         ids, matrix = self._build_search_index(user_id) if user_id else self._build_search_index_from(user_memories)
         if matrix is None or len(ids) == 0:
             return []
@@ -1565,15 +1616,27 @@ class MemoryManager:
         }
         score_denom = max(len(query_tokens), 1)
         length_denom = max(avgdl, 1)
+        prunable = prepared["prunable"]
+        q_g2, q_ascii, q_token_set = prepared["g2"], prepared["ascii"], prepared["token_set"]
         results = []
-        for memory, counts, dl, clean_content in documents:
+        for memory, counts, dl, clean_content, doc_g2 in documents:
+            # 剪枝：`_match_prepared` 的三条分支要么要正文里出现查询的 2 字连写、
+            # 要么要共享一个英文/数字词元；BM25 要么共享一个词元。三者都不成立的记忆
+            # 今天也必然是 0 分（下面 `if score > 0` 一样会把它筛掉），所以跳过是等价的——
+            # 省掉的正是每条记忆一遍的 24 次子串查找（实测 2 万条时这一步占单查询的三分之一）。
+            if prunable:
+                lex_possible = bool(doc_g2 & q_g2) or bool(counts.keys() & q_ascii)
+                if not lex_possible and not (counts.keys() & q_token_set):
+                    continue
+            else:
+                lex_possible = True
             bm25 = 0.0
             for token in query_tokens:
                 tf = counts.get(token)
                 if tf is None:
                     continue
                 bm25 += idf[token] * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / length_denom))
-            lexical = self._match_prepared(memory, prepared, clean_content)
+            lexical = self._match_prepared(memory, prepared, clean_content) if lex_possible else 0.0
             score = lexical + min(0.4, bm25 / score_denom)
             if score > 0:
                 results.append((score, memory))
@@ -1627,19 +1690,23 @@ class MemoryManager:
                 counts: Dict[str, int] = {}
                 for token in self._search_tokens(memory.content):
                     counts[token] = counts.get(token, 0) + 1
+                clean_content = "".join(c for c in memory.content.lower() if c.isalnum())
                 entry = (
                     counts,
                     sum(counts.values()),
-                    "".join(c for c in memory.content.lower() if c.isalnum()),
+                    clean_content,
                     memory.content,
+                    # 正文里相邻的两个字，剪枝用（跟查询侧的 g2 同一个口径）
+                    frozenset(clean_content[i:i + 2]
+                              for i in range(len(clean_content) - 1)),
                 )
                 if derived is not None:
                     derived[memory.id] = entry
-            counts, dl, clean_content, _ = entry
+            counts, dl, clean_content, _, doc_g2 = entry
             for token in counts:
                 df[token] = df.get(token, 0) + 1
             total_len += dl
-            documents.append((memory, counts, dl, clean_content))
+            documents.append((memory, counts, dl, clean_content, doc_g2))
         aggregate = (documents, df, len(documents), total_len / max(len(documents), 1))
         if cacheable:
             with self._state_lock:
@@ -1666,12 +1733,28 @@ class MemoryManager:
             for word_len in range(2, min(5, len(clean_query) + 1))
             for i in range(len(clean_query) - word_len + 1)
         ]
+        query_words = MemoryManager._split_words(query_lower)
+        tokens = MemoryManager._search_tokens(query)
+        # 剪枝用的三样，都是"能不能命中"的必要条件，不参与打分：
+        #   g2        = 清洗后正文里相邻的两个字；`_match_prepared` 的前两条分支都要靠它
+        #   ascii     = 英文/数字词元（第 3 条分支的英文回退）
+        #   prunable  = 这个查询能不能安全剪枝（下面那条注释解释什么时候不能）
+        g2 = frozenset(clean_query[i:i + 2] for i in range(len(clean_query) - 1))
+        # 只有当查询里每个空格分词都至少有 2 个字母数字时才能剪：
+        # 否则会出现"单字成词"（如「小 林 的」这种），那种命中既不在 2 字连写里、
+        # 也不在英文词元里，剪枝就会把真命中丢掉。宁可退化成全扫，不许漏召回。
+        prunable = (len(clean_query) >= 2 and query_words
+                    and all(sum(1 for c in w if c.isalnum()) >= 2 for w in query_words))
         return {
             "lower": query_lower,
             "clean_query": clean_query,
             "substrings": substrings,
-            "query_words": MemoryManager._split_words(query_lower),
-            "tokens": MemoryManager._search_tokens(query),
+            "query_words": query_words,
+            "tokens": tokens,
+            "token_set": frozenset(tokens),
+            "g2": g2,
+            "ascii": frozenset(t for t in tokens if t.isascii()),
+            "prunable": prunable,
         }
 
     @staticmethod

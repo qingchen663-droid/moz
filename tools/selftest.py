@@ -2334,6 +2334,248 @@ def stage_timings_add_up():
     return "; ".join(bad) or True
 
 
+def retrieval_pruning_parity():
+    """检索剪枝只许跳过"必然 0 分"的记忆——结果序列必须和全扫一模一样。
+
+    剪枝省掉的是每条记忆一遍的 24 次子串查找（2 万条时占单查询的三分之一）。
+    这里用同一批查询跑两遍：一遍允许剪枝、一遍强制全扫，逐条比对 (id, 分数)。
+    语料刻意掺了不好处理的形状：单字成词、跨标点才相邻、纯英文、极短正文、
+    moz 自己说过的话、提问形状的记忆。
+    """
+    import random
+    import shutil
+    import tempfile
+
+    import memory_manager as MM
+
+    bad = []
+    d = tempfile.mkdtemp()
+    real_prep = MM.MemoryManager.__dict__["_prepare_query"]
+    try:
+        mm = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "p.db"))
+        mm.embedding_service.get_embedding = lambda t: None
+        mm.embedding_service.get_embeddings_batch = lambda ts: [None] * len(ts)
+        rng = random.Random(11)
+        corpus = []
+        topics = ["体检", "答辩", "驾照", "香菜", "团子", "老郑", "青柠计划", "滨江", "复查", "搬家"]
+        shapes = [
+            "用户{t}那件事定在{n}号",
+            "用户提过{t}，细节是{t}{n}",           # 与查询共享 2 字连写
+            "用 户 {t} 的 安 排",                   # 单字成词：必须关掉剪枝
+            "用户说{t}……到底要不要去呢？",           # 提问形状
+            "user mentioned {t}3{t}2",              # 纯英文词元
+            "{t}",                                   # 极短正文（清洗后不足 2 字）
+            "续约，到时候再说{n}",                    # 跨标点才相邻
+            "用户后来在{n}号完成了{t}的事情",
+        ]
+        for i in range(320):
+            t = rng.choice(topics)
+            corpus.append(rng.choice(shapes).format(t=t, n=rng.randint(1, 30)) + f"（第{i}条）")
+        for text in corpus:
+            mm.add_memory("prune-user", text, category=MM.MemoryCategory.FACT)
+        if len([m for m in mm._get_user_memories("prune-user").values() if m.active()]) < 200:
+            return "语料没种够（被去重或降级了），这项没跑到路径"
+
+        queries = []
+        for _ in range(90):
+            base = rng.choice(corpus)
+            if rng.random() < 0.45:
+                base = rng.choice(topics) + rng.choice(["什么时候", "怎么办", "谁负责", "32"])
+            queries.append("".join(rng.sample(base, min(len(base), rng.randint(2, 8)))))
+        queries += ["团子", "续 约", "用 户 答 辩 的 安 排", "user mentioned 体检3体检2",
+                    "青柠计划的负责人是老郑", "滨江车管所"]
+
+        def raw_scores(force_full: bool):
+            def prep(q):
+                fn = real_prep.__func__ if hasattr(real_prep, "__func__") else real_prep
+                out = dict(fn(q))
+                if force_full:
+                    out["prunable"] = False
+                return out
+            MM.MemoryManager._prepare_query = staticmethod(prep)
+            mem = dict(mm._get_user_memories("prune-user"))
+            out = []
+            for q in queries:
+                pairs = mm._keyword_search_raw(mem, q, None, 0.0, user_id="prune-user")
+                out.append([(m.id, round(s, 12)) for s, m in pairs])
+            return out
+
+        full = raw_scores(force_full=True)
+        pruned = raw_scores(force_full=False)
+        # 至少要有查询真的走了剪枝，否则这项是空过的
+        sample = mm._prepare_query("青柠计划的负责人是老郑")
+        if not sample.get("prunable"):
+            bad.append("连正常中文查询都没被判成可剪枝，这条门禁没测到东西")
+
+        diffs = [(q, a, b) for q, a, b in zip(queries, full, pruned) if a != b]
+        if diffs:
+            q, a, b = diffs[0]
+            bad.append(f"剪枝改变了结果（{len(diffs)}/{len(queries)} 条查询）："
+                       f"「{q}」全扫 {len(a)} 条 / 剪枝 {len(b)} 条，"
+                       f"前三个 {a[:3]} vs {b[:3]}")
+
+        # 反向对照：故意把剪枝条件写坏（漏掉"只共享一个字"的那一路），必须被上面抓到
+        def broken_prep(q):
+            fn = real_prep.__func__ if hasattr(real_prep, "__func__") else real_prep
+            out = dict(fn(q))
+            if out.get("prunable"):
+                out["g2"] = frozenset()          # 假装没有任何 2 字连写命中
+            return out
+        MM.MemoryManager._prepare_query = staticmethod(broken_prep)
+        mem = dict(mm._get_user_memories("prune-user"))
+        broken = [[(m.id, round(s, 12)) for s, m in
+                   mm._keyword_search_raw(mem, q, None, 0.0, user_id="prune-user")]
+                  for q in queries]
+        if broken == full:
+            bad.append("反向对照失效：把剪枝写坏也没让结果变化，这个对拍根本量不到东西")
+    finally:
+        MM.MemoryManager._prepare_query = real_prep
+        close_db_conn(mm)
+        shutil.rmtree(d, ignore_errors=True)
+    return "; ".join(bad) or True
+
+
+def backfill_off_the_clock():
+    """补算向量不许挡在本轮检索前面；失败要越退越远，成功一次立刻复位。
+
+    这台机器上向量令牌是过期的，原来每过一次冷却就有一轮对话替整库付一次注定失败的往返
+    （一批最多 64 条文本打进一个请求）。全程打桩，绝不真连向量服务。
+    """
+    import shutil
+    import tempfile
+
+    import memory_manager as MM
+
+    bad = []
+    d = tempfile.mkdtemp()
+    mm = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "b.db"))
+    svc = mm.embedding_service
+    saved = (svc._client, getattr(svc, "_model", None), svc._failure_cooldown,
+             svc._failure_cooldown_max, svc._disabled_until, svc._consecutive_failures,
+             svc.tried, svc.succeeded, svc.failed)
+
+    def wait_free_backfill(cap=6.0):
+        deadline = time.time() + cap
+        while time.time() < deadline:
+            if MM.MemoryManager._backfill_lock.acquire(blocking=False):
+                MM.MemoryManager._backfill_lock.release()
+                return True
+            time.sleep(0.02)
+        return False
+
+    def pin_open():
+        """等上一批后台补算收干净，再把冷却状态摆正。
+
+        补算现在是后台线程，它失败会替整个进程 arm 冷却——不先排空就量到的是上一段的尾巴。
+        """
+        wait_free_backfill()
+        svc._disabled_until, svc._consecutive_failures = 0.0, 0
+
+    try:
+        for text in ["用户的体检安排在三月十二号", "用户的妈妈喜欢养花",
+                     "用户在滨江车管所换了驾照", "用户下周还要去复查"]:
+            mm.add_memory("backfill-user", text, category=MM.MemoryCategory.FACT)
+            # 种记忆时保留前面门禁留下的"绝不打上游"的桩：先摘桩再种就会真的发一次 401
+            # （上一版就这么漏过一手，日志里那条 401 是这条快检自己打的）
+            svc.get_embedding = lambda t: None
+        # 前面好几项快检会给这个**单例**服务挂上 `get_embeddings_batch = lambda ...` 却不还原，
+        # 于是后面的门禁量到的是别人的桩（不是真代码）。要量真路径就得先把这个桩摘掉。
+        svc.__dict__.pop("get_embeddings_batch", None)
+        # 冷却故意设长（30 秒、封顶 1 小时），让"冷却期内不再尝试"那段是确定的：
+        # 不会因为 30 次检索跑过了几十毫秒而误报；退避那段单独看倍数。
+        svc._failure_cooldown, svc._failure_cooldown_max = 30.0, 3600.0
+        tries = {"query": 0, "backfill": 0}
+
+        # 打桩打在**上游客户端**上，而不是替换 `get_embeddings_batch`：
+        # 冷却判断就写在那个方法里，把方法整个换掉等于把它一起绕过了（第一版就这么自欺过）
+        class FakeEmbeddings:
+            def create(self, model=None, input=None, **kw):
+                n = len(input) if isinstance(input, (list, tuple)) else 1
+                if n > 1:
+                    tries["backfill"] += 1
+                    time.sleep(0.25)      # 补库那一批原来就站在用户面前
+                else:
+                    tries["query"] += 1
+                raise RuntimeError("401 invalid authentication（打桩，不真连）")
+
+        class FakeClient:
+            embeddings = FakeEmbeddings()
+
+        svc._model = "fake-embed"
+        svc._client = FakeClient()
+        pin_open()
+        t0 = time.perf_counter()
+        hits = mm.search_memories("backfill-user", "体检", limit=5)
+        cost = (time.perf_counter() - t0) * 1000
+        if not hits:
+            return "连「体检」都检索不到东西，这项没跑到路径"
+        if cost > 120:
+            bad.append(f"本轮检索花了 {cost:.0f}ms——补库那一批（桩里 250ms）还挡在用户面前")
+        if tries["backfill"]:
+            bad.append(f"本轮替整库发了 {tries['backfill']} 批向量请求，应该一批都不发")
+        if tries["query"] != 1:
+            bad.append(f"查询向量打了 {tries['query']} 次，本轮应该只打一次")
+
+        # 补库那一批本身：直接问它，必须"立刻接走、后台去跑"
+        pin_open()
+        missing = [m for m in mm._get_user_memories("backfill-user").values() if m.active()]
+        t1 = time.perf_counter()
+        started = mm._request_backfill_async("backfill-user", missing)
+        handoff = (time.perf_counter() - t1) * 1000
+        if not started:
+            bad.append("_request_backfill_async 没接单（单飞锁没释放，或服务被判成不可用）")
+        if handoff > 80:
+            bad.append(f"把补库排进后台就花了 {handoff:.0f}ms，它自己就在挡路")
+        if not wait_free_backfill():
+            bad.append("后台补算的线程超过 6 秒还没收尾，单飞锁的释放路径有问题")
+        if tries["backfill"] < 1:
+            bad.append("后台那一批根本没发出去（接了单却没干活）")
+
+        # 冷却期内再检索 30 次：一次都不许再打
+        before_q, before_b = tries["query"], tries["backfill"]
+        for _ in range(30):
+            mm.search_memories("backfill-user", "体检", limit=5)
+        if (tries["query"], tries["backfill"]) != (before_q, before_b):
+            bad.append(f"冷却期内还是又打了 {tries['query'] - before_q} 次查询 /"
+                       f" {tries['backfill'] - before_b} 批补库")
+
+        # 退避要越退越长、要有封顶
+        base = svc._failure_cooldown
+        pin_open()
+        svc._note_failure(RuntimeError("a"))
+        first = svc._disabled_until - time.monotonic()
+        svc._note_failure(RuntimeError("b"))
+        svc._note_failure(RuntimeError("c"))
+        later = svc._disabled_until - time.monotonic()
+        if not (later > first and first >= base - 0.5 and later <= svc._failure_cooldown_max + 0.5):
+            bad.append(f"退避不对（基准 {base:.0f}s，首次 {first:.1f}s，三次后 {later:.1f}s，"
+                       f"封顶 {svc._failure_cooldown_max:.0f}s）")
+        # 成功一次必须复位，否则服务真恢复了也要多等一截
+        svc._note_success()
+        if svc._consecutive_failures or not svc.available() or svc.succeeded < 1:
+            bad.append("成功之后没复位：冷却时间/失败计数/成功计数三样都得归位")
+
+        # 反向对照：把退避写死成"不冷却"，上面那句"冷却期内不再尝试"必须测出差别
+        svc._failure_cooldown = svc._failure_cooldown_max = 0.0
+        pin_open()
+        before_q = tries["query"]
+        for _ in range(6):
+            mm.search_memories("backfill-user", "体检", limit=5)
+        if tries["query"] - before_q < 3:
+            bad.append("反向对照失效：冷却设成 0 也只打了一次，那些计数是假的")
+    finally:
+        wait_free_backfill()
+        (svc._client, svc._model, svc._failure_cooldown, svc._failure_cooldown_max,
+         svc._disabled_until, svc._consecutive_failures, svc.tried,
+         svc.succeeded, svc.failed) = saved
+        # 出去的时候给后面的门禁留"绝不打上游"的桩（快检铁律），别留真客户端出去乱跑
+        svc.get_embedding = lambda t: None
+        svc.get_embeddings_batch = lambda ts: [None] * len(ts)
+        close_db_conn(mm)
+        shutil.rmtree(d, ignore_errors=True)
+    return "; ".join(bad) or True
+
+
 def emotion_baseline_honest():
     """L1 情感基线：依据不够就不许总结，模型给的东西必须消毒，刷新要有节奏。
 
@@ -2858,6 +3100,8 @@ def main():
     check("数据库不变量", db_invariants)
     check("不遗忘只降到最低权重", capacity_policy_check)
     check("检索提速不改排序", keyword_parity_check)
+    check("检索剪枝不丢命中", retrieval_pruning_parity)
+    check("补向量不挡本轮", backfill_off_the_clock)
     check("落库队列重启不丢", save_queue_survives_restart)
     check("记忆质量底线", memory_quality_floor)
     check("首字路径没有上游往返", first_token_path_clear)
