@@ -37,7 +37,7 @@ from llm_config import get_llm_client
 from model_config import CHAT_MODEL, CHAT_BASE_URL, get_chat_api_key, detect_provider, resolve_api_key, PROVIDER_KEY_MAP
 from memory_manager import EmotionType, MemoryCategory, MemoryManager
 from working_memory import WorkingMemoryStore
-from emotion_graph import build_emotion_graph, run_emotion_workflow_streaming, load_prompt_config, save_prompt_config, get_dialogue_prompt, DIALOGUE_AGENT_PROMPT
+from emotion_graph import build_emotion_graph, run_emotion_workflow_streaming, load_prompt_config, save_prompt_config, get_dialogue_prompt, DIALOGUE_AGENT_PROMPT, CHAT_USE_THINKING
 from emotion_graph import SaveDeps, run_save_job
 from save_queue import SaveQueue, SaveWorker
 import emotion_state
@@ -483,6 +483,8 @@ async def chat(user_id: str, req: ChatRequest):
         raise HTTPException(status_code=500, detail="未配置 LLM_API_KEY")
 
     user_id = normalize_user_id(user_id)
+    # 秒表从这里起按：下面这几步（含会话文件的加锁读写）都在用户"看到第一个字之前"
+    request_started = time.time()
 
     # 主动关心要避开"用户正在聊"的时段；顺手把 TA 的话多/话少学进数据库
     gap_seconds = care_engine.note_user_activity(user_id)
@@ -501,14 +503,19 @@ async def chat(user_id: str, req: ChatRequest):
         cid = req.conversation_id or current_id
 
     async def event_stream():
+        stream_ready = time.time()
+        # 进到这里之前花掉的时间（路由体、会话文件加锁读写）也在用户的秒表上
+        emotion_state.record_stage("route_prep", stream_ready - request_started)
         lock = _turn_lock(user_id)
         errored = False     # 中转报错那一轮：记到该记的为止，最后不发 done
         if lock.locked():
             # 排队是常态（连点两次、托盘也发一条），别让界面看起来像卡死
             yield f"data: {json.dumps({'type': 'status', 'text': '上一条还在收尾，等一下'})}\n\n"
         await lock.acquire()
+        emotion_state.record_stage("lock_wait", time.time() - stream_ready)
         try:
             reply = ""
+            first_token_sent = False
             async for chunk in run_emotion_workflow_streaming(
                 memory_manager=_app_state.get("memory_manager"),
                 user_id=user_id,
@@ -528,6 +535,10 @@ async def chat(user_id: str, req: ChatRequest):
                 if chunk_type == "status":
                     yield f"data: {json.dumps({'type': 'status', 'text': chunk.get('text', '')})}\n\n"
                 elif chunk_type == "token":
+                    if not first_token_sent:
+                        first_token_sent = True
+                        # 这就是用户看到的"首字时间"：按下发送 → 第一个字离开后端
+                        emotion_state.record_stage("first_token", time.time() - request_started)
                     reply += chunk.get("text", "")
                     yield f"data: {json.dumps({'type': 'token', 'text': chunk.get('text', '')})}\n\n"
                 elif chunk_type == "reply":
@@ -1449,10 +1460,18 @@ async def get_metrics():
                 _metrics["llm_calls_duration_sum"] / _metrics["llm_calls_total"] * 1000, 1
             ) if _metrics["llm_calls_total"] > 0 else 0,
         },
-        # 首字延迟：情感预热唯一的硬指标（改造前实测 27.9~90.8 秒）
-        "first_token": emotion_state.ttft_stats(),
+        # 首字延迟：first_token = 收到请求 → 第一个字（等于界面上那块秒表）。
+        # 旧口径只量了"打到中转 → 中转吐字"这一段，自己单独认领一个名字，不许再混称。
+        "first_token": emotion_state.stage_stats("first_token"),
+        "first_token_relay": emotion_state.stage_stats("relay_ttfb"),
+        "first_token_stages": emotion_state.all_stage_stats(),
         "emotion": {**_app_state["emotion_store"].stats(DEFAULT_USER_ID),
                     "agreement": emotion_state.agreement_stats(),
+                    # 敏感主题那 45 秒的账：payoff_rate 低就该回来重拍上限
+                    "sensitive_wait": emotion_state.wait_stats(),
+                    # 开/关思考的参数到底发没发出去（不发出去，对照就是拿同一个请求比自己）
+                    "thinking": {**emotion_state.thinking_stats(),
+                                 "chat_use_thinking": CHAT_USE_THINKING},
                     "prewarm": emotion_state.plan_stats()},
     }
 

@@ -1891,17 +1891,17 @@ def first_token_path_clear():
 
         EG.emotion_analysis_node = fake_node
         EG.get_chat_client = lambda **kw: FakeClient(0.0)
-        # 查询改写走的是 llm_config 的客户端，上面的打桩盖不住它 —— 不打掉的话
-        # 这条快检会真打一次中转（铁律：快检不许碰大模型）
+        # 打桩只为"快检不许碰大模型"这条铁律；改写到底还站不站在首字路径上，
+        # 由下面单独那项「查询改写不挡首字」钉（它靠让 rewrite_query 一调用就炸来抓）
         real_rewrite = EG.rewrite_query
         EG.rewrite_query = lambda q: [q]
 
-        async def collect(message, wait_cap):
+        async def collect(message, wait_cap, history=None):
             EG.SENSITIVE_WAIT_SECONDS = wait_cap
             events, t0 = [], time.time()
             gen = EG.run_emotion_workflow_streaming(
                 memory_manager=mm, user_id="path-user", user_message=message,
-                conversation_history=[], conversation_id="c1")
+                conversation_history=history or [], conversation_id="c1")
             async for ev in gen:
                 events.append((round(time.time() - t0, 2), ev.get("type"), ev.get("text", "")[:12]))
             return events
@@ -1940,12 +1940,397 @@ def first_token_path_clear():
             bad.append(f"敏感判档或措辞不对：{sig}")
         if "stressed" in live_signal("今天加班到十点，好累")["emotion_summary"]:
             bad.append("英文标签漏进了中文措辞里")
+
+        # ④ 61 轮长历史：开口之前一次同步往返都不许有。
+        #    先说清这一支今天量到什么：`_sanitize_history` 把历史截到 HISTORY_MAX_MESSAGES 条，
+        #    比摘要触发线（SUMMARY_TRIGGER_ROUNDS 轮 = 60 条）还短，所以 /api/chat 上那段
+        #    摘要分支**根本跑不到**——真正在挡首字的是查询改写，不是它。这一条钉的是
+        #    "哪天放宽历史上限，摘要不许又变成开口前的同步等待"。
+        calls.update({"emotion_node": 0, "invoke": 0, "stream": 0})
+        requested: list = []
+        real_request = EG._request_summary_async
+        EG._request_summary_async = lambda uid, early, rounds: requested.append(rounds) or True
+        EG._summary_cache.pop("path-user", None)
+        hist61 = []
+        for i in range(61):
+            hist61.append({"role": "user", "content": f"第{i}句聊工作{i}和家里{i}"})
+            hist61.append({"role": "assistant", "content": f"收到{i}"})
+        reachable = len(EG._sanitize_history(hist61)) > EG.MAX_RECENT_ROUNDS * 2
+        try:
+            ev4 = asyncio.run(collect("我周末想回去看看她", 1.0, history=hist61))
+        finally:
+            EG._request_summary_async = real_request
+        if calls["invoke"]:
+            bad.append(f"61 轮长历史开口前还有 {calls['invoke']} 次同步往返（会话摘要又变回同步了）")
+        if reachable and not requested:
+            bad.append("长历史已经能触发摘要了，却没排进后台——既不等也不补，这段背景悄悄没了")
+        if next((t for t, k, _ in ev4 if k == "token"), None) is None:
+            bad.append("61 轮长历史一个 token 都没收到")
     finally:
         EG.emotion_analysis_node = fake_node_original
         EG.get_chat_client = real_get_client
         EG.rewrite_query = real_rewrite
         shutil.rmtree(d, ignore_errors=True)
 
+    return "; ".join(bad) or True
+
+
+def session_summary_off_the_clock():
+    """长对话的"之前聊了什么"必须后台补：本轮不挡首字、不排第二遍、下一句才吃到。
+
+    这里量的是**时间**而不是调用次数——摘要原来那次同步 `llm.invoke` 没有任何上限
+    （2026-09-28 实测长历史那轮 121.3 秒没回，最可能就是它和生成串在了一起）。
+    全程假客户端 + 假摘要服务：快检不许碰中转，也不许写 backend/moz.db。
+    """
+    from types import SimpleNamespace
+
+    import emotion_graph as EG
+
+    bad = []
+    RELAY_SLEEP = 0.4
+    user = "summary-async-user"
+    real_client, real_service = EG.get_chat_client, EG.get_summary_service
+    saved_cache, saved_lock = dict(EG._summary_cache), EG._summary_lock
+    calls = {"invoke": 0}
+    stored = []
+    try:
+        class SlowClient:
+            def invoke(self, messages):
+                calls["invoke"] += 1
+                time.sleep(RELAY_SLEEP)
+                return SimpleNamespace(content="那几周她提过答辩和妈妈的睡眠")
+
+        class FakeService:
+            def save_summary(self, uid, text, kind, key):
+                stored.append(text)
+
+            def cascade_async(self, uid):
+                pass
+
+            def format_for_prompt(self, uid):
+                return ""
+
+        EG.get_chat_client = lambda **kw: SlowClient()
+        EG.get_summary_service = lambda: FakeService()
+
+        hist = []
+        # 45 轮才够着那支摘要分支：`recent_rounds = min(轮数, MAX_RECENT_ROUNDS)`，
+        # 历史必须比 40 轮长才剩得出"更早的部分"。（/api/chat 上 `_sanitize_history`
+        # 先把历史截到 30 条，所以这一支今天是直接打 builder 才量得到。）
+        for i in range(45):
+            hist.append({"role": "user", "content": f"第{i}句聊工作{i}和家里{i}"})
+            hist.append({"role": "assistant", "content": f"收到{i}"})
+        state = {"user_id": user, "user_message": "我周末想回去看看她",
+                 "conversation_history": hist, "memory_context": "",
+                 "working_memory_text": "", "emotion_summary": ""}
+
+        # ① 本轮：拼装必须立刻返回（那段摘要还没生成出来，本轮就不该为它等）
+        EG._summary_cache.pop(user, None)
+        t0 = time.time()
+        first_msgs = EG._build_dialogue_messages(dict(state))
+        cost = time.time() - t0
+        if cost > RELAY_SLEEP / 2:
+            bad.append(f"45 轮长历史拼装花了 {cost:.2f}s，摘要还在开口之前同步等模型")
+        if any("那几周" in str(getattr(m, "content", "")) for m in first_msgs):
+            bad.append("本轮摘要还没生成出来，prompt 里却已经写上了（这是在编）")
+
+        # ② 单飞：后台还在跑时再排一次必须被拒（同 SummaryService.maybe_cascade 的写法）
+        again = EG._request_summary_async(user, hist[-4:], 45)
+        if again:
+            bad.append("后台摘要没有单飞锁，能排第二遍——等于拿同一条中转去排队")
+
+        deadline = time.time() + 5.0
+        while not stored and time.time() < deadline:
+            time.sleep(0.05)
+        if not calls["invoke"]:
+            bad.append("摘要一次都没生成：既不等也没投后台，这段背景等于悄悄没了")
+        if not stored:
+            bad.append("5 秒了后台还没把摘要补上（补不上就等于这段背景永远没有）")
+        if calls["invoke"] > 1:
+            bad.append(f"摘要跑了 {calls['invoke']} 次，单飞没起作用")
+
+        # ③ 下一句：缓存里的摘要必须真的进到 prompt 里，且不再调模型
+        calls["invoke"] = 0
+        t1 = time.time()
+        second_msgs = EG._build_dialogue_messages(dict(state))
+        if time.time() - t1 > 0.1:
+            bad.append("第二轮拿到缓存摘要还花了 >0.1s，缓存没生效")
+        if calls["invoke"]:
+            bad.append("缓存命中了还去调模型")
+        if not any("那几周" in str(getattr(m, "content", "")) for m in second_msgs):
+            bad.append("后台补好的摘要没能进入下一句的 prompt")
+
+        # ④ 反向对照：把摘要改回"同步等"，①那条计时必须当场抓得住——不然整项是空过的
+        EG._summary_cache.pop(user, None)
+        real_cached = EG._get_cached_summary
+        EG._get_cached_summary = lambda uid, rounds: None
+        real_async = EG._request_summary_async
+        EG._request_summary_async = lambda uid, early, rounds: (
+            EG._set_cached_summary(uid, EG._generate_summary(SlowClient(), early), rounds) or True)
+        try:
+            t2 = time.time()
+            EG._build_dialogue_messages(dict(state))
+            sync_cost = time.time() - t2
+        finally:
+            EG._get_cached_summary = real_cached
+            EG._request_summary_async = real_async
+        if sync_cost < RELAY_SLEEP / 2:
+            bad.append(f"反向对照失效：摘要改回同步只花 {sync_cost:.2f}s，这条门禁量不出退化")
+    finally:
+        EG.get_chat_client, EG.get_summary_service = real_client, real_service
+        EG._summary_cache.clear()
+        EG._summary_cache.update(saved_cache)
+        EG._summary_lock = saved_lock
+    return "; ".join(bad) or True
+
+
+def rewrite_off_first_token_path():
+    """查询改写不许站在首字路径上：上限 1.2 秒，而中转实测中位 25 秒——每轮必然超时白等。
+
+    钉法是让 `rewrite_query` 一被调用就炸。改造前那 1.2 秒是**每轮固定要付**的，
+    而且 `future.cancel()` 取消不了已经在跑的 HTTP，后台还多占一份额度。
+    """
+    import shutil
+    import tempfile
+
+    import emotion_graph as EG
+    import memory_manager as MM
+
+    bad = []
+    d = tempfile.mkdtemp()
+    real_rewrite = EG.rewrite_query
+    try:
+        def explode(q):
+            raise AssertionError("首字路径上又去调查询改写了")
+
+        EG.rewrite_query = explode
+        mm = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "r.db"))
+        mm.embedding_service.get_embedding = lambda t: None
+        mm.add_memory("rewrite-user", "用户习惯周六早上去滨江那家馆子",
+                      category=MM.MemoryCategory.FACT)
+        seen = {}
+        real_search = mm.search_memories
+
+        def spy(user_id, text, **kw):
+            seen.update(kw)
+            return real_search(user_id, text, **kw)
+
+        mm.search_memories = spy
+        state = {"user_id": "rewrite-user", "user_message": "周六想去吃那家馆子",
+                 "conversation_id": "c1"}
+        t0 = time.time()
+        out = EG._run_memory_retrieval(state, mm, None)
+        cost = time.time() - t0
+        if cost > 0.5:
+            bad.append(f"检索这一段花了 {cost:.2f}s，首字路径上还有东西在等")
+        if not out.get("retrieved_memories"):
+            bad.append("检索没拿到东西，这条快检根本没跑到路径")
+        if seen.get("queries") not in (None, [state["user_message"]]):
+            bad.append(f"检索收到的 queries 不是原句：{seen.get('queries')}")
+
+        # 反向对照：把改写塞回首字路径，上面的桩必须炸得起来
+        real_retrieval = EG._run_memory_retrieval
+
+        def with_rewrite(st, m, w=None):
+            EG.rewrite_query(st["user_message"])
+            return real_retrieval(st, m, w)
+
+        try:
+            with_rewrite(state, mm, None)
+            bad.append("反向对照失效：改写站回首字路径也抓不出来，这项是空过的")
+        except AssertionError:
+            pass
+    finally:
+        EG.rewrite_query = real_rewrite
+        close_db_conn(mm)
+        shutil.rmtree(d, ignore_errors=True)
+    return "; ".join(bad) or True
+
+
+def thinking_param_reaches_wire():
+    """"关思考"必须真的变成线上的参数——不然对照就是拿同一个请求比自己。
+
+    第八轮/第十九轮那两条"关思考没用"的结论，是 `use_thinking=False` 和 `=True`
+    发出**同一份 payload** 时量出来的（`MODEL_PROFILES` 里查不到 MiMo，extra_body 直接 None）。
+    现在钉三件事：① 当前模型声明了关的写法，两份 payload 就必须不一样；
+    ② 发没发出去要能在指标里看到（`thinking_param_sent/absent`）；
+    ③ 反向对照：把 profile 摘掉（=改造前），两份就必须又变回一样——
+       证明这条门禁盯的就是"profile 里到底声明没声明"，不是盯一个恒真的字符串比较。
+    """
+    import langchain_openai
+
+    import emotion_state as ES
+    import llm_config as LC
+    import model_config as MC
+
+    bad = []
+    real_cls = langchain_openai.ChatOpenAI
+    real_cfg, real_key = LC.load_active_config, LC.get_chat_api_key
+    real_profiles = dict(MC.MODEL_PROFILES)
+    captured = []
+    try:
+        class FakeChatOpenAI:
+            def __init__(self, **kw):
+                captured.append(kw)
+
+        langchain_openai.ChatOpenAI = FakeChatOpenAI
+        # llm_config 是 `from model_config import load_active_config`，所以要打在 LC 上，
+        # 打在 MC 上它根本看不见（第一版就踩了这个）
+        LC.load_active_config = lambda: {"model": "MiMo-V2.6-Flash",
+                                         "base_url": "https://relay.invalid/v1",
+                                         "api_key": "k", "use_thinking": True,
+                                         "multimodal": None}
+        LC.get_chat_api_key = lambda: "k"
+
+        before = dict(ES.thinking_stats())
+        captured.clear()
+        LC.get_llm_client(temperature=0.8, top_p=0.9, use_thinking=False)
+        off = dict(captured[-1])
+        captured.clear()
+        LC.get_llm_client(temperature=0.8, top_p=0.9, use_thinking=True)
+        on = dict(captured[-1])
+
+        if off.get("extra_body") != {"reasoning_effort": "none"}:
+            bad.append(f'当前模型"关思考"发出去的是 {off.get("extra_body")}，'
+                       '应该是 {"reasoning_effort": "none"}（中转实测只认这个）')
+        if off == on:
+            bad.append("开/关两个 use_thinking 发的是同一个 payload：对照又白做了")
+        if "temperature" in on and on.get("temperature") == 1.0 and off.get("temperature") != 0.8:
+            bad.append("关思考那次被 glm/qwen 的温度锁 1.0 连带改了")
+        sent = ES.thinking_stats()["thinking_param_sent"] - before.get("thinking_param_sent", 0)
+        if sent < 1:
+            bad.append("发没发参数没有计数，静默失效还是看不见")
+
+        # 用户 2026-09-29 看过两臂并排原话后定的：回话默认关掉「先想后说」。
+        # 钉住这个决定，别让哪次顺手改回去——改回去是看得见的（首字慢十几秒），但没人会想起是这行。
+        import emotion_graph as EG
+        if EG.CHAT_USE_THINKING:
+            bad.append("回话默认又变回「先想后说」了（用户定的是默认关掉；要开请设 MOZ_CHAT_THINKING=1）")
+        if "use_thinking=CHAT_USE_THINKING" not in (ROOT / "backend" / "emotion_graph.py").read_text(
+                encoding="utf-8"):
+            bad.append("回话那一次没把 CHAT_USE_THINKING 传给客户端，那这个开关是假的")
+
+        # ③ 反向对照
+        MC.MODEL_PROFILES.pop("mimo", None)
+        captured.clear()
+        LC.get_llm_client(temperature=0.8, top_p=0.9, use_thinking=False)
+        stripped_off = dict(captured[-1])
+        if stripped_off != on:
+            bad.append("反向对照失效：摘掉 profile 后「关」仍然和「开」不一样，这条门禁没盯着 profile")
+    finally:
+        langchain_openai.ChatOpenAI = real_cls
+        LC.load_active_config, LC.get_chat_api_key = real_cfg, real_key
+        MC.MODEL_PROFILES.clear()
+        MC.MODEL_PROFILES.update(real_profiles)
+    return "; ".join(bad) or True
+
+
+def stage_timings_add_up():
+    """指标里那个"首字"必须是用户看到的数：分段加起来要和自建秒表对得上，段段嵌套。
+
+    改造前唯一在量的数是 `stream_started → 首个 token`（只算中转那一段），
+    所以会出现"P50 1.5 秒"和用户等 25 秒同时成立的场面。这里两头都钉：
+    ① 数值：local_prep + relay_ttfb ≈ 自己掐表到首字；
+    ② 接线：first_token 必须由 server 在收到请求那一刻起算，且不许再指回 relay_ttfb。
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    import emotion_graph as EG
+    import emotion_state as ES
+
+    bad = []
+    RELAY_SLEEP, PREP_SLEEP = 0.35, 0.2
+    real_client = EG.get_chat_client
+
+    class SlowStreamClient:
+        def stream(self, messages):
+            def _gen():
+                time.sleep(RELAY_SLEEP)
+                for t in ("嗯", "，", "我在"):
+                    yield SimpleNamespace(content=t)
+            return _gen()
+
+        def invoke(self, messages):
+            return SimpleNamespace(content="{}")
+
+    class SlowStore:
+        """本地读被我们故意拖慢 0.2 秒：起点要是挪错了，这 0.2 秒就会从账上消失。"""
+
+        def prompt_line(self, user_id, stamp=None):
+            time.sleep(PREP_SLEEP)
+            return ""
+
+        def get(self, *a, **kw):
+            return None
+
+    before = {name: len(ES._stage_samples.get(name, ())) for name in ES.STAGES}
+
+    def run_once():
+        async def drain():
+            gen = EG.run_emotion_workflow_streaming(
+                memory_manager=None, user_id="stage-user",
+                user_message="今天加班到十点，好累", conversation_history=[],
+                emotion_store=SlowStore())
+            try:
+                async for ev in gen:
+                    if ev.get("type") == "token":
+                        return ev
+            finally:
+                await gen.aclose()
+
+        EG.get_chat_client = lambda **kw: SlowStreamClient()
+        t0 = time.time()
+        asyncio.run(drain())
+        return time.time() - t0
+
+    try:
+        total = run_once()
+
+        def newly(name):
+            seq = list(ES._stage_samples.get(name, ()))
+            return seq[before[name]] if len(seq) > before[name] else None
+
+        prep, relay, build = newly("local_prep"), newly("relay_ttfb"), newly("prompt_build")
+        if prep is None or relay is None:
+            bad.append(f"分段没记全：local_prep={prep} relay_ttfb={relay}")
+            return "; ".join(bad)
+        if not (relay - 0.1 <= RELAY_SLEEP <= relay + 0.3):
+            bad.append(f"relay_ttfb 记的是 {relay}s，和中转那 {RELAY_SLEEP}s 对不上")
+        if not (prep - 0.05 <= PREP_SLEEP <= prep + 0.3):
+            bad.append(f"local_prep 记的是 {prep}s，本地那 {PREP_SLEEP}s 没算进去（起点挪错了）")
+        if abs(total - (prep + relay)) > 0.2:
+            bad.append(f"分段加起来 {prep + relay:.2f}s ≠ 自己掐表的 {total:.2f}s，中间漏了一段埋点")
+        if total - relay < PREP_SLEEP / 2:
+            bad.append("首字总数里量不出开口之前的本地开销，等于还在只报中转那一段")
+        if build is not None and build > prep:
+            bad.append(f"段与段不嵌套：prompt_build {build}s > local_prep {prep}s")
+        if newly("first_token") is not None:
+            bad.append("流式路径自己声称了端到端首字（那一段该由 server 从收到请求起算）")
+
+        # 接线检查（python 侧扫源码：vitest 那套读不到后端）。
+        # 扫的是 /api/metrics 那个 dict 的**那一节**，不是整个文件——别处出现
+        # stage_stats("relay_ttfb") 是正当的（它就是被单独认领出来的旧口径）。
+        import ast as _ast
+        src_bytes = (ROOT / "backend" / "server.py").read_bytes()
+        src = src_bytes.decode("utf-8")
+        metrics_src = ""
+        for node in _ast.walk(_ast.parse(src_bytes)):
+            if isinstance(node, _ast.AsyncFunctionDef) and node.name == "get_metrics":
+                metrics_src = "\n".join(src.splitlines()[node.lineno - 1: node.end_lineno])
+        if not metrics_src:
+            bad.append("找不到 /api/metrics 的处理函数，接线检查等于没跑")
+        if 'record_stage("first_token", time.time() - request_started)' not in src:
+            bad.append('server.py 没有从"收到请求"那一刻起算 first_token')
+        if '"first_token": emotion_state.stage_stats("first_token")' not in metrics_src:
+            bad.append("/api/metrics 的 first_token 没有指向端到端那一段")
+        if '"first_token_relay": emotion_state.stage_stats("relay_ttfb")' not in metrics_src:
+            bad.append("/api/metrics 里旧口径（只量中转那一段）没有单独认领一个名字")
+        graph_src = (ROOT / "backend" / "emotion_graph.py").read_text(encoding="utf-8")
+        if "record_ttft" in graph_src:
+            bad.append("emotion_graph 还在用旧的 record_ttft 冒充首字")
+    finally:
+        EG.get_chat_client = real_client
     return "; ".join(bad) or True
 
 
@@ -2476,6 +2861,10 @@ def main():
     check("落库队列重启不丢", save_queue_survives_restart)
     check("记忆质量底线", memory_quality_floor)
     check("首字路径没有上游往返", first_token_path_clear)
+    check("后台摘要不挡首字", session_summary_off_the_clock)
+    check("查询改写不挡首字", rewrite_off_first_token_path)
+    check("关思考的参数真的发出去", thinking_param_reaches_wire)
+    check("分段计时不自证", stage_timings_add_up)
     check("情感基线不乱编", emotion_baseline_honest)
     check("临时对策双闸", emotion_plan_double_gate)
     check("系统文案不进长期记忆", system_copy_not_memory)

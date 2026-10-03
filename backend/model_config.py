@@ -159,6 +159,15 @@ MODEL_PROFILES = {
     "qwen": {
         "extra_body": {"enable_thinking": True, "return_reasoning": True},
     },
+    # MiMo 走中转（api.hcnsec.cn）。`tools/probe_first_token.py` 2026-09-29 实测：
+    #   不带任何参数 → 中转**默认就在先想后说**，每条 113~636 字的 reasoning，用户一个字
+    #     都看不到（`_consume_stream` 只取 chunk.content），首字因此 2.1~13.4 秒；
+    #   `thinking:{type:disabled}` → 直接 400，并回了一句 "Use reasoning_effort"；
+    #   `enable_thinking:false` / `chat_type:chat` → 200 但**完全没用**（reasoning 照旧）；
+    #   `reasoning_effort:"none"` → reasoning 0 字，首字 0.9~2.5 秒。
+    # "开"那一档不写参数＝就用中转的默认（想）。以前 `use_thinking=False` 是彻底的空动作，
+    # 因为这里查不到 mimo，extra_body 直接返回 None。
+    "mimo": {"thinking_off": {"reasoning_effort": "none"}},
 }
 
 def get_model_profile(model_name: str) -> dict:

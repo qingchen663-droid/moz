@@ -266,6 +266,22 @@ def relay_bench(sizes, with_extra=True, repeats=2):
     if ok:
         ok.sort()
         print(f"\n拿到首字的 {len(ok)} 次：最快 {ok[0]:.1f}s ／ 中位 {ok[len(ok) // 2]:.1f}s ／ 最慢 {ok[-1]:.1f}s")
+    # 同一档内离散能有 6.5 倍，2 次采样得出的"中位"就是抛硬币。样本不足就明说，别让它冒充结论。
+    groups: dict = {}
+    for n, case, r in rows:
+        groups.setdefault((n, case.split("·")[0]), []).append(r)
+    print("\n每档中位（样本 <3 次的档不许拿去说'快了几秒'）：")
+    thin = []
+    for (n, case), items in sorted(groups.items()):
+        got = sorted(it["first"] for it in items if it["first"])
+        med = f"{got[len(got) // 2]:.1f}s" if got else "—"
+        print(f"  {n:>5} 条 · {case:<12} 采样 {len(items)} 次 / 拿到首字 {len(got)} 次 → 中位 {med}")
+        if len(items) < 3:
+            thin.append(f"{n} 条·{case}")
+    if thin:
+        print("  ⚠ 这些档样本不够，数字只是参考：" + "；".join(thin))
+    print("  服务端那半的段账在 /api/metrics：first_token（端到端）／first_token_relay（只量中转）"
+          "／first_token_stages（各段分开）。两个口径不是一回事，别混着报。")
     return rows
 
 
@@ -274,7 +290,8 @@ def main():
     ap.add_argument("--local", action="store_true", help="只量本地部分（不发中转请求）")
     ap.add_argument("--sizes", default="", help="逗号分隔的记忆条数，如 0,10,100,1000")
     ap.add_argument("--no-extra", action="store_true", help="跳过敏感/长历史/带图三种情况")
-    ap.add_argument("--repeats", type=int, default=2, help="每档重复几句普通探针（摊开中转噪声）")
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="每档重复几句普通探针（摊开中转噪声；第十九轮定的口径是 ≥3 次才敢报中位）")
     a = ap.parse_args()
     sizes = [int(x) for x in a.sizes.split(",")] if a.sizes else (
         [0, 10, 100, 1000] if a.local else [0, 10, 100])

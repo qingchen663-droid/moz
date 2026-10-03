@@ -27,6 +27,8 @@ import os
 import time
 import json
 import re
+import datetime
+import threading
 import logging
 from collections import OrderedDict
 from typing import TypedDict, Annotated, Optional, List, Dict, Any
@@ -60,6 +62,12 @@ logger = logging.getLogger(__name__)
 # 敏感主题值得多等一次模型（用户 2026-09-28 决定"等"），但"等"必须有上限：
 # 实测那次调用 27.8~90.8 秒，不设上限就等于把"贴"换成"卡死"。
 SENSITIVE_WAIT_SECONDS = float(os.environ.get("MOZ_SENSITIVE_WAIT_SECONDS", "45"))
+
+# 回话这一句要不要让模型"先想后说"。中转默认就是想的（实测见 model_config 里 mimo 那段）：
+# 想的那 113~636 个字用户一个都看不见（`_consume_stream` 只取 chunk.content），
+# 非敏感那句的首字因此 16.6s → 4.4s（两臂并排实测见 RUNLOG 20.7）。
+# 2026-09-29 用户看过两臂并排的原话后拍板：默认关掉。想拿回旧写法就设 MOZ_CHAT_THINKING=1。
+CHAT_USE_THINKING = os.environ.get("MOZ_CHAT_THINKING", "0") == "1"
 
 
 def get_chat_client(temperature: float = 0.7, top_p: float = None, use_thinking: bool = True):
@@ -319,6 +327,45 @@ def _generate_summary(llm, conversation_history: List[Dict]) -> str:
         return ""
 
 
+# 摘要生成一次只允许一个在跑（照 SummaryService.maybe_cascade 那个非阻塞锁的写法）：
+# 排第二遍等于拿同一条中转去排队，而中转本来就是首字时间的大头。
+_summary_lock = threading.Lock()
+
+
+def _request_summary_async(user_id: str, early_history: List[Dict], total_rounds: int) -> bool:
+    """把"之前聊了什么"那段背景交给后台生成，本轮先不带它开口。
+
+    原来这里是开口之前的一次同步 `llm.invoke`，**没有任何超时上限**——2026-09-28 实测
+    30 条长历史那一轮 121.3 秒没回，最可能就是这次摘要和生成串在了一起（设计文档 §3：
+    首字路径上不许有上游往返）。摘要缓存每 20 轮才重算一次，所以代价是"这一句的背景少一段
+    更早的总结"，下一句起就补回来了——走的正是它自己异常时已经在用的那条回落分支。
+    """
+    if not _summary_lock.acquire(blocking=False):
+        return False
+    history = list(early_history[-60:])   # 别让后台线程握着调用方的大列表
+
+    def _run():
+        started = time.time()
+        try:
+            llm = get_chat_client(temperature=0.3, use_thinking=False)
+            text = _generate_summary(llm, history)
+            if text:
+                _set_cached_summary(user_id, text, total_rounds)
+                week_key = datetime.datetime.now().strftime('%G-W%V')
+                get_summary_service().save_summary(user_id, text, 'session', week_key)
+                get_summary_service().cascade_async(user_id)
+                logger.info("🧠 [会话摘要] 后台补完，%.1fs，下一句起生效", time.time() - started)
+            else:
+                logger.warning("[会话摘要] 后台没生成出来，下一轮再试")
+        except Exception as e:
+            logger.warning("[会话摘要] 后台生成失败，下一轮再试: %s", e)
+        finally:
+            _summary_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
 # ================================================================
 # 对话 Agent
 # ================================================================
@@ -416,14 +463,9 @@ def _build_dialogue_messages(state: AgentState) -> list:
         if early_history:
             conv_summary = _get_cached_summary(user_id, total_rounds)
             if conv_summary is None:
-                llm = get_chat_client(temperature=0.3, use_thinking=False)
-                conv_summary = _generate_summary(llm, early_history)
-                if conv_summary:
-                    _set_cached_summary(user_id, conv_summary, total_rounds)
-                    import datetime
-                    week_key = datetime.datetime.now().strftime('%G-W%V')
-                    get_summary_service().save_summary(user_id, conv_summary, 'session', week_key)
-                    get_summary_service().cascade_async(user_id)
+                # 这里原来是开口之前的一次同步模型调用（无上限）。改成后台补，
+                # 本轮这段背景就是空串——和它自己生成失败时的回落写法一模一样。
+                _request_summary_async(user_id, early_history, total_rounds)
 
         historical_messages = recent_history
     else:
@@ -896,12 +938,14 @@ def run_emotion_workflow_streaming(
             logger.warning(f"[落库队列] 本轮登记失败: {e}")
 
     async def _stream():
+        turn_started = time.time()
         try:
             # L0 先判档（毫秒级）：那一次情感模型调用要 27.8~90.8 秒，而生成本身只 4~8 秒，
             # 把它留在首字路径上等于让用户白等（2026-09-28 沙箱实测，见 docs/情感预热系统设计.md）。
             live = emotion_state.live_signal(user_message)
             state["emotion_analysis"] = live
             state["emotion_summary"] = live["emotion_summary"]
+            prepared = ""
             if emotion_store is not None:
                 # 本地扫一遍拿当前水位（不是上游往返）：用户删过记忆，旧总结和旧对策就该闭嘴
                 stamp, _evidence = emotion_state.collect_signals(memory_manager, care_store,
@@ -915,6 +959,8 @@ def run_emotion_workflow_streaming(
                     state["plan_context"] = line
                 emotion_state.schedule_prewarm(emotion_store, save_queue, save_worker,
                                                user_id, user_message, live["topics"])
+                # 下面这两样是本地读出来的，拿来问"这轮还要不要为情绪现等一次模型"不花成本
+                prepared = f"{state.get('plan_context', '')}{state.get('baseline_context', '')}"
 
             retrieval_task = asyncio.create_task(asyncio.to_thread(
                 _run_memory_retrieval, initial_state, memory_manager, working_memory_store))
@@ -922,29 +968,48 @@ def run_emotion_workflow_streaming(
             if emotion_state.worth_waiting(live):
                 # 用户 2026-09-28 拍板：医院/忌日/起冲突/落榜/马上答辩这几类，本轮值得等一次模型。
                 # 但等要有上限——超时就先带着 L0 开口，别把"贴"变成"卡死"。
+                if prepared:
+                    # 不是"不等了"（上限一个字没动），是把"后台早备好了还去等"这种情况数出来：
+                    # 2026-09-28 实测最长那轮 76.3s = 等满 45s 模型没回 + 才开口，白付。
+                    emotion_state.bump_counter("sensitive_had_plan")
                 yield {'type': 'status', 'text': '这事我认真想一想再说…'}
+                emotion_state.bump_counter("sensitive_asked")
+                wait_started = time.time()
                 try:
                     corrected = await asyncio.wait_for(
                         asyncio.to_thread(emotion_analysis_node, dict(initial_state)),
                         timeout=SENSITIVE_WAIT_SECONDS)
                     if corrected.get("emotion_summary"):
                         model_label = str((corrected.get("emotion_analysis") or {}).get("current_emotion", ""))
-                        emotion_state.record_agreement(live["current_emotion"], model_label)
+                        agreed = emotion_state.record_agreement(live["current_emotion"], model_label)
+                        # 等了半天模型给的档和规则档一样 = 这次等待没换来任何新信息
+                        emotion_state.bump_counter(
+                            "sensitive_agreed" if agreed else "sensitive_paid_off")
                         state.update(corrected)
                 except asyncio.TimeoutError:
+                    emotion_state.bump_counter("sensitive_timeout")
                     logger.info("[情感] 敏感主题等了 %.0fs 没等到，先用规则档开口", SENSITIVE_WAIT_SECONDS)
                 except Exception as e:
+                    emotion_state.bump_counter("sensitive_failed")
                     logger.warning("[情感] 敏感主题校正失败，先用规则档开口: %s", e)
+                emotion_state.record_stage("sensitive_wait", time.time() - wait_started)
             else:
                 yield {'type': 'status', 'text': 'moz 正在回忆…'}
 
+            retrieve_waited = time.time()
             state.update(await retrieval_task)
+            # 检索是并行跑的，这一段只记"它比敏感等待慢下来多少"——并行省掉的那部分不该算账
+            emotion_state.record_stage("retrieval", time.time() - retrieve_waited)
 
             yield {'type': 'status', 'text': 'moz 正在组织语言...'}
 
-            llm = get_chat_client(temperature=0.8, top_p=0.9)
+            prompt_started = time.time()
+            llm = get_chat_client(temperature=0.8, top_p=0.9, use_thinking=CHAT_USE_THINKING)
             messages = _build_dialogue_messages(state)
+            emotion_state.record_stage("prompt_build", time.time() - prompt_started)
             stream_started = time.time()
+            # local_prep 是"开口之前我们自己花的钱"，中转那一段单独记 relay_ttfb，两笔不许混
+            emotion_state.record_stage("local_prep", stream_started - turn_started)
 
             full_reply = ""
             token_queue: asyncio.Queue = asyncio.Queue()
@@ -965,15 +1030,19 @@ def run_emotion_workflow_streaming(
 
             stream_task = asyncio.create_task(asyncio.to_thread(_consume_stream))
 
+            first_token_at = None
             while True:
                 token = await asyncio.wait_for(token_queue.get(), timeout=120.0)
                 if token is None:
                     break
-                if stream_started is not None:
-                    # 首字延迟是这套改动的唯一硬指标：改造前 27.9~90.8 秒，目标 P50 ≤ 4 秒
-                    emotion_state.record_ttft(time.time() - stream_started)
-                    stream_started = None
+                if first_token_at is None:
+                    first_token_at = time.time()
+                    # 中转那一段的到达延迟（旧口径唯一在量的数，改名后单独进指标 relay_ttfb）
+                    emotion_state.record_stage("relay_ttfb", first_token_at - stream_started)
                 yield {'type': 'token', 'text': token}
+
+            if first_token_at is not None:
+                emotion_state.record_stage("generate", time.time() - first_token_at)
 
             await stream_task
 
@@ -1018,16 +1087,16 @@ def _run_memory_retrieval(
     if working_memory_store:
         working_memory_text = working_memory_store.format_for_prompt(user_id)
 
-    # 查询改写
-    queries = rewrite_query(user_message)
-
+    # 查询改写留在这里不调：它是一次上游往返，而它在首字路径上从来没赢过——
+    # 上限 1.2 秒（memory_manager.py:613），中转实测中位 25 秒，等于每轮先白等 1.2 秒
+    # 再退回 `[原句]`，还顺手在后台占掉一次额度（future.cancel() 取消不了已经在跑的 HTTP）。
+    # 本轮拿到的结果和以前一模一样，只是不再为它排队。非流式那条图（:535）不是用户在等的钟，留着。
     retrieved = []
     if memory_manager:
         local_results = memory_manager.search_memories(
             user_id,
             user_message,
             limit=10,
-            queries=queries,
             conversation_id=state.get("conversation_id"),
         )
         retrieved = [{"memory": m.content, "source": "local"} for m in local_results]

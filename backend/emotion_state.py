@@ -2,8 +2,13 @@
 
 为什么要有这一层（2026-09-28 沙箱实测）：情感分析那一次上游往返要 **27.8~90.8 秒**，
 而对话生成本身只有 **4~8 秒** —— 用户 80~95% 的时间花在"看到第一个字之前"。
-而且 `emotion_analysis_node` 本来就已经 `use_thinking=False`，所以"算得快一点"是空想；
-能做的只有**把这次调用从首字路径上挪走**：先用规则定档让她开口，模型那次调用退到后台校正。
+能做的只有**把这次调用从首字路径上挪走**，而不是把它算快一点。
+
+（2026-09-29 更正：这一层当初的理由里还顺带写了一句"`emotion_analysis_node` 本来就已经
+`use_thinking=False`，所以关思考是空想"——那句作废。`llm_config._build_extra_body()` 对
+当前生效的 MiMo-V2.6-Flash 返回 `None`（`MODEL_PROFILES` 里没有它），那次调用和
+`use_thinking=True` 发的是**同一个 payload**，所以那两组对照测的是同一个请求。
+"关思考到底能不能快"要由 `tools/probe_first_token.py` 重新量，不许再拿旧结论当依据。）
 
 设计文档：`docs/情感预热系统设计.md`（三层信号：L0 规则 / L1 基线 / L2 临时对策）。
 """
@@ -269,27 +274,44 @@ def format_baseline(data: Dict[str, Any]) -> str:
     return "；".join(bits) + "（这是从她说过的事里总结的，说错了她会纠正）"
 
 
-# ── 首字延迟取样（只读指标用，不放任何用户内容）────────────────────────
-TTFT_WINDOW = 200
-_ttft_samples: deque = deque(maxlen=TTFT_WINDOW)
+# ── 首字延迟分段取样（只读指标用，不放任何用户内容）────────────────────
+# 口径钉死在这里，免得又量成"只算自己好看的那一段"：
+#   first_token   = 后端收到请求 → 第一个字发出去，等于界面上那块秒表
+#   relay_ttfb    = 请求打到中转 → 中转吐第一个字（原来唯一在量的那一段）
+# 中间每一段各自有名有姓，加起来对不上 first_token 就是漏了埋点。
+STAGE_WINDOW = 200
+STAGES = ("route_prep", "lock_wait", "local_prep", "sensitive_wait", "retrieval",
+          "prompt_build", "relay_ttfb", "generate", "first_token")
+_stage_samples: Dict[str, deque] = {}
 
 
-def record_ttft(seconds: float) -> None:
-    if seconds and seconds > 0:
-        _ttft_samples.append(float(seconds))
+def record_stage(name: str, seconds: float) -> None:
+    if seconds is None or seconds <= 0:
+        return
+    if name not in STAGES:
+        # 不抛（不能在回话路上炸），但也不静默：多出来的名字在指标里看得见
+        logger.warning("[分段计时] 不认识的时间段 %s", name)
+    _stage_samples.setdefault(name, deque(maxlen=STAGE_WINDOW)).append(float(seconds))
 
 
-def ttft_stats() -> Dict[str, Optional[float]]:
-    if not _ttft_samples:
+def _pct(ordered: List[float], q: float) -> float:
+    idx = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
+    return round(ordered[idx], 2)
+
+
+def stage_stats(name: str) -> Dict[str, Optional[float]]:
+    samples = _stage_samples.get(name)
+    if not samples:
         return {"samples": 0, "p50": None, "p95": None, "max": None}
-    ordered = sorted(_ttft_samples)
-
-    def pct(q: float) -> float:
-        idx = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
-        return round(ordered[idx], 2)
-
-    return {"samples": len(ordered), "p50": pct(0.5), "p95": pct(0.95),
+    ordered = sorted(samples)
+    return {"samples": len(ordered), "p50": _pct(ordered, 0.5), "p95": _pct(ordered, 0.95),
             "max": round(ordered[-1], 2)}
+
+
+def all_stage_stats() -> Dict[str, Dict[str, Optional[float]]]:
+    """每一段都要出现在这里，一条样本都没有也照样列出来——
+    漏了埋点的段就该显示 samples=0，而不是从指标里消失。"""
+    return {name: stage_stats(name) for name in STAGES}
 
 
 # ── 规则档 vs 模型档的一致率（P1 的退路判据）───────────────────────────
@@ -299,9 +321,13 @@ _AGREE_WINDOW = 200
 _agree_samples: deque = deque(maxlen=_AGREE_WINDOW)
 
 
-def record_agreement(rule_emotion: str, model_emotion: str) -> None:
-    if rule_emotion and model_emotion:
-        _agree_samples.append(1.0 if rule_emotion == model_emotion else 0.0)
+def record_agreement(rule_emotion: str, model_emotion: str) -> bool:
+    """记一条样本，并回答"规则档和模型档一样吗"——调用方要用它判断这次等待值不值。"""
+    if not (rule_emotion and model_emotion):
+        return False
+    agreed = rule_emotion == model_emotion
+    _agree_samples.append(1.0 if agreed else 0.0)
+    return agreed
 
 
 def agreement_stats() -> Dict[str, Any]:
@@ -649,7 +675,12 @@ PLAN_PROMPT = """你是"临时对策"模块。她现在聊到了「{topic}」。
 - 全用中文自然语言，别出现英文键名、别写"用户"。"""
 
 _COUNTERS = {"asked": 0, "hit": 0, "expired_skipped": 0, "dup_skipped": 0,
-             "quota_skipped": 0, "built": 0, "failed": 0, "stale_skipped": 0}
+             "quota_skipped": 0, "built": 0, "failed": 0, "stale_skipped": 0,
+             # 敏感主题那 45 秒到底兑没兑现（用户 2026-09-28 拍板要等，但等要有账）
+             "sensitive_asked": 0, "sensitive_paid_off": 0, "sensitive_agreed": 0,
+             "sensitive_timeout": 0, "sensitive_failed": 0, "sensitive_had_plan": 0,
+             # 思考/关思考的参数到底发没发出去（不发出去就等于在用同一个请求做对照）
+             "thinking_param_sent": 0, "thinking_param_absent": 0}
 
 
 def bump_counter(name: str, n: int = 1) -> None:
@@ -657,7 +688,22 @@ def bump_counter(name: str, n: int = 1) -> None:
 
 
 def plan_stats() -> Dict[str, int]:
-    return dict(_COUNTERS)
+    """预热那一套的计数（敏感等待和 thinking 参数各走各的账，别挤在一个桶里）。"""
+    return {k: v for k, v in _COUNTERS.items()
+            if not k.startswith(("sensitive_", "thinking_"))}
+
+
+def wait_stats() -> Dict[str, Any]:
+    """敏感主题那一次"值得等"的账。兑现率 = 模型在限内回了、且给的档和规则档不一样；
+    等了半天给的还是同一个档，等于白花一次往返。上限动不动，看这个数。"""
+    out = {k: v for k, v in _COUNTERS.items() if k.startswith("sensitive_")}
+    asked = out.get("sensitive_asked", 0)
+    out["payoff_rate"] = round(out.get("sensitive_paid_off", 0) / asked, 3) if asked else None
+    return out
+
+
+def thinking_stats() -> Dict[str, int]:
+    return {k: v for k, v in _COUNTERS.items() if k.startswith("thinking_")}
 
 
 def reset_plan_stats() -> None:
