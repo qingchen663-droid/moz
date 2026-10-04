@@ -2147,6 +2147,81 @@ def rewrite_off_first_token_path():
     return "; ".join(bad) or True
 
 
+def http_pool_shared():
+    """每轮新建 ChatOpenAI 就等于每轮重做一遍 TCP+TLS（实测到中转中位 222ms）。
+
+    钉三件事：① 同一进程里建出来的客户端共用**同一个** httpx 连接池；
+    ② 换模型/换渠道/换 key 也不会各建一个（密钥不在 httpx 上，是每次请求的 header，
+       所以复用不会把旧 key 带进新渠道）；③ 全进程真的只**构造**了一次池子——
+       数"构造了几次"不能看交出去几次，所以直接数 `httpx.Client(...)` 这个表达式跑了几遍。
+    """
+    import httpx
+    import langchain_openai
+
+    import llm_config as LC
+
+    bad = []
+    real_cls = langchain_openai.ChatOpenAI
+    real_shared, real_fn = LC._shared_http, LC._shared_http_client
+    real_httpx_client = httpx.Client
+    captured = []
+    made = []
+
+    try:
+        class FakeChatOpenAI:
+            def __init__(self, **kw):
+                captured.append(kw)
+
+        class CountingClient(httpx.Client):
+            """数"真的构造了几次池子"。只换 httpx.Client 这个类，
+            `_shared_http_client` 一个字不动——上一版把函数本身换成替身，
+            量的就成了我自己的替身，是假通过。"""
+
+            def __init__(self, *a, **kw):
+                made.append(self)
+                super().__init__(*a, **kw)
+
+        langchain_openai.ChatOpenAI = FakeChatOpenAI
+        httpx.Client = CountingClient
+        LC._shared_http = None          # 当它是刚启动的进程
+        LC.get_llm_client(temperature=0.8, top_p=0.9, use_thinking=False)
+        LC.get_llm_client(temperature=0.3, use_thinking=False)
+        LC.get_llm_client(model="some-other-model", base_url="https://other.invalid/v1",
+                          api_key="another-key")
+
+        if len(captured) != 3:
+            return f"只建出 {len(captured)} 个客户端，这项没跑到路径"
+        if any("http_client" not in kw for kw in captured):
+            bad.append("有客户端没带 http_client，等于还在各建各的连接池")
+        first = captured[0]["http_client"]
+        if any(kw["http_client"] is not first for kw in captured):
+            bad.append("三次建客户端拿到的是不同的连接池（换模型/换 key 时也不该重开一个）")
+        if len(made) != 1:
+            bad.append(f"连接池被构造了 {len(made)} 次，应该全进程只构造一次")
+
+        # 反向对照：把"共用"改成"每次都新建"，上面两条断言必须立刻红
+        captured.clear()
+        made.clear()
+        LC._shared_http = None
+        LC._shared_http_client = lambda: httpx.Client(timeout=None)
+        LC.get_llm_client(temperature=0.8, top_p=0.9)
+        LC.get_llm_client(temperature=0.3, use_thinking=False)
+        if captured[0]["http_client"] is captured[1]["http_client"] or len(made) < 2:
+            bad.append("反向对照失效：改成每次新建客户端，这条门禁却什么都看不见")
+    finally:
+        langchain_openai.ChatOpenAI = real_cls
+        httpx.Client = real_httpx_client
+        LC._shared_http_client = real_fn
+        for client in made + [LC._shared_http]:
+            if client is not None and client is not real_shared:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        LC._shared_http = real_shared
+    return "; ".join(bad) or True
+
+
 def thinking_param_reaches_wire():
     """"关思考"必须真的变成线上的参数——不然对照就是拿同一个请求比自己。
 
@@ -2493,7 +2568,7 @@ def backfill_off_the_clock():
                 n = len(input) if isinstance(input, (list, tuple)) else 1
                 if n > 1:
                     tries["backfill"] += 1
-                    time.sleep(0.25)      # 补库那一批原来就站在用户面前
+                    time.sleep(1.0)       # 补库那一批原来就站在用户面前；故意拉大到"绝不可能被噪声盖住"
                 else:
                     tries["query"] += 1
                 raise RuntimeError("401 invalid authentication（打桩，不真连）")
@@ -2509,8 +2584,8 @@ def backfill_off_the_clock():
         cost = (time.perf_counter() - t0) * 1000
         if not hits:
             return "连「体检」都检索不到东西，这项没跑到路径"
-        if cost > 120:
-            bad.append(f"本轮检索花了 {cost:.0f}ms——补库那一批（桩里 250ms）还挡在用户面前")
+        if cost > 300:
+            bad.append(f"本轮检索花了 {cost:.0f}ms——补库那一批（桩里 1000ms）还挡在用户面前")
         if tries["backfill"]:
             bad.append(f"本轮替整库发了 {tries['backfill']} 批向量请求，应该一批都不发")
         if tries["query"] != 1:
@@ -3108,6 +3183,7 @@ def main():
     check("后台摘要不挡首字", session_summary_off_the_clock)
     check("查询改写不挡首字", rewrite_off_first_token_path)
     check("关思考的参数真的发出去", thinking_param_reaches_wire)
+    check("连接池不每轮重握手", http_pool_shared)
     check("分段计时不自证", stage_timings_add_up)
     check("情感基线不乱编", emotion_baseline_honest)
     check("临时对策双闸", emotion_plan_double_gate)

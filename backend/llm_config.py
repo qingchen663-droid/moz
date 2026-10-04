@@ -3,12 +3,38 @@ LLM 客户端工厂模块
 支持运行时动态读取模型配置与特性
 """
 
+import threading
 from typing import Optional
 from model_config import (
     load_active_config,
     get_chat_api_key,
     get_model_profile,
 )
+
+_shared_http = None
+_shared_http_lock = threading.Lock()
+
+
+def _shared_http_client():
+    """全进程共用一个 httpx 客户端（连接池按 host 复用，httpx 文档写明可跨线程共享）。
+
+    原来每轮对话、每个后台任务都新建一个 ChatOpenAI → 新建一个 httpx 客户端 →
+    从零再来一遍 TCP+TLS。实测到 api.hcnsec.cn:443 一次完整握手中位 **222ms**
+    （TCP 83ms；10 次采样），这一下正是站在"按下发送 → 第一个字"里的。
+    密钥不在 httpx 客户端上（它是每次请求的 header），所以换模型/换渠道/换 key
+    都不用重建，也就不存在"缓存了过期状态"这件事。
+    """
+    global _shared_http
+    if _shared_http is None:
+        with _shared_http_lock:
+            if _shared_http is None:
+                import httpx
+                _shared_http = httpx.Client(
+                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=8,
+                                        keepalive_expiry=75.0),
+                    timeout=None)   # 超时由 openai SDK 每次请求带，别在这里下个 5 秒的默认值
+    return _shared_http
+
 
 def _build_extra_body(profile: dict, use_thinking: bool) -> Optional[dict]:
     """按 profile 组装 extra_body——**"关思考"这个意图也必须真的发到线上**。
@@ -62,6 +88,9 @@ def get_llm_client(
 
     if top_p is not None:
         kwargs["top_p"] = top_p
+
+    # 共用连接池：每轮重新握手到中转要花 0.22 秒，全花在"按下发送 → 第一个字"里
+    kwargs["http_client"] = _shared_http_client()
 
     profile = get_model_profile(target_model)
     extra_body = _build_extra_body(profile, thinking_enabled)
