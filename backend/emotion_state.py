@@ -706,6 +706,7 @@ def thinking_stats() -> Dict[str, int]:
     return {k: v for k, v in _COUNTERS.items() if k.startswith("thinking_")}
 
 
+
 def reset_plan_stats() -> None:
     for key in list(_COUNTERS):
         _COUNTERS[key] = 0

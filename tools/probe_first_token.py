@@ -149,6 +149,75 @@ def report(label: str, payload: dict, r: Dict[str, Any]) -> None:
           f"usage reasoning_tokens={r['reasoning_tokens']} / delta 里见过的键={sorted(r['keys_seen'])}")
 
 
+def first_content_ms(client, base_url, api_key, payload, timeout) -> Optional[float]:
+    """只量"打到中转 → 第一个看得见的正文 token"，拿到就断开（不烧完这一次回答）。"""
+    t0 = time.time()
+    try:
+        with client.stream("POST", f"{base_url}/chat/completions", json=payload,
+                           headers={"Authorization": f"Bearer {api_key}"},
+                           timeout=timeout) as res:
+            if res.status_code != 200:
+                return None
+            for line in res.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                try:
+                    frame = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                for choice in (frame.get("choices") or []):
+                    if (choice.get("delta") or {}).get("content"):
+                        return (time.time() - t0) * 1000
+    except Exception:
+        return None
+    return None
+
+
+def hedge_ab(base_url, api_key, payload, rounds, timeout) -> int:
+    """配对对照：同一轮里 A=单发一枪、B=同时发两枪取快的那枪，**逐轮配对**。
+
+    2026-10-04 跑过 8 对（`--hedge-ab 8`）：单发中位 3244ms、两枪取快中位 3422ms，
+    配对里"两枪更快"只有 3/6，还出现两枪一起不回话——**同渠道对冲没有收益**，
+    说明这条中转按 IP/账号排队而不是按连接排队，第二枪插不进别的队。
+    为这个实现过的功能已经删掉了（RUNLOG 第廿三轮）。这个量法留着：
+    以后换供应商/加备用渠道，先跑它再决定要不要做对冲，别再凭想象实现一遍。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    pairs = []
+    with httpx.Client() as client, ThreadPoolExecutor(max_workers=2) as pool:
+        for i in range(rounds):
+            one = first_content_ms(client, base_url, api_key, payload, timeout)
+            two = list(pool.map(
+                lambda _: first_content_ms(client, base_url, api_key, payload, timeout), (0, 1)))
+            fast = min([t for t in two if t is not None], default=None)
+            pairs.append((one, fast, two.count(None)))
+            print(f"  第{i + 1}对：单发 {fmt_ms(one)} ／ 两枪取快 {fmt_ms(fast)}"
+                  f"{'（两枪都没回）' if fast is None else ''}")
+
+    got = [(a, b) for a, b, _ in pairs if a is not None and b is not None]
+    med = lambda v: statistics.median(v)
+    print(f"\n有效配对 {len(got)}/{len(pairs)} 对；"
+          f"单发全部失败 {sum(1 for _a, _b, n in pairs if n == 2)} 对")
+    if not got:
+        print("一次都没配上对，别下结论。")
+        return 0
+    a = sorted(x for x, _y in got)
+    b = sorted(y for _x, y in got)
+    faster = sum(1 for x, y in got if y < x)
+    print(f"  单发一枪：中位 {med(a):.0f}ms（{a[0]:.0f}~{a[-1]:.0f}ms）")
+    print(f"  两枪取快：中位 {med(b):.0f}ms（{b[0]:.0f}~{b[-1]:.0f}ms）")
+    print(f"  配对里「两枪更快」占 {faster}/{len(got)}；中位差 "
+          f"{(med(a) - med(b)) / 1000:+.2f}s")
+    print("判读：差值不到 1 秒、或「两枪更快」不到一半 → 说明两枪排在同一个队列里，"
+          "这个功能应该删掉而不是留着白花额度。")
+    return 0
+
+
+def fmt_ms(v) -> str:
+    return "没回话" if v is None else f"{v:.0f}ms"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repeats", type=int, default=3,
@@ -156,6 +225,8 @@ def main() -> int:
     ap.add_argument("--only-baseline", action="store_true", help="只打基准，跳过候选参数")
     ap.add_argument("--long", type=int, default=2, help="长历史那几行打几次（基准 + 1 个候选）")
     ap.add_argument("--timeout", type=float, default=180.0)
+    ap.add_argument("--hedge-ab", type=int, default=0, metavar="N",
+                    help="只做对冲配对对照：每对 = 单发一枪 + 同时发两枪取快的那枪，跑 N 对")
     a = ap.parse_args()
 
     cfg = load_active_config()
@@ -168,6 +239,10 @@ def main() -> int:
 
     short_msgs = [{"role": "user", "content": PLAIN}]
     long_msgs = long_history() + [{"role": "user", "content": "我周末想回去看看她"}]
+    if a.hedge_ab:
+        print(f"对冲配对对照 {a.hedge_ab} 对（每对最多 3 枪）：")
+        return hedge_ab(cfg["base_url"], api_key,
+                        build_payload(cfg["model"], short_msgs, None), a.hedge_ab, a.timeout)
     base_rows: List[Dict[str, Any]] = []
     planned = a.repeats + (0 if a.only_baseline else len(CANDIDATES) - 1 + max(a.long, 0) * 2)
     print(f"这一趟大约打 {planned} 次中转。")

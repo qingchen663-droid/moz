@@ -70,6 +70,7 @@ SENSITIVE_WAIT_SECONDS = float(os.environ.get("MOZ_SENSITIVE_WAIT_SECONDS", "45"
 CHAT_USE_THINKING = os.environ.get("MOZ_CHAT_THINKING", "0") == "1"
 
 
+
 def get_chat_client(temperature: float = 0.7, top_p: float = None, use_thinking: bool = True):
     """
     获取 LLM 客户端。
@@ -1037,7 +1038,7 @@ def run_emotion_workflow_streaming(
                     break
                 if first_token_at is None:
                     first_token_at = time.time()
-                    # 中转那一段的到达延迟（旧口径唯一在量的数，改名后单独进指标 relay_ttfb）
+                    # 中转那一段的到达延迟（旧口径唯一在量的数，单独进指标 relay_ttfb）
                     emotion_state.record_stage("relay_ttfb", first_token_at - stream_started)
                 yield {'type': 'token', 'text': token}
 
