@@ -2,13 +2,12 @@
 
 # moz — AI 情感陪伴助手
 
-**拥有多层认知记忆系统的 AI 情感伴侣，基于艾宾浩斯遗忘曲线、RRF 混合检索、用户档案卡与 LangGraph 三 Agent 协作工作流**
+**拥有多层认知记忆系统的 AI 情感伴侣，基于艾宾浩斯遗忘曲线、RRF 混合检索、用户档案卡与三 Agent 协作工作流**
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
 [![React](https://img.shields.io/badge/React-18-61DAFB?style=flat&logo=react&logoColor=black)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.5-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![LangGraph](https://img.shields.io/badge/LangGraph-Workflow-1C3C3C?style=flat)](https://github.com/langchain-ai/langgraph)
 [![Vite](https://img.shields.io/badge/Vite-8-646CFF?style=flat&logo=vite&logoColor=white)](https://vitejs.dev)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
 [![Version](https://img.shields.io/badge/Version-v0.4-blue.svg)](./CHANGELOG.md)
@@ -67,7 +66,7 @@ moz 由三个协作的 AI Agent 分工驱动：**情感分析** 与 **记忆检�
 **新增**
 - 一键启动与桌面外壳：`moz-app.bat`、PWA（**零缓存** Service Worker）、系统托盘（页面关着也能弹 Windows 通知）
 - 主动关心引擎：后端每 60 秒判定"现在该不该说句话"，带安静时段、当日名额、最小间隔；事项（生日/约定/复诊/答辩）从对话里自己长出来，用户不填表
-- 自测与保命工具：`tools/selftest.py`（现 48 项快检）、`tools/snapshot_data.py`（快照/回滚）、`tools/clean_probe_data.py`
+- 自测与保命工具：`tools/selftest.py`（现 51 项快检）、`tools/snapshot_data.py`（快照/回滚）、`tools/clean_probe_data.py`
 - 情感预热三层（L0 规则 / L1 基线 / L2 触发式对策）+ 界面「她猜的」页签可看可撤
 
 **变更/修复（挑对外感受最明显的）**
@@ -160,8 +159,9 @@ moz 由三个协作的 AI Agent 分工驱动：**情感分析** 与 **记忆检�
 
 > **这张图画的是三 Agent 的概念分工，不是运行时序。** 界面上真正跑的只有流式路径
 > （`run_emotion_workflow_streaming`）：情感分析与记忆检索**不再挡在第一个字前面**——
-> 情感判断改由毫秒级规则（L0）+ 后台基线（L1）+ 后台预热对策（L2）供措辞，模型调用排在落库前；
-> `build_emotion_graph()` 那个非流式图仍在启动时构建，但没有任何地方调用它。
+> 情感判断改由毫秒级规则（L0）+ 后台基线（L1）+ 后台预热对策（L2）供措辞，模型调用排在落库前。
+> 第廿四轮把这条路上"建好却从没被调用"的非流式 LangGraph 图删了——它曾长期遮住一个真 bug
+> （档案卡只有那个节点会填进 prompt，等于存了却从来不用）。
 > 三层情感信号的设计见 `docs/情感预热系统设计.md`，首字时间的实测账本见 `docs/响应时间账.md`。
 
 ### 记忆检索流程（RAG）
@@ -174,8 +174,9 @@ moz 由三个协作的 AI Agent 分工驱动：**情感分析** 与 **记忆检�
 ```
 
 **回话那一句用的是用户原话这一个查询**（首字路径上不调模型做查询改写，见 `docs/响应时间账.md` §3）：
-`rewrite_query` 本身还在（硬超时 `MOZ_QUERY_REWRITE_TIMEOUT`），但**已经没有任何运行中的调用方**——
-只有那个建好却从没被调用的非流式 LangGraph 图还在调它，属于待清理的死代码。
+`rewrite_query` / `_REWRITE_POOL` / `search_memories(queries=)` 多路扇出已在第廿四轮整块删除
+（唯一调用方就是那条死图）。
+超长对话另有第三层：被历史窗口丢掉的早期轮次会折成一段「之前聊了什么」，**后台补、下一句生效、按会话分键**。
 关键词那一路会先**剪掉词面上必然 0 分的记忆**（第廿一轮，`(id, 分数)` 逐条对拍不变：5000 条 111.6ms → 60.6ms）。
 
 语义索引按用户缓存归一化向量矩阵，记忆写入、状态变化或补算向量时失效并重建。
@@ -205,12 +206,12 @@ moz 由三个协作的 AI Agent 分工驱动：**情感分析** 与 **记忆检�
 | **前端** | React 18 + TypeScript + Vite 8 | 响应式 SPA，温暖治愈风格 UI |
 | **状态管理** | Zustand | 轻量级状态管理 |
 | **后端** | FastAPI + Uvicorn | 高性能异步 API，SSE 流式响应 |
-| **Agent 编排** | LangGraph + LangChain | 三 Agent 分工（流式路径只等生成这一次上游往返） |
+| **Agent 编排** | 自研流式编排（LangChain 客户端） | 三 Agent 分工；第廿四轮删掉了那条建好却从没被调用的非流式 LangGraph 图 |
 | **LLM 客户端** | langchain-openai (ChatOpenAI) | 统一接口，支持多模型 |
 | **记忆系统** | 多层认知记忆模型 | 档案卡 + 三层分级 + 时间标签 + 遗忘曲线 + RRF 混合检索 + Reranking |
 | **语义向量** | 智谱 Embedding API (embedding-3) | 余弦相似度记忆匹配；令牌失效时自动指数退避、检索走关键词 |
 | **存储** | SQLite (WAL 模式) | 对话 & 记忆 & 档案卡持久化，增量写入 |
-| **测试** | pytest (152 tests) + Vitest (67 tests) + `tools/selftest.py`（48 项全局快检门禁） | 后端核心算法 + 前端交互 + 端到端行为契约 |
+| **测试** | pytest (145 tests) + Vitest (67 tests) + `tools/selftest.py`（51 项全局快检门禁） | 后端核心算法 + 前端交互 + 端到端行为契约 |
 | **质量门禁** | `tools/selftest.py` + pytest + tsc/vitest | 四条命令全绿才提交（见上面「度量与自测」）。**没有 CI 流水线**——门禁靠人跑 |
 
 ---
@@ -337,7 +338,7 @@ MOZ_EMBED_FAILURE_COOLDOWN_MAX=1800  # 向量服务失败后的退避封顶（�
 
 - 只读指标：`GET /api/metrics`（Admin Key）——`first_token*`、`search`、`emotion.sensitive_wait`（含兑现率）、
   `emotion.thinking`（思考参数发没发出去）、`emotion.prewarm`
-- 门禁：`tools/selftest.py` **48 项快检**（秒级、全打桩、不碰大模型、不写用户数据；
+- 门禁：`tools/selftest.py` **51 项快检**（秒级、全打桩、不碰大模型、不写用户数据；
   `--full` 另加真实对话与中转看图）。**其中 11 项走 HTTP，后端没起会全红——那是环境不是代码**
 - 单元测试：`pytest backend/tests`（152 条）+ 前端 `npx tsc -b && npx vitest run`
 
@@ -349,7 +350,7 @@ MOZ_EMBED_FAILURE_COOLDOWN_MAX=1800  # 向量服务失败后的退避封顶（�
 moz/
 ├── backend/                        # 后端（Python / FastAPI）
 │   ├── server.py                   # FastAPI 主服务：路由、认证、SSE、Metrics 中间件
-│   ├── emotion_graph.py            # LangGraph 三 Agent 工作流 + 流式执行
+│   ├── emotion_graph.py            # 三 Agent 分工的流式编排 + 落库队列入口
 │   ├── memory_manager.py           # 记忆系统核心：遗忘曲线、RRF 混合检索、Reranking、事实提取
 │   ├── memory_layer.py             # 记忆分层：核心/重要/常规，遗忘强度与检索权重
 │   ├── temporal_metadata.py        # 时间标签：时间表达识别、时间上下文提取
@@ -361,13 +362,13 @@ moz/
 │   ├── file_processor.py           # 图片处理：格式校验、多模态检测
 │   ├── conversation_store.py       # 会话持久化（SQLite）
 │   ├── migration_v2.py             # 数据库迁移脚本（v1 → v2：档案卡 + 分层 + 时间标签）
-│   └── tests/                      # 单元测试（152 tests）
+│   └── tests/                      # 单元测试（145 tests）
 │       ├── test_core.py            # 遗忘曲线、Provider 检测、序列化
 │       ├── test_api.py             # API 端点、SSE、速率限制
 │       ├── test_rag.py             # RRF 检索、查询改写、Reranking、工作记忆
 │       └── test_memory_upgrade.py  # 档案卡、时间标签、记忆分层、迁移脚本
 ├── tools/                          # 量数与门禁（一律用 .venv 里的 python 跑）
-│   ├── selftest.py                 # 48 项快检门禁（不碰模型、不写用户数据；--full 走真实往返）
+│   ├── selftest.py                 # 51 项快检门禁（不碰模型、不写用户数据；--full 走真实往返）
 │   ├── bench_latency.py            # 端到端首字分布，按档报采样数
 │   ├── probe_first_token.py        # 裸连中转：实际发出的键 + 5 段计时 + reasoning 字数
 │   ├── compare_wording.py          # 两份沙箱开/关思考交替问，并排看原话
@@ -493,7 +494,7 @@ cd frontend && npm run lint && npm run build
 ### 量响应时间（Windows 上必须用 `.venv` 里的 python）
 
 ```bash
-# 快检门禁：48 项，秒级，不碰大模型、不写用户数据（11 项走 HTTP，需要后端在跑）
+# 快检门禁：51 项，秒级，不碰大模型、不写用户数据（11 项走 HTTP，需要后端在跑）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py
 
 # 端到端首字分布（每档至少 3 次采样才允许当结论；花中转账度）

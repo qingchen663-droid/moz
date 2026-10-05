@@ -8,7 +8,7 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:

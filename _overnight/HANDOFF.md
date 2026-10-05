@@ -1,6 +1,6 @@
 # moz 交接文档
 
-写于 2026-09-27 20:30，第廿三轮后更新到 2026-10-04　·　最新提交见 `git log`（第廿三轮：
+写于 2026-09-27 20:30，第廿四轮后更新到 2026-10-05 20:10　·　最新提交见 `git log`（第廿四轮：
 `0819a64` 同渠道对冲**做了、量了、没赢，所以删了**——单发中位 3244ms vs 两枪取快 3422ms，
 这条中转按 IP/账号排队；顺带留下新默认下的真机分布：普通句首字中位 **1.0~2.1 秒**，
 但**每个后端起来后的第一句 17~50 秒**，这条成了下一轮头条），工作区干净
@@ -20,21 +20,21 @@
 
 | 端口 | 是什么 | 备注 |
 |---|---|---|
-| 127.0.0.1:8000 | 后端 `uvicorn server:app --reload` | 改任何 `.py` 都会重启 |
+| 127.0.0.1:8000 | 后端 `uvicorn server:app`（**这台机器现在跑的这一个没带 `--reload`**） | 有 `--reload` 时改 `.py` 会重启；没有就得手动重启 |
 | 127.0.0.1:3000 | 前端 Vite dev server | PWA 就装在它上面 |
 
 日常启动：双击项目根的 **`moz-app.bat`** —— 它只在端口没被占时启动后端和前端、开一个无地址栏的应用窗口、
 并拉起托盘（托盘自带互斥锁，重复启动会自己退出，所以看到两个 pythonw 进程是正常的）。
-`--reload` 的代价必须记住：**重启会把进程内状态清零**——当天的主动关心额度、"话多话少"的观察、
+两条都要记住：① **改了后端代码不重启就吃不到**——2026-10-05 那天跑着的后端是没带 `--reload` 起的，我一度把在旧进程上测的数字当成新代码的成绩（现已核对：本轮所有真机数字都在定稿代码上重跑）；② `--reload` 的代价是**重启会把进程内状态清零**——当天的主动关心额度、"话多话少"的观察、
 `MemoryManager` 的记忆缓存全部重来。所以别假设后端连续跑着，也别在测时间相关行为时随手改 `.py`。
 
 ## 2. 门禁：四条命令，全绿才提交
 
 ```bash
-# ① 后端全局自测（48 项快检，秒级，不碰大模型、不写用户数据）
+# ① 后端全局自测（51 项快检，秒级，不碰大模型、不写用户数据）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py
 # 想连真实对话/中转看图一起验：--full（42 项，慢、耗额度；跑完自己擦痕迹）
-# ② 后端单元测试（152 条）
+# ② 后端单元测试（145 条）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m pytest backend/tests -q
 # ③④ 前端
 cd frontend && npx tsc -b && npx vitest run
@@ -42,16 +42,21 @@ cd frontend && npx tsc -b && npx vitest run
 
 几条必须知道的细节：
 - **必须用 `.venv/Scripts/python.exe`**。用系统 python 会报一堆假的 `ModuleNotFoundError: langchain`。
-- **48 项里有 11 项走 HTTP（127.0.0.1:8000）**：后端没起它们全红。看到"11 项连接被拒绝"先想起这条，
+- **51 项里有 11 项走 HTTP（127.0.0.1:8000）**：后端没起它们全红。看到"11 项连接被拒绝"先想起这条，
   别去怀疑代码（第廿一轮就是这么白查过一遍的）。
 - 两次自测之间**隔 60 秒以上**，否则会被自己的限流打掉（`限流不误伤本地` 那项自己就连发 80 次）。
 - pytest 是第八轮才补进门禁的：它之前一直不在门里，结果藏着一条从几轮前就失效的断言（429 文案）。
-- 当前基线：selftest **48 项 0 失败 / 0 警告**、pytest **152 passed（~6-9s）**、vitest **67** 条、tsc 无输出。
+- 当前基线：selftest **51 项 0 失败 / 0 警告**、pytest **145 passed（~24-40s）**、vitest **67** 条、tsc 无输出。
+  （pytest 从 152 降到 145：第廿四轮删掉非流式图时，`TestQueryRewrite` 6 条 + 多路召回 1 条
+   测的是**被删掉的能力**，跟着删；`test_search_batches_and_caches_query_embeddings` 改成"同一句只许要一次向量"。）
+- **lint 不在四条门禁里**：第廿四轮那个"`friendly_llm_error` 没 import"（中转报错时把生成器炸在 except 里）
+  只有 ruff 看得见。`backend/`+`tools/` 还剩 11 条风格项（E731/E741/F401）。要不要加第五条，等用户拍。
   （第九轮 +2 selftest；第十轮 +5 pytest +6 vitest；第十一轮 +1 selftest +10 pytest；
   第十二轮 +2 selftest +3 pytest；第十三轮 +1 selftest +6 pytest +2 vitest；
   第十四轮 +2 selftest +4 pytest +3 vitest；第十五轮 +1 selftest +2 pytest +1 vitest；第十六轮 +2 vitest；
   第十七~十八轮 +3 selftest；第二十轮 +4 selftest；第廿一轮 +2 selftest；第廿二轮 +1 selftest；
-  第廿三轮 ±0（对冲那条随功能一起删了））
+  第廿三轮 ±0（对冲那条随功能一起删了）；第廿四轮 +3（档案卡真的进 prompt、上下文字段都有人写、没回话才原样重发一次）
+   +「查询改写不挡首字」改名升级为「检索这一段不调模型」）
 - **写库的自测必须同时给 `storage_path` 和 `db_path`**：`MemoryManager(storage_path=tmp)` 的 SQLite
   默认仍然指向 `backend/moz.db`，第八轮就这么往用户真实库写过 8 条探针行（快照后按 user_id 删干净了）。
 - **临时库跑完必须真的把连接关掉再 rmtree**：`MemoryManager` 没有 `_conn()`，连接在 `self._local` 上，
@@ -78,9 +83,10 @@ cd frontend && npx tsc -b && npx vitest run
 - `memory_manager.py`（近 2400 行，核心）：`add_memory` / `search_memories`（语义+关键词 → RRF → rerank；
   **回话那一句只用用户原话这一个查询**，多路改写 `rewrite_query` 已经不在首字路径上，见第廿轮）/
   容量策略（`MAX_ACTIVE_MEMORIES=5000`、归档默认永不硬删）/ 遗忘曲线。
-  **多路改写有硬超时 `QUERY_REWRITE_TIMEOUT`（默认 1.2 秒，`memory_manager.py:635`）**（第十三轮钉的，
-  当时是 5s）：以前写成 `with ThreadPoolExecutor(...)`，超时之后退出 with 还要等工作线程跑完，等于没超时
-  （实测假客户端睡 8 秒 → 调用方等 8.00s，改完 5.18s）。要加这种"超时"记住：**别把池包在 with 里**。
+  **`rewrite_query` / `_REWRITE_POOL` / `QUERY_REWRITE_TIMEOUT` 第廿四轮整块删了**（唯一调用方是那条死图）。
+  它留下的教训钉在代码注释里，别丢：以前写成 `with ThreadPoolExecutor(...)`，`future.result(5)` 是超时了，
+  可退出 with 解释器照样 `shutdown(wait=True)` 等线程跑完，**等于没超时**（实测睡 8 秒的客户端让调用方等满 8.00s）。
+  要加这种"超时"记住：**别把池包在 with 里**。
   检索缓存两件套：`_keyword_derived`（每条记忆的分词/词频/清洗正文/**2 字连写集合**）+
   `_search_index_cache`（向量矩阵），作废统一走 `_invalidate_search_cache()`——
   **任何改记忆状态/重要度/情感的地方都必须调它**（第五轮踩过）。
@@ -128,13 +134,14 @@ cd frontend && npx tsc -b && npx vitest run
 
 **对话与配置**
 - `server.py`（1.5k 行）：所有接口。`/api/care/dry-run` 是"看它此刻会说什么"的演练口（不写库、不调模型）。
-- `emotion_graph.py`：LangGraph 工作流。一轮对话的落库在 `run_save_job()`，**四步并行**
+- `emotion_graph.py`：**只剩流式那一条路径**（第廿四轮删掉了 `build_emotion_graph` / `run_emotion_workflow` 那条建好却从没被 invoke 的非流式图，连带 `rewrite_query`、`search_memories(queries=)` 多路扇出）。一轮对话的落库在 `run_save_job()`，**四步并行**
   （工作记忆 / 长期记忆→时间标签 / 档案卡 / 关心抽取），实测 38.7 秒（旧串行写法 3~7 分钟）。
   时间标签必须紧跟长期记忆——它靠"刚创建 10 秒内"认领记忆，并行会认领不到。
   **流式那个 120 秒是"空档计时"不是总时长上限**（`emotion_graph.py:918` 的
   `wait_for(token_queue.get(), timeout=120)` 每吐一个字就重置）：第十四轮实测一句对话被
   慢中转挤到 **383 秒**才报超时，所以报错文案现在带**实际等了多久**（`friendly_llm_error(..., waited=)`）。
   要不要再加一个总上限还没定，见 §8 第 12 条。
+  **第廿四轮三条新约定**：① **一个字都没发出去才原样重发一枪**（`_stream` 里两枪为限，出过字绝不重发；废掉那一枪不 await，但要留在 `_orphan_streams` 里握强引用——事件循环对 Task 只持弱引用）；② 历史窗口用 `_split_history_window()` 切成"留下的 + 丢掉的"，丢掉那截折成「之前聊了什么」（**按 (用户, 会话) 分键**、每多丢 5 轮重折一次、只进 prompt 不进总结金字塔）；③ 档案卡由 `_run_memory_retrieval` 读出来随检索一起交出去（以前这字段只有死图会填，等于她存了档案卡却从来不用）。
 - `emotion_state.py`：**情感预热三层的存储与判据**（第十八轮起）。
   L0 `live_signal()` 纯规则判档（0.03ms，措辞写成中文人话、内部键名一律不外露）；
   L1 `EmotionStore` 存 `emotion_state` 表的相处总结（`MIN_EVIDENCE=6` 条依据起、两次隔 6h、
@@ -190,6 +197,7 @@ cd frontend && npx tsc -b && npx vitest run
 | 廿一 | 检索时间：剪枝（跳过词面必然 0 分的记忆）配对实测 5000 条 111.6→**60.6ms**、`(id,分数)` 逐条对拍不变；整库补向量交后台单飞线程、向量失败改指数退避封顶 30 分钟。**顺手揪出门禁互相污染**（老项给单例挂桩不还原，后面的项量的是别人的桩）。门禁 +2 → 47 | `db8ea5e` |
 | 廿二 | **每轮白付的 222ms**：裸量 TCP+TLS 握手中位 222ms，而每轮/每个后台任务都新建 `ChatOpenAI` → 每次从零握手 → 全进程共用一个 httpx 连接池。门禁「连接池不每轮重握手」两次自己骗自己（桩把被测对象换掉了）都记进 RUNLOG。门禁 → **48 项** | `388a195` |
 | 廿三 | 用户说"额度无所谓"→ 去量那条一直没做的**同渠道对冲**：8 对里 6 对有效，**单发中位 3244ms vs 两枪取快 3422ms**（"两枪更快"只占 3/6）。这条中转**按 IP/账号排队、不按连接排队**，第二枪只会多烧额度 ⇒ **功能整块删除**（含门禁、指标），只留 `--hedge-ab` 这个量法。备用渠道实测 **503**。新默认下的真机分布：普通句中位 **1.0~2.1s**、敏感 7.1s、带图 4.6s——**但每个后端第一句 17~50s，原因未查** | `0819a64` |
+| 廿四 | 用户对第廿三轮那三件"要表态的"回了**都要**，三件全做：① 清死代码（非流式图 / `rewrite_query` / `_REWRITE_POOL` / `queries=` 多路扇出）——**清出两个真 bug**：**档案卡从来没进过 prompt**（那字段只有死图会填，界面有内容、prompt 里一个字没有）、`friendly_llm_error` **没 import**（中转报错带 "error code" 那一类当场 NameError，生成器炸在 except 里，用户只收到断流不是一句人话）；② 整条没回话时**同一请求原样再发一枪**（出过字绝不重发、最多两枪、不换嗓子，账进 `emotion.retry`）；③ **长对话第三层接通**：摘要分支触发线 30 轮 vs 窗口 15 轮那个"永远差一倍"改成"有被窗口丢掉的轮次就折"，按 (用户, 会话) 分键、每 5 轮重折、只进 prompt 不进金字塔。门禁 48→**51 项**（+「上下文字段都有人写」这条 AST 结构门禁，反向对照=抹掉档案卡那行立刻报）、pytest 152→**145**（删的是测已删能力的 7 条）、ruff 18→11 条。真机验到第三层：45 轮沙箱历史，第 2 句 1.1 秒开口并想起被窗口扔掉的那句，且**不编更早的** | `747d5d3` `5aca8b2` `2f2524e` |
 
 ## 6. 数据现状（别被空库吓到）
 
@@ -350,6 +358,9 @@ cd frontend && npx tsc -b && npx vitest run
     现在日期全部现算，三档一起测：未来 20 天 / 正好今天 / 已过 35 天。
     反向对照：把 `_to_timestamp` 的 86400 秒宽容改成"严格未来"，这项立刻红。
     **要测日期滚动，就别把日期写死。**
+46. **死代码能遮住一个用户可见的真 bug**（第廿四轮）：`_build_dialogue_messages` 一直读 `state["profile_context"]`，而这个字段**只有那条"建好却从没被 invoke"的非流式图**会填——于是档案卡存了、界面上看得见、回话时一次都没用上，从外面完全看不出来。**判据不是"有没有人读"，是"同一条活路径上有没有人写"**。所以门禁「上下文字段都有人写」用 AST 扫 builder 读的键 vs 三个装配函数写的键，缺一个就红；反向对照＝从源码里抹掉 `"profile_context": profile_context,` 那一行，它必须立刻报出来。
+47. **`except` 里调一个没 import 的名字 = 报错本身变成另一种故障**（第廿四轮）：server.py 的对话兜底写着 `friendly_llm_error(e)` 却从来没 import 它，而带 "error code" 的报文正是中转最常见的死法——**于是报错处理路径自己 NameError，生成器炸在半路，用户收到断流而不是一句人话**。四条门禁里没有 lint，所以这个 bug 能活好几轮（ruff 里它就是唯一的 F821）。**兜底/异常处理里的每个外部名字都要被至少一条测试跑到。**
+48. **`asyncio` 事件循环对 Task 只持弱引用**（第廿四轮"重发一枪"里踩的）：放弃那一枪时既不 await 也不留引用，它会被 GC，报 `Task was destroyed but it is pending`。废掉的流要扔进模块级集合（`emotion_graph._orphan_streams`），`add_done_callback` 跑完自摘。
 45. **`docs/*` 在 `.gitignore` 里（第 59 行）**——内部文档默认不入版本控制，靠一条条 `!docs/xxx.md` 白名单放行。
     所以往 `docs/` 新写一份文档，`git status` 里**根本不会出现**，会静默留在未跟踪状态。
     写完必须 `git status --untracked-files=all -- docs/` 确认，并按现有约定加白名单。
@@ -445,16 +456,15 @@ cd frontend && npx tsc -b && npx vitest run
     第十五轮改的是显示层（折成"你讨厌吃香菜"），存储里还是"我"。
     要不要在 `_extract_facts` 出口一并折成第三人称（顺带让 `is_near_duplicate` 少看一种形状）——
     这是口径变化，动手前先看 RUNLOG 第十六轮第 5 节那几条原文。
-19. **第廿三轮起，"降低首字"这张单子已经清完了，接下来三件都要你表态**（详见 `docs/响应时间账.md` §6）：
-    - ① 中转整句不回话时（第十九轮 18 次里 2 次＝11%），要不要**同一请求原样重试一次**？
-      不换嗓子，代价是最坏情况下多等一倍。**换模型/换渠道兜底会换嗓子**，那条更要你点头
-      （备用渠道实测 503，本来就还没通）。
-    - ② 两处**死代码**要不要清：`build_emotion_graph()`（启动时建好、从没有地方 invoke）
-      和它里面那条多路召回 `rewrite_query` + `_REWRITE_POOL`。删掉＝"多路查询召回"这条能力
-      从代码里消失，README 原来还写着它有，所以不自己删。
-    - ③ 超长对话没有第三层记忆：摘要分支的触发线是 30 轮，而历史在进 prompt 前被截到 30 **条**
-      （最多 15 轮）——**这个分支在 `/api/chat` 上到不了**，真实库 `conversation_summaries` 0 行。
-      第廿轮我错把它当超时元凶、已认错，改动本身按结构理由保留、**实测收益记 0**。
+19. ~~第廿三轮那三件要表态的事~~ **用户 2026-10-05 说"都要"，三件全部做完**（RUNLOG 第廿四轮）：
+    ① 整条不回话→同一请求原样再发一枪（`emotion.retry` 有账，**recovery_rate 还没真样本**）；
+    ② 死代码清干净，顺带修掉两个真 bug（档案卡没进 prompt、`friendly_llm_error` 没 import）；
+    ③ 长对话第三层接通并真机验到。**改动要重启后端才生效**（现在跑着的没带 `--reload`）。
+19b. **第廿四轮新长出来、需要你拍的三件**：
+    - ① **会话级摘要什么时候真正落一次**进 `conversation_summaries`（切对话？满 N 轮？）——
+      现在它只进 prompt、不落库，所以**周记/月记仍然没有活的生产者**（真实库那两张表还是空的）。
+    - ② 要不要把 **`ruff check` 加成第五条门禁**：本轮那个 NameError 只有 lint 看得见。
+    - ③ `langgraph` 已经完全没人用了，**要不要从 requirements.txt 卸掉**（卸依赖算改环境，不自己动）。
 20. **验收还欠你本人那三句**（`下一对话执行计划.md` 里你自己写的清单）：跑 `.\moz-app.bat`，
     对她说①普通问候 ②一件家里的烦心事 ③追问第二句的内容，记下**首字出现大约几秒、话自不自然、记不记得**。
     验的时候**别改 `.py`**（`--reload` 会中途重启后端，把这一轮清掉）。
@@ -478,10 +488,11 @@ cd frontend && npx tsc -b && npx vitest run
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health                                 # 后端活着（注意是 /api/health，根路径 404）
-PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py   # 48 项门禁应 0 失败 0 警告（11 项要后端在跑）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py   # 51 项门禁应 0 失败 0 警告（11 项要后端在跑）
 curl -X POST "http://127.0.0.1:8000/api/care/dry-run?user_id=web_user_001"   # 看它此刻会主动说什么
 curl -s  "http://127.0.0.1:8000/api/care/save-queue?user_id=web_user_001"    # 还有几轮没落库（第八轮新增）
 ```
 
-然后读 `_overnight/RUNLOG.md` 的最新一轮（当前到第廿三轮）。有问题先查 RUNLOG 再查代码——这一夜踩的坑大多已经写在那里了。
+然后读 `_overnight/RUNLOG.md` 的最新一轮（当前到第廿四轮）。有问题先查 RUNLOG 再查代码——这一夜踩的坑大多已经写在那里了。
+**改了后端代码要重启才吃得到**（这台机器现在的进程没带 `--reload`）。
 **要碰响应时间就先读 `docs/响应时间账.md`**（口径、实测数字、已经被证伪的办法、能拧的环境变量都在那一份里）。
