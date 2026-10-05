@@ -11,7 +11,7 @@
 [![LangGraph](https://img.shields.io/badge/LangGraph-Workflow-1C3C3C?style=flat)](https://github.com/langchain-ai/langgraph)
 [![Vite](https://img.shields.io/badge/Vite-8-646CFF?style=flat&logo=vite&logoColor=white)](https://vitejs.dev)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
-[![Version](https://img.shields.io/badge/Version-v0.3-blue.svg)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-v0.4-blue.svg)](./CHANGELOG.md)
 
 </div>
 
@@ -24,7 +24,8 @@
 与传统聊天 AI 不同，moz 拥有**多层认知记忆系统**——用户档案卡 + 三层分级记忆（核心/重要/常规）+ 时间标签 + 艾宾浩斯遗忘曲线 + RRF 混合检索。她能模拟人类记忆的编码、存储、检索、衰减四个阶段：你告诉她的事情，她不会轻易忘记；
 不重要的事情，她**也不会删掉或忘掉**——只是权重一路降到最低，很少再主动想起来、再提起来。
 
-moz 由三个协作的 AI Agent 驱动：**情感分析 Agent** 与 **记忆检索 Agent** 并行工作，然后**对话生成 Agent** 综合这些信息，用心地与你对话。
+moz 由三个协作的 AI Agent 分工驱动：**情感分析** 与 **记忆检索** 提供上下文，**对话生成** 综合它们用心地与你对话。
+运行时序上前两者**不挡在第一个字前面**（情感判断走毫秒级规则 + 后台攒下的基线与对策），否则每次开口都要先等一次上游往返。
 
 ---
 
@@ -37,14 +38,16 @@ moz 由三个协作的 AI Agent 驱动：**情感分析 Agent** 与 **记忆检�
 - **情感分析引擎** — 规则+LLM 混合情感分析，支持语境翻转（「喜欢+没结果」→ 难过而非开心），情感标签自动传递给记忆存储
 - **工作记忆层** — 跨对话持久化的短期上下文，解决切换对话后 AI "失忆"的问题
 - **记忆查看器** — Web 端可查看档案卡、全部记忆（含层级/情感/时间标签）、工作记忆摘要
-- **三 Agent 协作工作流** — 情感分析与记忆检索并行执行，对话生成 Agent 综合信息流式回复
-- **RRF 混合检索** — 语义 + 关键词多路召回 → RRF 融合（k=60）→ 多特征 Reranking（RRF 0.5 + 时间衰减 0.2 + 情感匹配 0.15 + 重要性 0.1 + 层级权重 0.05）
+- **三 Agent 协作工作流** — 概念分工是「情感分析 ‖ 记忆检索 → 对话生成」；运行时序上**前两者不挡第一个字**（情感判断走毫秒级规则 + 后台基线/预热，模型调用排在落库前），详见 `docs/响应时间账.md`
+- **RRF 混合检索** — 语义 + 关键词两路召回 → RRF 融合（k=60）→ 多特征 Reranking（RRF 0.5 + 时间衰减 0.2 + 情感匹配 0.15 + 重要性 0.1 + 层级权重 0.05）；关键词那一路会**剪掉词面上必然 0 分的记忆**（结果逐条对拍不变）
 - **流式逐 Token 输出** — 基于 `asyncio.Queue` 实现逐 token 推送，回复像真人打字一样自然
-- **可观测性** — 请求耗时中间件 + `/api/metrics` 端点，暴露各端点 QPS / 平均延迟 / 错误率
+- **可观测性** — 请求耗时中间件 + `/api/metrics` 端点，暴露各端点 QPS / 平均延迟 / 错误率，以及**首字分段计时**（`first_token` 端到端／`first_token_relay` 只量中转／`first_token_stages` 各段）
 - **自定义人设** — Web 端侧栏点击按钮即可修改 AI 性格、身份和说话风格，立即生效
 - **多模型支持** — DeepSeek / OpenAI / 智谱 / 通义千问 / SiliconFlow，切换只需改两个变量
-- **深度思考模式** — 支持各模型 thinking 模式，通过 `MODEL_PROFILES` 配置，新增模型零代码改动
-- **多模态对话** — 图片上传，AI 能「看懂」你分享的图片（需视觉模型），微信风格图片气泡
+- **深度思考模式** — 各家的开/关键由 `MODEL_PROFILES` **自己声明**，没声明的维持不发（不猜参数名）。
+  **注意有坑**：中转可能 200 收下参数然后静默忽略——发没发出去看 `emotion.thinking.thinking_param_sent/absent`
+- **多模态对话** — 图片能发过去（需视觉模型），微信风格图片气泡。**不承诺看得准**：实测中转会随机丢图，
+  所以措辞只说"图会发过去，不一定准"（v0.4 起按实测去掉承诺）
 - **安全认证** — 双级密钥认证（访问密钥 + 管理员密钥），保护对话数据安全
 - **总结记忆金字塔** — 会话摘要持久化 SQLite，同周自动聚合为周记、周记级联为月记，AI 能自然提起「上周/上个月」的话题
 - **记忆巩固引擎** — 相似片段语义聚类后 LLM 合并为整合记忆，容量超限时自动执行巩固→归档→清理三层维护
@@ -56,7 +59,24 @@ moz 由三个协作的 AI Agent 驱动：**情感分析 Agent** 与 **记忆检�
 
 ## 版本迭代
 
-### v0.3 — 记忆治理与巩固 `当前版本`
+### v0.4 — 桌面化与主动关心 `当前版本`
+
+> 从"能聊能记"走到"像装在自己电脑上的一个软件"，并把"她答不上来"从静默丢数据变成能看见、能补记的失败。
+> 逐条清单见 [CHANGELOG.md](./CHANGELOG.md)（v0.4 之后还有一串未发布的响应时间偿还，见同文件顶部）。
+
+**新增**
+- 一键启动与桌面外壳：`moz-app.bat`、PWA（**零缓存** Service Worker）、系统托盘（页面关着也能弹 Windows 通知）
+- 主动关心引擎：后端每 60 秒判定"现在该不该说句话"，带安静时段、当日名额、最小间隔；事项（生日/约定/复诊/答辩）从对话里自己长出来，用户不填表
+- 自测与保命工具：`tools/selftest.py`（现 48 项快检）、`tools/snapshot_data.py`（快照/回滚）、`tools/clean_probe_data.py`
+- 情感预热三层（L0 规则 / L1 基线 / L2 触发式对策）+ 界面「她猜的」页签可看可撤
+
+**变更/修复（挑对外感受最明显的）**
+- 长期记忆上限从 300 抬到 5000、默认**永不物理删除**（旧策略会悄悄把用户历史归档再删掉）
+- 首字路径上摘掉三次上游往返：「组织语言」从 10.4/178.6/64.1 秒 → 1.6/1.3 秒
+- 相对日期不再「今天+7 天」糊弄（下周三记成下周一，会在错的日子当面说错话）
+- 发图措辞去承诺、报错翻译成人话并带上**实际等了多久**、主动关心不再对着没人听的房间说
+
+### v0.3 — 记忆治理与巩固
 
 > 在 v0.2 分层记忆基础上引入 governed lifecycle：相似记忆自动巩固、总结金字塔持久化、开放话题主动跟进，以及用户数据自主权（导出/导入）。
 
@@ -138,17 +158,28 @@ moz 由三个协作的 AI Agent 驱动：**情感分析 Agent** 与 **记忆检�
                     └─────────────────┘
 ```
 
+> **这张图画的是三 Agent 的概念分工，不是运行时序。** 界面上真正跑的只有流式路径
+> （`run_emotion_workflow_streaming`）：情感分析与记忆检索**不再挡在第一个字前面**——
+> 情感判断改由毫秒级规则（L0）+ 后台基线（L1）+ 后台预热对策（L2）供措辞，模型调用排在落库前；
+> `build_emotion_graph()` 那个非流式图仍在启动时构建，但没有任何地方调用它。
+> 三层情感信号的设计见 `docs/情感预热系统设计.md`，首字时间的实测账本见 `docs/响应时间账.md`。
+
 ### 记忆检索流程（RAG）
 
 ```
-用户输入 → 查询改写（LLM 生成 2-3 个检索查询）
-         → 每个查询跑语义 + 关键词两路召回（查询向量批量生成并短时缓存）
+用户输入 → 每个查询跑语义 + 关键词两路召回（查询向量批量生成并短时缓存）
          → RRF 融合排序（k=60）
          → BM25/IDF 关键词加权 + 多特征 Reranking（RRF 0.5 + 时间衰减 0.2 + 情感匹配 0.15 + 重要性 0.1 + 层级权重 0.05）
          → Top N 记忆注入 Prompt
 ```
 
+**回话那一句用的是用户原话这一个查询**（首字路径上不调模型做查询改写，见 `docs/响应时间账.md` §3）：
+`rewrite_query` 本身还在（硬超时 `MOZ_QUERY_REWRITE_TIMEOUT`），但**已经没有任何运行中的调用方**——
+只有那个建好却从没被调用的非流式 LangGraph 图还在调它，属于待清理的死代码。
+关键词那一路会先**剪掉词面上必然 0 分的记忆**（第廿一轮，`(id, 分数)` 逐条对拍不变：5000 条 111.6ms → 60.6ms）。
+
 语义索引按用户缓存归一化向量矩阵，记忆写入、状态变化或补算向量时失效并重建。
+**整库补向量已交给后台单飞线程**：本轮不再替整库付一次注定失败的往返，下一轮起语义自动生效。
 检索阶段耗时、索引命中率和平均阶段延迟通过管理员接口 `GET /api/metrics` 的 `search` 字段查看。
 
 ### 记忆分层架构
@@ -174,13 +205,13 @@ moz 由三个协作的 AI Agent 驱动：**情感分析 Agent** 与 **记忆检�
 | **前端** | React 18 + TypeScript + Vite 8 | 响应式 SPA，温暖治愈风格 UI |
 | **状态管理** | Zustand | 轻量级状态管理 |
 | **后端** | FastAPI + Uvicorn | 高性能异步 API，SSE 流式响应 |
-| **Agent 编排** | LangGraph + LangChain | 三 Agent 工作流（情感分析与记忆检索并行） |
+| **Agent 编排** | LangGraph + LangChain | 三 Agent 分工（流式路径只等生成这一次上游往返） |
 | **LLM 客户端** | langchain-openai (ChatOpenAI) | 统一接口，支持多模型 |
 | **记忆系统** | 多层认知记忆模型 | 档案卡 + 三层分级 + 时间标签 + 遗忘曲线 + RRF 混合检索 + Reranking |
-| **语义向量** | 智谱 Embedding API (embedding-3) | 余弦相似度记忆匹配 |
+| **语义向量** | 智谱 Embedding API (embedding-3) | 余弦相似度记忆匹配；令牌失效时自动指数退避、检索走关键词 |
 | **存储** | SQLite (WAL 模式) | 对话 & 记忆 & 档案卡持久化，增量写入 |
-| **测试** | pytest (100 tests) + Vitest (22 tests) | 后端核心算法 + 前端交互测试 |
-| **CI** | GitHub Actions | ruff lint + pytest + eslint + tsc build + vitest |
+| **测试** | pytest (152 tests) + Vitest (67 tests) + `tools/selftest.py`（48 项全局快检门禁） | 后端核心算法 + 前端交互 + 端到端行为契约 |
+| **质量门禁** | `tools/selftest.py` + pytest + tsc/vitest | 四条命令全绿才提交（见上面「度量与自测」）。**没有 CI 流水线**——门禁靠人跑 |
 
 ---
 
@@ -286,6 +317,30 @@ MOZ_ALLOWED_USER_IDS=web_user_001
 MOZ_ADMIN_KEY=your-admin-key     # 管理员密钥（日志、Metrics、Prompt 修改）
 ```
 
+### 响应时间（首字）
+
+**完整账本在 [`docs/响应时间账.md`](./docs/响应时间账.md)**——里面写的是量出来的数、哪些办法已被数字否掉、
+以及三条口径不同的计时线（`first_token` 端到端／`first_token_relay` 只量中转／`first_token_stages` 各段）。
+全部旋钮在 `.env.example` 里有注释，改了要**重启后端**（正在跑的后端不会自己改）。常用的三个：
+
+```env
+MOZ_CHAT_THINKING=0            # 回话那一句带不带思考；默认关（开着更慢、回复更长）
+MOZ_SENSITIVE_WAIT_SECONDS=45  # 命中敏感话题时，开口之前最多为那一次情感判断等几秒；0 = 不等
+MOZ_EMBED_FAILURE_COOLDOWN_MAX=1800  # 向量服务失败后的退避封顶（越退越长，成功一次复位）
+```
+
+现在实测到的样子（`tools/bench_latency.py`，每档 ≥3 次采样才算结论）：0/10/100 条记忆下的普通句
+**首字中位 1.0~2.1 秒**；敏感轮 7.1 秒开口；带图 4.6 秒。
+**但每个后端起来之后的第一句是 17~50 秒**（原因未查清，别把它读成"她平时 2 秒开口"）。
+
+### 度量与自测
+
+- 只读指标：`GET /api/metrics`（Admin Key）——`first_token*`、`search`、`emotion.sensitive_wait`（含兑现率）、
+  `emotion.thinking`（思考参数发没发出去）、`emotion.prewarm`
+- 门禁：`tools/selftest.py` **48 项快检**（秒级、全打桩、不碰大模型、不写用户数据；
+  `--full` 另加真实对话与中转看图）。**其中 11 项走 HTTP，后端没起会全红——那是环境不是代码**
+- 单元测试：`pytest backend/tests`（152 条）+ 前端 `npx tsc -b && npx vitest run`
+
 ---
 
 ## 项目目录结构
@@ -306,11 +361,27 @@ moz/
 │   ├── file_processor.py           # 图片处理：格式校验、多模态检测
 │   ├── conversation_store.py       # 会话持久化（SQLite）
 │   ├── migration_v2.py             # 数据库迁移脚本（v1 → v2：档案卡 + 分层 + 时间标签）
-│   └── tests/                      # 单元测试（100 tests）
+│   └── tests/                      # 单元测试（152 tests）
 │       ├── test_core.py            # 遗忘曲线、Provider 检测、序列化
 │       ├── test_api.py             # API 端点、SSE、速率限制
 │       ├── test_rag.py             # RRF 检索、查询改写、Reranking、工作记忆
 │       └── test_memory_upgrade.py  # 档案卡、时间标签、记忆分层、迁移脚本
+├── tools/                          # 量数与门禁（一律用 .venv 里的 python 跑）
+│   ├── selftest.py                 # 48 项快检门禁（不碰模型、不写用户数据；--full 走真实往返）
+│   ├── bench_latency.py            # 端到端首字分布，按档报采样数
+│   ├── probe_first_token.py        # 裸连中转：实际发出的键 + 5 段计时 + reasoning 字数
+│   ├── compare_wording.py          # 两份沙箱开/关思考交替问，并排看原话
+│   ├── profile_search.py           # 检索分段耗时 + 剪枝配对 A/B（结果逐条对拍，不花额度）
+│   ├── sandbox_chat.py             # 隔离沙箱问答（答对/想不起来/答错/没回话）
+│   ├── seed_ui_sandbox.py          # 给界面造可见数据，全程不碰 backend/moz.db
+│   └── snapshot_data.py            # 数据快照与回滚（快照目录在仓库外）
+├── docs/                           # 设计文档与实测账本
+│   ├── 响应时间账.md               # 首字时间的口径、数字、被否掉的办法、旋钮
+│   ├── 情感预热系统设计.md         # 三层情感信号（L0/L1/L2）设计
+│   └── MODEL_CONFIG_GUIDE.md       # 模型配置指南
+├── _overnight/                     # 交接文档与逐轮实测记录（冷启动先读 HANDOFF.md）
+│   ├── HANDOFF.md
+│   └── RUNLOG.md
 ├── frontend/                       # 前端（React / TypeScript / Vite）
 │   └── src/
 │       ├── App.tsx                 # 根组件（布局 + 认证门控）
@@ -318,7 +389,6 @@ moz/
 │       ├── store.ts                # Zustand 状态管理
 │       ├── types.ts                # TypeScript 类型定义
 │       └── components/             # UI 组件（13 个，含记忆查看器）
-├── .github/workflows/ci.yml        # CI：ruff + pytest + eslint + build + vitest
 ├── .env.example                    # 环境变量模板
 ├── requirements.txt                # Python 依赖
 └── README.md
@@ -394,7 +464,7 @@ R = e^(-t/S)
 - **t**：经过时间（小时）
 - **S**：记忆强度 = 基础强度 `0.3` + 重要性加成 `importance × 0.5` + 复习次数加成 `min(access_count × 0.15, 1.0)`
 
-记忆生命周期：编码（事实提取 + 情感标注 + 程度评分 + `G0-G4` 分级 + 来源追溯）→ 存储（SQLite）→ 治理（去重、动态再分级、修正覆盖、反馈和软删除）→ 检索（RRF + Reranking，仅激活记忆）→ 衰减（低价值记忆归档而非直接移除）。完整设计见 [docs/MEMORY_FRAMEWORK.md](./docs/MEMORY_FRAMEWORK.md)。
+记忆生命周期：编码（事实提取 + 情感标注 + 程度评分 + `G0-G4` 分级 + 来源追溯）→ 存储（SQLite）→ 治理（去重、动态再分级、修正覆盖、反馈和软删除）→ 检索（RRF + Reranking，仅激活记忆）→ 降到最低权重（**不遗忘、不删除**：`prune_memories()` 只降权，归档永不物理删；唯一会转归档的是超过 5000 条软上限的性能阀门）。
 
 ---
 
@@ -420,6 +490,25 @@ cd frontend && npx vitest run
 cd frontend && npm run lint && npm run build
 ```
 
+### 量响应时间（Windows 上必须用 `.venv` 里的 python）
+
+```bash
+# 快检门禁：48 项，秒级，不碰大模型、不写用户数据（11 项走 HTTP，需要后端在跑）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/selftest.py
+
+# 端到端首字分布（每档至少 3 次采样才允许当结论；花中转账度）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/bench_latency.py --sizes 10 --repeats 3
+
+# 裸连中转：看实际发出的键 + 5 段计时 + reasoning 字数；--hedge-ab 配对量"补打一枪值不值"
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/probe_first_token.py
+
+# 检索分段与剪枝配对 A/B（不花额度，结果逐条对拍）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe tools/profile_search.py
+```
+
+> 量数的四条纪律（配对交替、桩不许替换被测对象、绝对毫秒阈值不稳、别边改代码边测量）
+> 写在 `docs/响应时间账.md` §7，都是踩出来的。
+
 ---
 
 ## 常见问题
@@ -429,12 +518,17 @@ A: 检查 `.env` 文件，确保至少配置了当前模型对应的 API Key。
 
 **Q: 记忆检索效果不好？**
 A: 需配置 `ZHIPU_API_KEY`（语义向量检索）。未配置时降级到纯关键词匹配，检索效果会下降。
+**注意**：这台机器上向量令牌目前是 **401 永久失效**的状态，属预期——她会自动退避
+（120 秒起、越退越长、封顶 30 分钟，成功一次复位），期间检索走关键词那一路，**不会每轮白等一次失败请求**。
 
 **Q: 切换模型后 Embedding 报 401？**
 A: Embedding 使用独立的 `EMBED_PROVIDER`（默认 `zhipu`），与对话模型解耦，需单独配置 `ZHIPU_API_KEY`。
 
 **Q: 流式回复卡住？**
-A: 检查后端日志，可能是 LLM API 超时或限流。对话过长可开启新对话。
+A: 先看 `GET /api/metrics` 的 `first_token_stages`（各段分开），确认等在中转（`relay_ttfb`）
+还是本地（`local_prep`）——**这两个数不是一回事**，别拿"只量中转"的数当界面秒表。
+已知：每个后端起来之后的**第一句**要 17~50 秒（原因未查，见 `docs/响应时间账.md` §6），
+同批后面几句 0.8~2.1 秒。对话过长可开启新对话。
 
 ---
 

@@ -132,7 +132,7 @@ def conversation_detail():
 def bad_inputs():
     ok = True
     cases = [
-        (f"/memory/not-a-real-user-%24%24/stats", "GET", None, (400, 403, 404)),
+        ("/memory/not-a-real-user-%24%24/stats", "GET", None, (400, 403, 404)),
         ("/config/list-models", "POST", {"base_url": "ftp://x/v1", "api_key": "k"}, (400,)),
         ("/config/list-models", "POST", {"base_url": "", "api_key": "k"}, (400,)),
         (f"/avatar/{USER}", "PUT", {"data_url": "data:image/png;base64,AAAA"}, (400,)),
@@ -540,11 +540,25 @@ def care_harvest_roundtrip():
     """"不用你填表，聊到生日面试它自己记下"——这条卖点的最短链路（规则兜底，不碰大模型）。
 
     大模型挂了或没配 Key 时走的就是这条路，所以它必须自己能记下事、不重复、不乱记。
+
+    **日期一律现算，不许写死**（原来写死的「10 月 5 日」在生日当天必然红：那天已经过了 9 点）。
+    写死还遮住了真正的口径：生日**就是今天**时要落在今天（到点就提醒），不许推到明年。
     """
+    import datetime as _dt
     from care_store import CareStore
     import care_extractor as X
 
     u = "__selftest_harvest__"
+    today = _dt.date.today()
+    ahead = today + _dt.timedelta(days=20)          # 还没到：折成未来的那一天
+    past = today - _dt.timedelta(days=35)           # 今年已经过掉：必须滚到下一次
+
+    def say(person, d):
+        return f"{person}生日是 {d.month} 月 {d.day} 日"
+
+    def local_date(ts):
+        return _dt.datetime.fromtimestamp(ts).date() if ts else None
+
     s = CareStore()
     try:
         for t in ("care_items", "proactive_queue", "care_log"):
@@ -552,19 +566,44 @@ def care_harvest_roundtrip():
         s._conn().execute("DELETE FROM care_settings WHERE user_id=?", (u,))
         s._conn().commit()
 
-        X.harvest(s, u, "我妈生日是 10 月 5 日", "")
+        X.harvest(s, u, say("我妈", ahead), "")
         items = s.list_items(u)
         if not items:
             return "说了一句带日子的话，什么都没记下来"
         got = items[0]
         if got["kind"] != "birthday" or got["repeat"] != "yearly":
             return f"生日没被认成每年重复：{got['kind']}/{got['repeat']}"
-        if not got["due_at"] or got["due_at"] < time.time():
-            return f"生日日期没折成未来的时间点：{got['due_at']}"
-        if "10 月" in got["title"] or "10月" in got["title"]:
+        if local_date(got["due_at"]) != ahead:
+            return f"「{ahead.month} 月 {ahead.day} 日」没折成那一天：{got['due_at']}"
+        if got["due_at"] < time.time():
+            return f"没过到的日子却给了个过去的时间点：{got['due_at']}"
+        if "月" in got["title"] or str(ahead.day) in got["title"]:
             return f"标题里还带着日期，读起来像半句话：{got['title']}"
-        n0 = len(items)
-        X.harvest(s, u, "我妈生日是 10 月 5 日", "")
+
+        # 生日就是今天：不许推到明年（推到明年＝当天一句都不提）
+        X.harvest(s, u, say("姥姥", today), "")
+        same_day = [i for i in s.list_items(u) if "外婆" in i["title"] or "姥姥" in i["title"]]
+        if not same_day:
+            return "说「姥姥生日是今天这一号」什么都没记下来"
+        if local_date(same_day[0]["due_at"]) != today:
+            return (f"生日正好是今天却被推到 {local_date(same_day[0]['due_at'])}，"
+                    f"当天就不会提了：{same_day[0]['due_at']}")
+
+        # 今年已经过掉的日子：必须滚到下一次，不许停在刚过去那天
+        X.harvest(s, u, say("我爸", past), "")
+        rolled = [i for i in s.list_items(u) if "爸爸" in i["title"]]
+        if not rolled:
+            return "说「我爸生日是 35 天前那个日子」什么都没记下来"
+        landed = local_date(rolled[0]["due_at"])
+        if not landed:
+            return "过掉的那个日子压根没折出时间点"
+        if (landed.month, landed.day) != (past.month, past.day):
+            return f"35 天前那个日子被折成了别的月日：{landed}"
+        if landed < today:
+            return f"过掉的日子没滚到下一次，停在 {landed}（今天 {today}）"
+
+        n0 = len(s.list_items(u))
+        X.harvest(s, u, say("我妈", ahead), "")
         after = len(s.list_items(u))
         if after != n0:
             return f"同一件事说了两遍被记成 {after - n0} 条新的（该去重）"
@@ -1051,7 +1090,7 @@ def care_link_graph_check():
         store.add_item(user, "姥姥体检", kind="health", source="manual")
         yanghua = mm.add_memory(user, "用户的妈妈喜欢养花", confidence=0.9)
         mm.add_memory(user, "用户下周三的项目答辩在总部三楼，负责人是老郑", confidence=0.9)
-        hua = mm.add_memory(user, "用户的猫叫团子，五岁橘猫", confidence=0.9)
+        mm.add_memory(user, "用户的猫叫团子，五岁橘猫", confidence=0.9)
 
         graph.sync_all(store, mm, user)
         linked = {r["label"]: r for r in graph.related(user, ITEM, mom["id"], limit=5)}
@@ -2728,7 +2767,6 @@ def emotion_baseline_honest():
             bad.append("解析不出 JSON 却返回了成功")
 
         # ④ 刷新节奏：事实没变别重算；变了也要隔够 6 小时；一天最多 3 次
-        now = time.time()
         fresh = store.get(user, "baseline")
         if store.needs_baseline(user, watermark, 20, now=fresh["updated_at"] + 60):
             bad.append("事实没变，一分钟前刚算过又要重算")
@@ -2988,7 +3026,6 @@ def full_chat_roundtrip():
     _, before = http(f"/conversations/{USER}")
     cid = before.get("current_id")
     _, msgs_before = http(f"/conversations/{USER}/{cid}") if cid else (200, {"messages": []})
-    n_before = len(msgs_before.get("messages", []))
     body = {"message": "自测探针：请用一句话回答你好", "conversation_id": cid,
             "conversation_history": [], "image_data": None}
     t0 = time.time()
