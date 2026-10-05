@@ -1473,7 +1473,9 @@ async def get_metrics():
                     # 开/关思考的参数到底发没发出去（不发出去，对照就是拿同一个请求比自己）
                     "thinking": {**emotion_state.thinking_stats(),
                                  "chat_use_thinking": CHAT_USE_THINKING},
-                    "prewarm": emotion_state.plan_stats()},
+                    "prewarm": emotion_state.plan_stats(),
+                    # 整条没回话时"原样再发一次"的账：fired/recovered/still_silent + 第一枪的死法分布
+                    "retry": emotion_state.retry_stats()},
     }
 
 # ================================================================

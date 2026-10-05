@@ -298,6 +298,10 @@ def _generate_summary(llm, conversation_history: List[Dict]) -> str:
         return ""
 
 
+# 被放弃的那一枪：不 await、但要在进程里留个强引用直到它自己跑完（详见 _stream 里的注释）
+_orphan_streams = set()
+
+
 # 摘要生成一次只允许一个在跑（照 SummaryService.maybe_cascade 那个非阻塞锁的写法）：
 # 排第二遍等于拿同一条中转去排队，而中转本来就是首字时间的大头。
 _summary_lock = threading.Lock()
@@ -747,45 +751,84 @@ def run_emotion_workflow_streaming(
             # local_prep 是"开口之前我们自己花的钱"，中转那一段单独记 relay_ttfb，两笔不许混
             emotion_state.record_stage("local_prep", stream_started - turn_started)
 
-            full_reply = ""
-            token_queue: asyncio.Queue = asyncio.Queue()
-            stream_error = [None]
+            # 中转偶尔**整条不回话**（第十九轮 18 次真请求里 2 次、第廿三轮 8 对里 3 次没回或 16 秒才回）。
+            # 用户 2026-10-05 拍板"都要"：**一个字都没出去时，同一请求原样再发一次**——
+            # 不换模型、不换渠道＝不换嗓子；已经吐过字的绝不重试（那等于同一句话说两遍）。
+            # 实测过同渠道"补打一枪取快的那枪"没有收益（3244ms vs 3422ms，中转按 IP 排队），
+            # 所以这里不是"抢快"，是"没回话时再多一次机会"，最坏情况多等一倍。
+            reply = ""
+            for attempt in (1, 2):
+                full_reply = ""
+                token_queue: asyncio.Queue = asyncio.Queue()
+                stream_error = [None]
+                # 每一枪单独计时：relay_ttfb 该是"出字那一枪"的中转延迟，不该把废掉那枪混进来。
+                # 用户实际等了多久由 server.py 那个端到端 first_token 负责，两笔账不重复也不漏。
+                stream_started = time.time()
 
-            def _consume_stream():
-                nonlocal full_reply
-                try:
-                    for chunk in llm.stream(messages):
-                        token = chunk.content
-                        if token:
-                            full_reply += token
-                            token_queue.put_nowait(token)
-                except Exception as e:
-                    stream_error[0] = e
-                finally:
-                    token_queue.put_nowait(None)
+                def _consume_stream():
+                    nonlocal full_reply
+                    try:
+                        for chunk in llm.stream(messages):
+                            token = chunk.content
+                            if token:
+                                full_reply += token
+                                token_queue.put_nowait(token)
+                    except Exception as e:
+                        stream_error[0] = e
+                    finally:
+                        token_queue.put_nowait(None)
 
-            stream_task = asyncio.create_task(asyncio.to_thread(_consume_stream))
+                stream_task = asyncio.create_task(asyncio.to_thread(_consume_stream))
+                # 事件循环只握着任务的**弱引用**，废掉那一枪没人 await 就会被 GC
+                # （"Task was destroyed but it is pending"）。扔进模块级集合，跑完自己摘掉。
+                _orphan_streams.add(stream_task)
+                stream_task.add_done_callback(_orphan_streams.discard)
 
-            first_token_at = None
-            while True:
-                token = await asyncio.wait_for(token_queue.get(), timeout=120.0)
-                if token is None:
-                    break
-                if first_token_at is None:
-                    first_token_at = time.time()
-                    # 中转那一段的到达延迟（旧口径唯一在量的数，单独进指标 relay_ttfb）
-                    emotion_state.record_stage("relay_ttfb", first_token_at - stream_started)
-                yield {'type': 'token', 'text': token}
+                first_token_at = None
+                got_any = False
+                gap_timed_out = False
+                while True:
+                    try:
+                        token = await asyncio.wait_for(token_queue.get(), timeout=120.0)
+                    except asyncio.TimeoutError:
+                        gap_timed_out = True
+                        break
+                    if token is None:
+                        break
+                    if first_token_at is None:
+                        first_token_at = time.time()
+                        # 中转那一段的到达延迟（旧口径唯一在量的数，单独进指标 relay_ttfb）
+                        emotion_state.record_stage("relay_ttfb", first_token_at - stream_started)
+                    got_any = True
+                    yield {'type': 'token', 'text': token}
 
-            if first_token_at is not None:
-                emotion_state.record_stage("generate", time.time() - first_token_at)
+                if first_token_at is not None:
+                    emotion_state.record_stage("generate", time.time() - first_token_at)
 
-            await stream_task
+                if not got_any and attempt == 1:
+                    # 这一枪整个废了。不 await 它：`future` 取消不了已经在飞的 HTTP（第十三轮那条老账），
+                    # 慢中转能一句一句挤到几百秒，等它就等于把"再试一次"变成"更久不回话"。
+                    reason = ("timeout" if gap_timed_out
+                              else "error" if stream_error[0] else "empty")
+                    emotion_state.note_retry(reason)
+                    logger.warning("[重试] 第 1 枪一个字没出（%s），原样再发一次",
+                                   "等了 120 秒没动静" if reason == "timeout"
+                                   else (str(stream_error[0])[:80] if reason == "error" else "回话是空的"))
+                    yield {'type': 'status', 'text': '刚才那句没接上，我再想一想…'}
+                    continue
 
-            if stream_error[0]:
-                raise stream_error[0]
+                if attempt == 2:
+                    # 第二枪的结果单独记，`fired - recovered` 才是"再发一次也没救回来"
+                    emotion_state.note_retry_outcome(
+                        bool(full_reply.strip()) and not gap_timed_out and not stream_error[0])
+                if gap_timed_out:
+                    raise asyncio.TimeoutError()
+                if stream_error[0]:
+                    raise stream_error[0]
+                reply = full_reply.strip()
+                break
 
-            reply = full_reply.strip() or "抱歉，我暂时无法回复。"
+            reply = reply or "抱歉，我暂时无法回复。"
 
             yield {'type': 'reply', 'text': reply}
 

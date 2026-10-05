@@ -2247,6 +2247,126 @@ def profile_card_reaches_prompt():
     return "; ".join(bad) or True
 
 
+def retry_only_when_silent():
+    """中转整条不回话时，同一请求**原样再发一次**（用户 2026-10-05 说"都要"）。
+
+    钉三条边界，一条都不能松：
+    ① 一个字都没出去才重发；**已经吐过字的绝不重发**（那等于同一句话说两遍，比不回话更难看）；
+    ② 最多两枪（第二枪也没回话就照旧报错，不许无限重试把额度烧穿）；
+    ③ 重发不换模型、不换渠道、不换参数＝不换嗓子。
+    计数走 `emotion.retry`：`fired / recovered / still_silent`。
+    120 秒空档那一支和"报错/空回话"走的是同一个 `not got_any` 分支，
+    快检里**没测**（不许为了一条断言睡两分钟），测的是 error 与 empty 两种死法。
+    """
+    import asyncio
+
+    import emotion_graph as EG
+    import emotion_state as ES
+
+    bad = []
+    counters_backup = dict(ES._COUNTERS)
+
+    class Client:
+        """按剧本出字的假中转：`stream()` 每被调一次就是"打了一枪"，剧本按枪次取。"""
+
+        def __init__(self, script, box):
+            self.script = script
+            self.box = box
+
+        def stream(self, messages):
+            shot = self.script[min(len(self.box), len(self.script) - 1)]
+            self.box.append(shot)
+            if isinstance(shot, Exception):
+                raise shot
+            for token in shot:
+                yield type("C", (), {"content": token})()
+
+    def drive(script):
+        box = []
+        EG.get_chat_client = lambda **kw: Client(script, box)
+        EG.emotion_analysis_node = lambda state: {}
+        EG._build_dialogue_messages = lambda state: []
+        EG.SENSITIVE_WAIT_SECONDS = 0.5
+
+        async def collect():
+            events = []
+            gen = EG.run_emotion_workflow_streaming(
+                memory_manager=None, user_id="__retry_selftest__",
+                user_message="今天天气不错", conversation_history=[])
+            async for ev in gen:
+                events.append(ev)
+            return events
+
+        return asyncio.run(collect()), box
+
+    real_client, real_node, real_messages = (EG.get_chat_client, EG.emotion_analysis_node,
+                                             EG._build_dialogue_messages)
+    real_wait = EG.SENSITIVE_WAIT_SECONDS
+    try:
+        # ① 第一枪报错、第二枪正常 → 用户该拿到完整一句，且只重发一次
+        ES._COUNTERS.update({k: 0 for k in ES._COUNTERS if k.startswith("retry_")})
+        evs, box = drive([RuntimeError("Error code: 502 no channel"), ["好", "的", "呀"]])
+        tokens = [e["text"] for e in evs if e.get("type") == "token"]
+        if "".join(tokens) != "好的呀":
+            bad.append(f"第二枪的话没接上：tokens={tokens!r} 事件={[e.get('type') for e in evs]}")
+        if len(box) != 2:
+            bad.append(f"该正好两枪，实际打了 {len(box)} 次")
+        st = ES.retry_stats()
+        if not (st.get("retry_fired") == 1 and st.get("retry_recovered") == 1
+                and st.get("retry_first_error") == 1):
+            bad.append(f"重发计数不对：{st}")
+        if not any(e.get("type") == "status" and "没接上" in (e.get("text") or "") for e in evs):
+            bad.append("重发时界面上没有任何交代（用户只会觉得她突然多等了很久）")
+        if any(k.startswith("retry_") for k in ES.plan_stats()):
+            bad.append("重试计数漏进了 prewarm 那个桶里，两边的账都会失真（plan_stats 要按前缀排除）")
+
+        # ② 第一枪就出字 → 一枪都不许多打（反向对照：把"出过字也重发"写回去，这里必须炸）
+        ES._COUNTERS.update({k: 0 for k in ES._COUNTERS if k.startswith("retry_")})
+        evs2, box2 = drive([["你", "好"]])
+        if len(box2) != 1:
+            bad.append(f"正常一句也去重发，打了 {len(box2)} 枪（同一句话可能说两遍）")
+        if ES.retry_stats().get("retry_fired"):
+            bad.append("正常回话却被记成重发过，这笔账会骗人")
+
+        # ③ 两枪都空回话 → 只许两枪，最后照旧给用户一句话
+        ES._COUNTERS.update({k: 0 for k in ES._COUNTERS if k.startswith("retry_")})
+        evs3, box3 = drive([[], []])
+        if len(box3) != 2:
+            bad.append(f"空回话应该重发一次就收手，实际 {len(box3)} 枪")
+        if not [e for e in evs3 if e.get("type") == "reply"]:
+            bad.append("两枪都空时没有任何回复事件（用户对着转圈）")
+        st3 = ES.retry_stats()
+        if not (st3.get("retry_fired") == 1 and st3.get("retry_still_silent") == 1):
+            bad.append(f"空回话那两支计数不对：{st3}")
+
+        # ④ **已经吐出半个字**之后才断——绝不重发（重发等于同一句话前后说两遍，比不回话更难看）
+        ES._COUNTERS.update({k: 0 for k in ES._COUNTERS if k.startswith("retry_")})
+        evs4, box4 = drive([["半", RuntimeError("Error code: 502 断了")]])
+        tokens4 = [e["text"] for e in evs4 if e.get("type") == "token"]
+        if len(box4) != 1:
+            bad.append(f"出了半个字还去重发，打了 {len(box4)} 枪")
+        if tokens4 != ["半"]:
+            bad.append(f"半个字那一枪的话被改写了：{tokens4!r}")
+        if not [e for e in evs4 if e.get("type") == "error"]:
+            bad.append("半个字后断流却没给用户任何交代（既不重发也不报错，界面就卡在说到一半）")
+        if ES.retry_stats().get("retry_fired"):
+            bad.append(f"出过字的情况被记成重发：{ES.retry_stats()}")
+
+        # 结构对照：闸门形状（只有"一个字都没出 + 第一枪"才重发）被改写时这项要说话。
+        # 注意它只钉形状，真正"不许多打"的行为证据是上面 ②④ 两支。
+        src = io.open(EG.__file__, encoding='utf-8').read()
+        if "if not got_any and attempt == 1:" not in src:
+            bad.append("重发的闸门形状变了（不再是 `not got_any and attempt == 1`），"
+                       "下面的两枪上限和计数口径都得重新核一遍")
+        return "; ".join(bad) or True
+    finally:
+        EG.get_chat_client, EG.emotion_analysis_node, EG._build_dialogue_messages = (
+            real_client, real_node, real_messages)
+        EG.SENSITIVE_WAIT_SECONDS = real_wait      # 别把上限留给后面的快检（第廿一轮那课的复发预防）
+        ES._COUNTERS.clear()
+        ES._COUNTERS.update(counters_backup)
+
+
 def prompt_fields_have_writers():
     """`_build_dialogue_messages` 读到的每一个上下文字段，必须真有人在同一条流式路径上写它。
 
@@ -2577,6 +2697,15 @@ def stage_timings_add_up():
             bad.append("/api/metrics 的 first_token 没有指向端到端那一段")
         if '"first_token_relay": emotion_state.stage_stats("relay_ttfb")' not in metrics_src:
             bad.append("/api/metrics 里旧口径（只量中转那一段）没有单独认领一个名字")
+        for needle, why in (
+                ('"sensitive_wait": emotion_state.wait_stats()',
+                 '敏感等待的兑现率没进指标（那 45 秒值不值就永远没人能判）'),
+                ('"thinking": {**emotion_state.thinking_stats()',
+                 '思考参数发没发出去没进指标（看不见就等于第廿轮那次假对照会再来一遍）'),
+                ('"retry": emotion_state.retry_stats()',
+                 '"没回话时重发"那笔账没进指标（发了几枪、救回几枪、几枪白烧都无从可查）')):
+            if needle not in metrics_src:
+                bad.append(why)
         graph_src = (ROOT / "backend" / "emotion_graph.py").read_text(encoding="utf-8")
         if "record_ttft" in graph_src:
             bad.append("emotion_graph 还在用旧的 record_ttft 冒充首字")
@@ -3357,6 +3486,7 @@ def main():
     check("后台摘要不挡首字", session_summary_off_the_clock)
     check("检索这一段不调模型", retrieval_makes_no_model_call)
     check("档案卡真的进 prompt", profile_card_reaches_prompt)
+    check("没回话才原样重发一次", retry_only_when_silent)
     check("上下文字段都有人写", prompt_fields_have_writers)
     check("关思考的参数真的发出去", thinking_param_reaches_wire)
     check("连接池不每轮重握手", http_pool_shared)

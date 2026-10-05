@@ -680,7 +680,10 @@ _COUNTERS = {"asked": 0, "hit": 0, "expired_skipped": 0, "dup_skipped": 0,
              "sensitive_asked": 0, "sensitive_paid_off": 0, "sensitive_agreed": 0,
              "sensitive_timeout": 0, "sensitive_failed": 0, "sensitive_had_plan": 0,
              # 思考/关思考的参数到底发没发出去（不发出去就等于在用同一个请求做对照）
-             "thinking_param_sent": 0, "thinking_param_absent": 0}
+             "thinking_param_sent": 0, "thinking_param_absent": 0,
+             # 整条没回话时"原样再发一次"的账（用户 2026-10-05 拍板：不换嗓子，只多给一次机会）
+             "retry_fired": 0, "retry_recovered": 0, "retry_still_silent": 0,
+             "retry_first_timeout": 0, "retry_first_error": 0, "retry_first_empty": 0}
 
 
 def bump_counter(name: str, n: int = 1) -> None:
@@ -688,9 +691,27 @@ def bump_counter(name: str, n: int = 1) -> None:
 
 
 def plan_stats() -> Dict[str, int]:
-    """预热那一套的计数（敏感等待和 thinking 参数各走各的账，别挤在一个桶里）。"""
+    """预热那一套的计数（敏感等待、thinking 参数、重试各走各的账，别挤在一个桶里）。"""
     return {k: v for k, v in _COUNTERS.items()
-            if not k.startswith(("sensitive_", "thinking_"))}
+            if not k.startswith(("sensitive_", "thinking_", "retry_"))}
+
+
+def note_retry(reason: str) -> None:
+    """第一枪一个字都没出去 → 准备原样重发。reason: timeout / error / empty。"""
+    bump_counter("retry_fired")
+    bump_counter(f"retry_first_{reason}")
+
+
+def note_retry_outcome(recovered: bool) -> None:
+    """第二枪的结果。`fired - recovered` = 再发一次也没救回来（含第二枪直接报错的那种）。"""
+    bump_counter("retry_recovered" if recovered else "retry_still_silent")
+
+
+def retry_stats() -> Dict[str, Any]:
+    out = {k: v for k, v in _COUNTERS.items() if k.startswith("retry_")}
+    fired = out.get("retry_fired", 0)
+    out["recovery_rate"] = round(out.get("retry_recovered", 0) / fired, 3) if fired else None
+    return out
 
 
 def wait_stats() -> Dict[str, Any]:
