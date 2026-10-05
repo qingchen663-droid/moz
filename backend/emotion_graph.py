@@ -27,7 +27,6 @@ import os
 import time
 import json
 import re
-import datetime
 import threading
 import logging
 from collections import OrderedDict
@@ -93,6 +92,7 @@ class AgentState(TypedDict):
     user_message: str                               # 当前用户消息
     conversation_id: Optional[str]                  # 当前会话 ID，用于记忆频率治理
     conversation_history: List[Dict]                # 当前对话历史（短期记忆，已截窗）
+    dropped_history: List[Dict]                     # 被窗口丢掉的更早轮次（摘要的原料）
     image_data: Optional[str]                       # 上传图片的 base64 data URL（多模态用）
 
     # 情感分析 Agent 输出
@@ -212,9 +212,11 @@ _summary_cache: OrderedDict = OrderedDict()
 _SUMMARY_CACHE_MAX_SIZE = 100
 _SUMMARY_CACHE_TTL = 30 * 60
 
-SUMMARY_TRIGGER_ROUNDS = 30
-SUMMARY_INTERVAL = 20
-MAX_RECENT_ROUNDS = 40
+# 「之前聊了什么」那段背景：窗口装不下的更早轮次折成一段摘要，**后台补、下一句才吃到**。
+# 第廿四轮之前这条分支永远跑不到——触发线写的是 30 轮，而 `_sanitize_history` 最多只给 15 轮，
+# 等于"聊久了她忘了前面"从来没被真正修过（RUNLOG 廿轮还把它错当过一次超时元凶）。
+# 现在判据换成一句话：**有被窗口丢掉的轮次，就该折起来**。
+SUMMARY_REFRESH_ROUNDS = 5      # 每多丢掉 5 轮才重算一次：一次后台往返换 5 轮背景，够便宜
 
 # 前端每次把整个会话历史原样回传，图片是 data URL，几十张就能顶到中转的 15MB 上限；
 # 那个报错会被上层 except 吞掉，表现出来就是"它突然不记得我了"。历史只留最近这些、且不重发图片。
@@ -224,7 +226,8 @@ HISTORY_MAX_CHARS = 800
 _HISTORY_IMAGE_RE = re.compile(r"data:image/[a-zA-Z]+;base64,[A-Za-z0-9+/=\s]+")
 
 
-def _sanitize_history(history) -> List[Dict]:
+def _sanitize_messages(history) -> List[Dict]:
+    """清洗并截断长文本、折掉图片，**不截窗口**——窗口那一段单独切，好让"被丢掉的部分"看得见。"""
     clean = []
     for msg in history or []:
         if not isinstance(msg, dict):
@@ -241,7 +244,17 @@ def _sanitize_history(history) -> List[Dict]:
             text = text[:HISTORY_MAX_CHARS] + "…"
         if text:
             clean.append({"role": role, "content": text})
-    return clean[-HISTORY_MAX_MESSAGES:]
+    return clean
+
+
+def _split_history_window(history) -> "tuple[List[Dict], List[Dict]]":
+    """→ (留在窗口里的, 被窗口丢掉的更早部分)。丢掉的这半截就是要折成摘要的原料。"""
+    full = _sanitize_messages(history)
+    return full[-HISTORY_MAX_MESSAGES:], full[:-HISTORY_MAX_MESSAGES]
+
+
+def _sanitize_history(history) -> List[Dict]:
+    return _split_history_window(history)[0]
 
 _summary_service: Optional[SummaryService] = None
 
@@ -258,24 +271,31 @@ def set_working_memory_ref(store: Optional[WorkingMemoryStore]):
     _working_memory_ref = store
 
 
-def _get_cached_summary(user_id: str, current_rounds: int) -> Optional[str]:
-    if user_id not in _summary_cache:
+def _summary_key(user_id: str, conversation_id: str):
+    # 按会话分键：切了新对话还端着上一个对话的"之前聊了什么"，等于当面说错话
+    return f"{user_id}::{conversation_id or ''}"
+
+
+def _get_cached_summary(user_id: str, conversation_id: str, dropped_rounds: int) -> Optional[str]:
+    key = _summary_key(user_id, conversation_id)
+    if key not in _summary_cache:
         return None
-    summary, timestamp, rounds = _summary_cache[user_id]
+    summary, timestamp, rounds = _summary_cache[key]
     if time.time() - timestamp > _SUMMARY_CACHE_TTL:
-        del _summary_cache[user_id]
+        del _summary_cache[key]
         return None
-    if (current_rounds - rounds) < SUMMARY_INTERVAL:
-        _summary_cache.move_to_end(user_id)
+    if (dropped_rounds - rounds) < SUMMARY_REFRESH_ROUNDS:
+        _summary_cache.move_to_end(key)
         return summary
     return None
 
 
-def _set_cached_summary(user_id: str, summary: str, rounds: int):
+def _set_cached_summary(user_id: str, conversation_id: str, summary: str, dropped_rounds: int):
+    key = _summary_key(user_id, conversation_id)
     if len(_summary_cache) >= _SUMMARY_CACHE_MAX_SIZE:
         _summary_cache.popitem(last=False)
-    _summary_cache[user_id] = (summary, time.time(), rounds)
-    _summary_cache.move_to_end(user_id)
+    _summary_cache[key] = (summary, time.time(), dropped_rounds)
+    _summary_cache.move_to_end(key)
 
 SUMMARY_PROMPT = """请对以下对话历史生成简洁的摘要（200字以内），提取关键信息和情感脉络。
 只需输出摘要内容，不要添加任何前缀或解释。
@@ -307,17 +327,24 @@ _orphan_streams = set()
 _summary_lock = threading.Lock()
 
 
-def _request_summary_async(user_id: str, early_history: List[Dict], total_rounds: int) -> bool:
+def _request_summary_async(user_id: str, conversation_id: str,
+                           dropped_history: List[Dict], dropped_rounds: int) -> bool:
     """把"之前聊了什么"那段背景交给后台生成，本轮先不带它开口。
 
     原来这里是开口之前的一次同步 `llm.invoke`，**没有任何超时上限**——2026-09-28 实测
-    30 条长历史那一轮 121.3 秒没回，最可能就是这次摘要和生成串在了一起（设计文档 §3：
-    首字路径上不许有上游往返）。摘要缓存每 20 轮才重算一次，所以代价是"这一句的背景少一段
-    更早的总结"，下一句起就补回来了——走的正是它自己异常时已经在用的那条回落分支。
+    30 条长历史那一轮 121.3 秒没回。改成后台补之后本轮这段背景就是空串，走的正是它自己
+    异常时已经在用的那条回落写法，下一句起补回来。
+
+    只写进程内那份缓存，**不往总结金字塔落一行**：这段摘要是"每多丢 5 轮重折一次"的滚动
+    口径，同一个对话会反复产出互相包含的摘要，塞进 `conversation_summaries` 等于让周记/
+    月记拿重叠内容去聚合。会话级摘要什么时候该真正落一次（切对话？满 N 轮？），
+    是产品口径，还没人拍——见 _overnight/HANDOFF.md §8。
     """
+    if not dropped_history:
+        return False
     if not _summary_lock.acquire(blocking=False):
         return False
-    history = list(early_history[-60:])   # 别让后台线程握着调用方的大列表
+    history = list(dropped_history[-60:])   # 别让后台线程握着调用方的大列表
 
     def _run():
         started = time.time()
@@ -325,11 +352,9 @@ def _request_summary_async(user_id: str, early_history: List[Dict], total_rounds
             llm = get_chat_client(temperature=0.3, use_thinking=False)
             text = _generate_summary(llm, history)
             if text:
-                _set_cached_summary(user_id, text, total_rounds)
-                week_key = datetime.datetime.now().strftime('%G-W%V')
-                get_summary_service().save_summary(user_id, text, 'session', week_key)
-                get_summary_service().cascade_async(user_id)
-                logger.info("🧠 [会话摘要] 后台补完，%.1fs，下一句起生效", time.time() - started)
+                _set_cached_summary(user_id, conversation_id, text, dropped_rounds)
+                logger.info("🧠 [会话摘要] 后台补完 %.1fs，覆盖被窗口丢掉的 %d 轮，下一句起生效",
+                            time.time() - started, dropped_rounds)
             else:
                 logger.warning("[会话摘要] 后台没生成出来，下一轮再试")
         except Exception as e:
@@ -407,23 +432,19 @@ def _build_dialogue_messages(state: AgentState) -> list:
     conversation_history = state.get("conversation_history", [])
     user_id = state.get("user_id", "default")
 
-    total_rounds = len(conversation_history) // 2
+    # 被窗口丢掉的更早轮次 = 该折成"之前聊了什么"的那部分。
+    # 第廿四轮之前这里写的是"总轮数 > 30 才折"，而窗口最多只有 15 轮，**这条永远不成立**
+    # （于是聊久了她确实忘前面，而界面上看不出任何异常）。判据换成"有没有被丢掉的东西"。
+    dropped = state.get("dropped_history") or []
     conv_summary = ""
-    if total_rounds > SUMMARY_TRIGGER_ROUNDS:
-        recent_rounds = min(total_rounds, MAX_RECENT_ROUNDS)
-        recent_history = conversation_history[-recent_rounds * 2:]
-        early_history = conversation_history[:-recent_rounds * 2]
-
-        if early_history:
-            conv_summary = _get_cached_summary(user_id, total_rounds)
-            if conv_summary is None:
-                # 这里原来是开口之前的一次同步模型调用（无上限）。改成后台补，
-                # 本轮这段背景就是空串——和它自己生成失败时的回落写法一模一样。
-                _request_summary_async(user_id, early_history, total_rounds)
-
-        historical_messages = recent_history
-    else:
-        historical_messages = conversation_history
+    historical_messages = conversation_history
+    if dropped:
+        dropped_rounds = len(dropped) // 2
+        conv_summary = _get_cached_summary(user_id, state.get("conversation_id") or "", dropped_rounds)
+        if conv_summary is None:
+            # 本轮先不带它开口：折一段背景要一次上游往返，而用户在等的是第一个字
+            _request_summary_async(user_id, state.get("conversation_id") or "",
+                                   dropped, dropped_rounds)
 
     context_parts = []
     working_memory_text = state.get("working_memory_text", "")
@@ -463,7 +484,7 @@ def _build_dialogue_messages(state: AgentState) -> list:
 
     messages = [SystemMessage(content=system_text)]
 
-    for msg in historical_messages[-MAX_RECENT_ROUNDS * 2:]:
+    for msg in historical_messages:      # 窗口就是 HISTORY_MAX_MESSAGES 那一条闸，不再二次截
         if msg["role"] == "user":
             messages.append(HumanMessage(content=msg["content"]))
         elif msg["role"] == "assistant":
@@ -635,11 +656,13 @@ def run_emotion_workflow_streaming(
     if working_memory_store:
         working_memory_text = working_memory_store.format_for_prompt(user_id)
 
+    kept_history, dropped_history = _split_history_window(conversation_history)
     initial_state = {
         "user_id": user_id,
         "user_message": user_message,
         "conversation_id": conversation_id,
-        "conversation_history": _sanitize_history(conversation_history),
+        "conversation_history": kept_history,
+        "dropped_history": dropped_history,          # 窗口装不下的那截，该被折成"之前聊了什么"
         "image_data": image_data,
         "emotion_analysis": None,
         "emotion_summary": None,

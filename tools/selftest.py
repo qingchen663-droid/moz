@@ -1979,29 +1979,29 @@ def first_token_path_clear():
         if "stressed" in live_signal("今天加班到十点，好累")["emotion_summary"]:
             bad.append("英文标签漏进了中文措辞里")
 
-        # ④ 61 轮长历史：开口之前一次同步往返都不许有。
-        #    先说清这一支今天量到什么：`_sanitize_history` 把历史截到 HISTORY_MAX_MESSAGES 条，
-        #    比摘要触发线（SUMMARY_TRIGGER_ROUNDS 轮 = 60 条）还短，所以 /api/chat 上那段
-        #    摘要分支**根本跑不到**——真正在挡首字的是查询改写，不是它。这一条钉的是
-        #    "哪天放宽历史上限，摘要不许又变成开口前的同步等待"。
+        # ④ 61 轮长历史：开口之前一次同步往返都不许有，而被窗口丢掉的那截**必须排进后台**。
+        #    第廿四轮之前这里只能证明"没等"（那支摘要分支永远跑不到：触发线 30 轮、窗口最多 15 轮），
+        #    现在判据换成"有被丢掉的轮次就折"，所以两头都要钉：不挡首字 + 真的补上。
         calls.update({"emotion_node": 0, "invoke": 0, "stream": 0})
         requested: list = []
         real_request = EG._request_summary_async
-        EG._request_summary_async = lambda uid, early, rounds: requested.append(rounds) or True
-        EG._summary_cache.pop("path-user", None)
+        EG._request_summary_async = lambda uid, cid, early, rounds: (
+            requested.append((cid, rounds)) or True)
+        EG._summary_cache.clear()
         hist61 = []
         for i in range(61):
             hist61.append({"role": "user", "content": f"第{i}句聊工作{i}和家里{i}"})
             hist61.append({"role": "assistant", "content": f"收到{i}"})
-        reachable = len(EG._sanitize_history(hist61)) > EG.MAX_RECENT_ROUNDS * 2
         try:
             ev4 = asyncio.run(collect("我周末想回去看看她", 1.0, history=hist61))
         finally:
             EG._request_summary_async = real_request
         if calls["invoke"]:
             bad.append(f"61 轮长历史开口前还有 {calls['invoke']} 次同步往返（会话摘要又变回同步了）")
-        if reachable and not requested:
-            bad.append("长历史已经能触发摘要了，却没排进后台——既不等也不补，这段背景悄悄没了")
+        if not requested:
+            bad.append("窗口丢掉的那截没排进后台——既不等也不补，聊久了就是真的忘（这次修的就是它）")
+        if requested and requested[0][1] < 1:
+            bad.append(f"排进后台了但覆盖轮数不对：{requested}")
         if next((t for t, k, _ in ev4 if k == "token"), None) is None:
             bad.append("61 轮长历史一个 token 都没收到")
     finally:
@@ -2015,8 +2015,10 @@ def first_token_path_clear():
 def session_summary_off_the_clock():
     """长对话的"之前聊了什么"必须后台补：本轮不挡首字、不排第二遍、下一句才吃到。
 
-    这里量的是**时间**而不是调用次数——摘要原来那次同步 `llm.invoke` 没有任何上限
-    （2026-09-28 实测长历史那轮 121.3 秒没回，最可能就是它和生成串在了一起）。
+    第廿轮之前这一支**在 /api/chat 上根本跑不到**（触发线 30 轮，窗口最多 15 轮），
+    所以这项当时只能直接打 builder 才量得到；现在判据是"有被窗口丢掉的轮次就该折"，
+    于是它第一次真的对用户生效——顺带要多钉两件事：按会话分键（不许把上一个对话的
+    背景端过来）、以及**只进 prompt 不进总结金字塔**（滚动摘要会互相包含）。
     全程假客户端 + 假摘要服务：快检不许碰中转，也不许写 backend/moz.db。
     """
     from types import SimpleNamespace
@@ -2026,10 +2028,11 @@ def session_summary_off_the_clock():
     bad = []
     RELAY_SLEEP = 0.4
     user = "summary-async-user"
+    conv = "conv-A"
     real_client, real_service = EG.get_chat_client, EG.get_summary_service
     saved_cache, saved_lock = dict(EG._summary_cache), EG._summary_lock
     calls = {"invoke": 0}
-    stored = []
+    pyramid_rows = []
     try:
         class SlowClient:
             def invoke(self, messages):
@@ -2039,10 +2042,10 @@ def session_summary_off_the_clock():
 
         class FakeService:
             def save_summary(self, uid, text, kind, key):
-                stored.append(text)
+                pyramid_rows.append(text)
 
             def cascade_async(self, uid):
-                pass
+                pyramid_rows.append("cascade")
 
             def format_for_prompt(self, uid):
                 return ""
@@ -2051,18 +2054,21 @@ def session_summary_off_the_clock():
         EG.get_summary_service = lambda: FakeService()
 
         hist = []
-        # 45 轮才够着那支摘要分支：`recent_rounds = min(轮数, MAX_RECENT_ROUNDS)`，
-        # 历史必须比 40 轮长才剩得出"更早的部分"。（/api/chat 上 `_sanitize_history`
-        # 先把历史截到 30 条，所以这一支今天是直接打 builder 才量得到。）
         for i in range(45):
             hist.append({"role": "user", "content": f"第{i}句聊工作{i}和家里{i}"})
             hist.append({"role": "assistant", "content": f"收到{i}"})
-        state = {"user_id": user, "user_message": "我周末想回去看看她",
-                 "conversation_history": hist, "memory_context": "",
-                 "working_memory_text": "", "emotion_summary": ""}
+        kept, dropped = EG._split_history_window(hist)
+        if not dropped:
+            return "45 轮历史居然没被窗口丢掉任何东西，这项的路径变了（先修量法再谈结论）"
+        state = {"user_id": user, "conversation_id": conv, "user_message": "我周末想回去看看她",
+                 "conversation_history": kept, "dropped_history": dropped,
+                 "memory_context": "", "working_memory_text": "", "emotion_summary": ""}
+
+        def cache_entry(cid=conv):
+            return EG._summary_cache.get(EG._summary_key(user, cid))
 
         # ① 本轮：拼装必须立刻返回（那段摘要还没生成出来，本轮就不该为它等）
-        EG._summary_cache.pop(user, None)
+        EG._summary_cache.pop(EG._summary_key(user, conv), None)
         t0 = time.time()
         first_msgs = EG._build_dialogue_messages(dict(state))
         cost = time.time() - t0
@@ -2072,19 +2078,21 @@ def session_summary_off_the_clock():
             bad.append("本轮摘要还没生成出来，prompt 里却已经写上了（这是在编）")
 
         # ② 单飞：后台还在跑时再排一次必须被拒（同 SummaryService.maybe_cascade 的写法）
-        again = EG._request_summary_async(user, hist[-4:], 45)
+        again = EG._request_summary_async(user, conv, dropped[-4:], 4)
         if again:
             bad.append("后台摘要没有单飞锁，能排第二遍——等于拿同一条中转去排队")
 
         deadline = time.time() + 5.0
-        while not stored and time.time() < deadline:
+        while not cache_entry() and time.time() < deadline:
             time.sleep(0.05)
         if not calls["invoke"]:
             bad.append("摘要一次都没生成：既不等也没投后台，这段背景等于悄悄没了")
-        if not stored:
-            bad.append("5 秒了后台还没把摘要补上（补不上就等于这段背景永远没有）")
+        if not cache_entry():
+            bad.append("等了 5 秒后台还没把摘要补上（补不上就等于这段背景永远没有）")
         if calls["invoke"] > 1:
             bad.append(f"摘要跑了 {calls['invoke']} 次，单飞没起作用")
+        if pyramid_rows:
+            bad.append(f"滚动摘要不该往总结金字塔落行，却写了 {pyramid_rows}——周记会拿重叠内容聚合")
 
         # ③ 下一句：缓存里的摘要必须真的进到 prompt 里，且不再调模型
         calls["invoke"] = 0
@@ -2097,20 +2105,28 @@ def session_summary_off_the_clock():
         if not any("那几周" in str(getattr(m, "content", "")) for m in second_msgs):
             bad.append("后台补好的摘要没能进入下一句的 prompt")
 
+        # ③b 换一个新对话：不许把 A 对话的背景端过来（"记错人"比"不记得"更伤人）
+        other = dict(state, conversation_id="conv-B")
+        EG._summary_cache.pop(EG._summary_key(user, "conv-B"), None)
+        b_msgs = EG._build_dialogue_messages(other)
+        if any("那几周" in str(getattr(m, "content", "")) for m in b_msgs):
+            bad.append("摘要没有按会话分键：新对话里端上了上一个对话的「之前聊了什么」")
+        deadline = time.time() + 5.0
+        while cache_entry("conv-B") is None and time.time() < deadline:
+            time.sleep(0.05)
+
         # ④ 反向对照：把摘要改回"同步等"，①那条计时必须当场抓得住——不然整项是空过的
-        EG._summary_cache.pop(user, None)
-        real_cached = EG._get_cached_summary
-        EG._get_cached_summary = lambda uid, rounds: None
-        real_async = EG._request_summary_async
-        EG._request_summary_async = lambda uid, early, rounds: (
-            EG._set_cached_summary(uid, EG._generate_summary(SlowClient(), early), rounds) or True)
+        EG._summary_cache.pop(EG._summary_key(user, conv), None)
+        real_cached, real_async = EG._get_cached_summary, EG._request_summary_async
+        EG._get_cached_summary = lambda uid, cid, rounds: None
+        EG._request_summary_async = lambda uid, cid, early, rounds: (
+            EG._set_cached_summary(uid, cid, EG._generate_summary(SlowClient(), early), rounds) or True)
         try:
             t2 = time.time()
             EG._build_dialogue_messages(dict(state))
             sync_cost = time.time() - t2
         finally:
-            EG._get_cached_summary = real_cached
-            EG._request_summary_async = real_async
+            EG._get_cached_summary, EG._request_summary_async = real_cached, real_async
         if sync_cost < RELAY_SLEEP / 2:
             bad.append(f"反向对照失效：摘要改回同步只花 {sync_cost:.2f}s，这条门禁量不出退化")
     finally:
