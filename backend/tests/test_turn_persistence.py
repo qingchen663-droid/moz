@@ -45,7 +45,7 @@ class OkStream:
 def _drive(monkeypatch, llm, queue):
     monkeypatch.setattr(EG, "get_chat_client", lambda **kw: llm)
     monkeypatch.setattr(EG, "emotion_analysis_node", lambda state: {})
-    monkeypatch.setattr(EG, "_run_memory_retrieval", lambda state, mm, wm=None: {})
+    monkeypatch.setattr(EG, "_run_memory_retrieval", lambda state, mm, wm=None, pm=None: {})
     monkeypatch.setattr(EG, "_build_dialogue_messages", lambda state: [])
 
     async def collect():

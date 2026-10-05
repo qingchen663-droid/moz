@@ -14,6 +14,7 @@
 import argparse
 import datetime as dt
 import http.client
+import io
 import json
 import math
 import os
@@ -1930,10 +1931,8 @@ def first_token_path_clear():
 
         EG.emotion_analysis_node = fake_node
         EG.get_chat_client = lambda **kw: FakeClient(0.0)
-        # 打桩只为"快检不许碰大模型"这条铁律；改写到底还站不站在首字路径上，
-        # 由下面单独那项「查询改写不挡首字」钉（它靠让 rewrite_query 一调用就炸来抓）
-        real_rewrite = EG.rewrite_query
-        EG.rewrite_query = lambda q: [q]
+        # "检索这一段不许调模型"由下面那项「检索这一段不调模型」单独钉
+        # （第廿四轮：rewrite_query 本体已删，没法再拿它当探针）
 
         async def collect(message, wait_cap, history=None):
             EG.SENSITIVE_WAIT_SECONDS = wait_cap
@@ -2008,7 +2007,6 @@ def first_token_path_clear():
     finally:
         EG.emotion_analysis_node = fake_node_original
         EG.get_chat_client = real_get_client
-        EG.rewrite_query = real_rewrite
         shutil.rmtree(d, ignore_errors=True)
 
     return "; ".join(bad) or True
@@ -2123,28 +2121,37 @@ def session_summary_off_the_clock():
     return "; ".join(bad) or True
 
 
-def rewrite_off_first_token_path():
-    """查询改写不许站在首字路径上：上限 1.2 秒，而中转实测中位 25 秒——每轮必然超时白等。
+def retrieval_makes_no_model_call():
+    """记忆检索那一段（在首字路径上）一次模型调用都不许有。
 
-    钉法是让 `rewrite_query` 一被调用就炸。改造前那 1.2 秒是**每轮固定要付**的，
-    而且 `future.cancel()` 取消不了已经在跑的 HTTP，后台还多占一份额度。
+    第廿轮摘掉查询改写、第十七轮摘掉"记忆摘要"那次 invoke，第廿四轮把 `rewrite_query`
+    连同那条从没被调用的非流式图**整个删了**。所以这条钉法也跟着升级：
+    以前是"让 `rewrite_query` 一被调用就炸"，现在把**所有能拿到模型客户端的门都焊死**
+    （`emotion_graph.get_chat_client` 和 `llm_config.get_llm_client`）——
+    谁再往检索里塞一次上游往返，不管它叫改写、摘要还是别的，这里立刻红。
     """
     import shutil
     import tempfile
 
     import emotion_graph as EG
+    import llm_config as LC
     import memory_manager as MM
 
     bad = []
     d = tempfile.mkdtemp()
-    real_rewrite = EG.rewrite_query
+    mm = None
+    real_eg, real_lc = EG.get_chat_client, LC.get_llm_client
     try:
-        def explode(q):
-            raise AssertionError("首字路径上又去调查询改写了")
+        def explode(*a, **kw):
+            raise AssertionError("检索路径上又去拿模型客户端了")
 
-        EG.rewrite_query = explode
+        EG.get_chat_client = explode
+        LC.get_llm_client = explode
         mm = MM.MemoryManager(storage_path=d, db_path=os.path.join(d, "r.db"))
+        # 全程不碰上游：向量服务两头都钉住（第廿一轮的教训——桩要打在上游客户端上，
+        # 并且出去时留给后面的快检一个"绝不打上游"的桩）
         mm.embedding_service.get_embedding = lambda t: None
+        mm.embedding_service.get_embeddings_batch = lambda texts: [None] * len(texts)
         mm.add_memory("rewrite-user", "用户习惯周六早上去滨江那家馆子",
                       category=MM.MemoryCategory.FACT)
         seen = {}
@@ -2157,33 +2164,163 @@ def rewrite_off_first_token_path():
         mm.search_memories = spy
         state = {"user_id": "rewrite-user", "user_message": "周六想去吃那家馆子",
                  "conversation_id": "c1"}
+
+        class ProfileOnly:
+            """档案卡是本地读，不该被"不许调模型"误伤——给一个只回字符串的假管理器。"""
+
+            def get_profile(self, uid):
+                return type("P", (), {"to_prompt_context": lambda self: "用户叫小林，住在杭州"})()
+
         t0 = time.time()
-        out = EG._run_memory_retrieval(state, mm, None)
+        out = EG._run_memory_retrieval(state, mm, None, ProfileOnly())
         cost = time.time() - t0
         if cost > 0.5:
             bad.append(f"检索这一段花了 {cost:.2f}s，首字路径上还有东西在等")
         if not out.get("retrieved_memories"):
             bad.append("检索没拿到东西，这条快检根本没跑到路径")
-        if seen.get("queries") not in (None, [state["user_message"]]):
-            bad.append(f"检索收到的 queries 不是原句：{seen.get('queries')}")
+        if "queries" in seen:
+            bad.append(f"多路查询那个参数还在线上被用：{seen.get('queries')}")
+        if out.get("profile_context") != "用户叫小林，住在杭州":
+            bad.append(f"档案卡没随检索一起交出去（本轮 prompt 里就没有它）：{out.get('profile_context')!r}")
 
-        # 反向对照：把改写塞回首字路径，上面的桩必须炸得起来
+        # 反向对照：把"检索里调一次模型"放回去（等价于当年那句 rewrite_query），必须炸得起来
         real_retrieval = EG._run_memory_retrieval
 
-        def with_rewrite(st, m, w=None):
-            EG.rewrite_query(st["user_message"])
-            return real_retrieval(st, m, w)
+        def with_model_call(st, m, w=None, p=None):
+            LC.get_llm_client()
+            return real_retrieval(st, m, w, p)
 
+        EG.get_chat_client, LC.get_llm_client = real_eg, real_lc
         try:
-            with_rewrite(state, mm, None)
-            bad.append("反向对照失效：改写站回首字路径也抓不出来，这项是空过的")
-        except AssertionError:
-            pass
+            EG._run_memory_retrieval = with_model_call
+            EG.get_chat_client = explode
+            LC.get_llm_client = explode
+            with_rewrite = None
+            try:
+                EG._run_memory_retrieval(state, mm, None, ProfileOnly())
+            except AssertionError as e:
+                with_rewrite = str(e)
+            if not with_rewrite:
+                bad.append("反向对照失效：检索里塞回一次模型调用也抓不出来，这项是空过的")
+        finally:
+            EG._run_memory_retrieval = real_retrieval
     finally:
-        EG.rewrite_query = real_rewrite
-        close_db_conn(mm)
+        EG.get_chat_client, LC.get_llm_client = real_eg, real_lc
+        if mm is not None:
+            close_db_conn(mm)
         shutil.rmtree(d, ignore_errors=True)
     return "; ".join(bad) or True
+
+
+def profile_card_reaches_prompt():
+    """档案卡必须真的出现在回话的 prompt 里——第廿四轮之前它压根没有。
+
+    成因不是逻辑错，是**装配断了**：`_build_dialogue_messages` 一直读 `state["profile_context"]`，
+    而那个字段只有那条"建好却从没被 invoke"的非流式图会填。界面「档案卡」那一栏有内容、
+    库里有内容、prompt 里一个字都没有，所以从外面完全看不出来。
+    """
+    import emotion_graph as EG
+
+    bad = []
+    profile = type("P", (), {"to_prompt_context": lambda self: "用户叫小林，住在杭州；喜欢紫鸢尾"})()
+    mgr = type("M", (), {"get_profile": lambda self, uid: profile})()
+    state = {"user_id": "u", "user_message": "我最近想养花", "conversation_history": [],
+             "emotion_summary": "", "memory_context": "", "working_memory_text": "",
+             "profile_context": mgr.get_profile("u").to_prompt_context()}
+    msgs = "\n".join(str(getattr(m, "content", m)) for m in EG._build_dialogue_messages(state))
+    if "紫鸢尾" not in msgs:
+        bad.append("档案卡内容没进 prompt（她存了档案卡却不肯用）")
+
+    # 反向对照：没有档案卡时不许凭空冒出来（也证明上面那条断言不是白写的常量）
+    state_empty = dict(state, profile_context="")
+    msgs_empty = "\n".join(str(getattr(m, "content", m)) for m in EG._build_dialogue_messages(state_empty))
+    if "紫鸢尾" in msgs_empty:
+        bad.append("反向对照失效：档案卡清空了 prompt 里还写着它，那条断言是自证的")
+
+    # 空档案（新用户）不许往 prompt 里塞一行空话术
+    empty_profile = type("P", (), {"to_prompt_context": lambda self: ""})()
+    empty_mgr = type("M", (), {"get_profile": lambda self, uid: empty_profile})()
+    out = EG._run_memory_retrieval({"user_id": "u", "user_message": "你好", "conversation_id": "c"},
+                                   None, None, empty_mgr)
+    if out.get("profile_context"):
+        bad.append(f"空档案卡不该产出上下文：{out.get('profile_context')!r}")
+    return "; ".join(bad) or True
+
+
+def prompt_fields_have_writers():
+    """`_build_dialogue_messages` 读到的每一个上下文字段，必须真有人在同一条流式路径上写它。
+
+    形状是第廿轮那次挖出来的：**装配断了但逻辑没错**——档案卡一直只由那条
+    "建好却从没被 invoke"的非流式图填，`_build_dialogue_messages` 照读不误，
+    于是库里、界面上都有内容，prompt 里一个字都没有，从外面完全看不出来。
+    这条不看内容对不对，只管"有没有人填"，所以它是结构性的、能挡住下一版的同类事故。
+
+    看得见的写法：`xxx_state = {...}` 这类键、`return {...}` 里的键、`state["k"] = v`。
+    看不见：别的模块往 state 里塞东西（现在没有这种写法）、字段内容正确与否。
+    """
+    import ast
+
+    import emotion_graph as EG
+
+    src = io.open(EG.__file__, encoding='utf-8').read()
+
+    def reads_from(tree, fname):
+        out = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == fname:
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) \
+                            and sub.func.value.__class__.__name__ == "Name" \
+                            and getattr(sub.func.value, "id", "") == "state" \
+                            and sub.func.attr == "get" and sub.args \
+                            and isinstance(sub.args[0], ast.Constant):
+                        out.add(sub.args[0].value)
+                    elif isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name) \
+                            and sub.value.id == "state" and isinstance(sub.slice, ast.Constant):
+                        out.add(sub.slice.value)
+        return out
+
+    def writes_from(tree, fnames):
+        out = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in fnames:
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Dict):
+                        targets = {t.id for t in sub.targets if isinstance(t, ast.Name)}
+                        if any("state" in t for t in targets):
+                            out |= {k.value for k in sub.value.keys if isinstance(k, ast.Constant)}
+                    elif isinstance(sub, ast.Return) and isinstance(sub.value, ast.Dict):
+                        out |= {k.value for k in sub.value.keys if isinstance(k, ast.Constant)}
+                    elif isinstance(sub, ast.Assign) and any(
+                            isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                            and t.value.id == "state" and isinstance(t.slice, ast.Constant)
+                            for t in sub.targets):
+                        out |= {t.slice.value for t in sub.targets
+                                if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)}
+        return out
+
+    producers = {"run_emotion_workflow_streaming", "_run_memory_retrieval", "emotion_analysis_node"}
+    tree = ast.parse(src)
+    reads = reads_from(tree, "_build_dialogue_messages")
+    writes = writes_from(tree, producers)
+    # live_signal 的返回键由 `state["emotion_analysis"]=live` 那几行手工写，单独并进写侧
+    try:
+        import emotion_state as ES
+        estree = ast.parse(io.open(ES.__file__, encoding='utf-8').read())
+        writes |= writes_from(estree, {"live_signal"})
+    except Exception as e:                                       # 读不到就少一项依据，不许误报成"没问题"
+        return f"没法核对 live_signal 产出哪些字段，这条快检没跑完：{type(e).__name__}: {e}"
+
+    missing = sorted(reads - writes)
+    if missing:
+        return (f"这些上下文字段有人读、没人写（等于永远不进 prompt）：{', '.join(missing)}")
+
+    # 反向对照：把档案卡那一行的"写"抹掉（复刻第廿轮之前的真实形状），必须立刻报出来
+    mutated = ast.parse(src.replace('"profile_context": profile_context,', ''))
+    found = sorted(reads_from(mutated, "_build_dialogue_messages") - writes_from(mutated, producers))
+    if "profile_context" not in found:
+        return f"反向对照失效：抹掉档案卡那行也没报出来（报的是 {found}），这项是空过的"
+    return True
 
 
 def http_pool_shared():
@@ -3218,7 +3355,9 @@ def main():
     check("记忆质量底线", memory_quality_floor)
     check("首字路径没有上游往返", first_token_path_clear)
     check("后台摘要不挡首字", session_summary_off_the_clock)
-    check("查询改写不挡首字", rewrite_off_first_token_path)
+    check("检索这一段不调模型", retrieval_makes_no_model_call)
+    check("档案卡真的进 prompt", profile_card_reaches_prompt)
+    check("上下文字段都有人写", prompt_fields_have_writers)
     check("关思考的参数真的发出去", thinking_param_reaches_wire)
     check("连接池不每轮重握手", http_pool_shared)
     check("分段计时不自证", stage_timings_add_up)

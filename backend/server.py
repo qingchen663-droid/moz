@@ -34,10 +34,14 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 # ruff: noqa: E402
 from llm_config import get_llm_client
-from model_config import CHAT_MODEL, CHAT_BASE_URL, get_chat_api_key, detect_provider, resolve_api_key, PROVIDER_KEY_MAP
+from model_config import CHAT_MODEL, get_chat_api_key, detect_provider, resolve_api_key, PROVIDER_KEY_MAP
+# 第廿四轮补上的一个漏import：下面 `except Exception` 里要调 friendly_llm_error，
+# 而它一直没被 import——于是**中转报错**（报文里带 "error code" 那一类，正是最常见的死法）
+# 走到这里当场 NameError，生成器炸在 except 里，用户收到的是断流而不是那句人话。
+from llm_errors import friendly_llm_error
 from memory_manager import EmotionType, MemoryCategory, MemoryManager
 from working_memory import WorkingMemoryStore
-from emotion_graph import build_emotion_graph, run_emotion_workflow_streaming, load_prompt_config, save_prompt_config, get_dialogue_prompt, DIALOGUE_AGENT_PROMPT, CHAT_USE_THINKING
+from emotion_graph import run_emotion_workflow_streaming, load_prompt_config, save_prompt_config, get_dialogue_prompt, DIALOGUE_AGENT_PROMPT, CHAT_USE_THINKING
 from emotion_graph import SaveDeps, run_save_job
 from save_queue import SaveQueue, SaveWorker
 import emotion_state
@@ -192,12 +196,9 @@ async def lifespan(app: FastAPI):
     profile_manager = ProfileManager(db_path)
     _app_state["profile_manager"] = profile_manager
 
-    graph = build_emotion_graph(
-        memory_manager=mm,
-        working_memory_store=_app_state["working_memory_store"],
-        profile_manager=profile_manager,
-    )
-    _app_state["emotion_graph"] = graph
+    # 第廿四轮：这里原来还要 build_emotion_graph(...) 建一张非流式的 LangGraph 图存进
+    # _app_state["emotion_graph"]，但全项目没有一处 invoke 它——用户在等的是流式那条。
+    # 图删了，档案卡上下文改由 _run_memory_retrieval 直接读（它以前只由那个死节点填）。
 
     _app_state["multimodal"] = is_multimodal_model()
     logger.info(f"多模态支持: {_app_state['multimodal']}")

@@ -23,7 +23,6 @@ import sqlite3
 import threading
 import re
 from functools import lru_cache, wraps
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
@@ -607,78 +606,12 @@ class ImportanceScorer:
         return max(0.0, min(1.0, round(total, 3)))
 
 
-# ================================================================
-# 查询改写（Query Rewriting）
-# ================================================================
-
-QUERY_REWRITE_PROMPT = """你是一个搜索查询改写专家。请将用户的口语化输入改写为2-3个更适合检索记忆的查询。
-
-规则：
-1. 保留原始查询的核心意图
-2. 将口语化表达转为更正式的描述性语句
-3. 从不同角度扩展查询（情感状态、具体事实、相关事件）
-4. 每个查询不超过30字
-5. 如果原始查询已经很清晰，只需微调
-
-用户输入：{query}
-
-以 JSON 数组格式返回改写后的查询（包含原始意图的改写版本）：
-["查询1", "查询2"]"""
-
-
-# 查询改写共用一个线程池：每次新建一个池的话，超时后 with 退出还要等那次请求跑完，
-# "5 秒上限"就形同虚设（实测模型 8 秒回，调用方等了 8.00 秒）。
-_REWRITE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="query-rewrite")
-# 查询改写是"多想起几条"的加分项，不是必需品：它跑在首字路径上，
-# 原来给 5 秒等于每轮先白等 5 秒（2026-09-28 实测：正常窗口也要 2~5 秒）。
-# 超了就先用原始查询——召回少一点，但开口快。
-QUERY_REWRITE_TIMEOUT = float(os.environ.get("MOZ_QUERY_REWRITE_TIMEOUT", "1.2"))
-
-
-def rewrite_query(query: str) -> List[str]:
-    """
-    使用 LLM 将用户口语化输入改写为多个检索查询。
-
-    LLM 不可用或超时降级返回原始查询。**超时是真的会返回**：以前这里写成
-    `with ThreadPoolExecutor(...)`，即使 future.result(5) 超时了，退出 with 也要
-    等工作线程跑完，慢中转会把整轮检索拖满（实测模型 8 秒回，调用方等 8.00 秒）。
-    """
-    if not query or len(query.strip()) < 2:
-        return [query]
-
-    try:
-        from llm_config import get_llm_client
-        from langchain_core.messages import HumanMessage
-
-        llm = get_llm_client(temperature=0.0, use_thinking=False)
-        prompt = QUERY_REWRITE_PROMPT.format(query=query)
-
-        future = _REWRITE_POOL.submit(llm.invoke, [HumanMessage(content=prompt)])
-        try:
-            response = future.result(timeout=QUERY_REWRITE_TIMEOUT)
-        except FutureTimeout:
-            # 别等它：这一次改写不要了，原始查询照样能搜
-            future.cancel()
-            logger.warning("[查询改写] 超过 %.0fs 没回，先用原始查询", QUERY_REWRITE_TIMEOUT)
-            return [query]
-
-        content = response.content.strip()
-
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-
-        queries = json.loads(content)
-        if isinstance(queries, list) and len(queries) > 0:
-            # 确保原始查询也在列表中
-            result = [query] + [q for q in queries if q != query]
-            return result[:4]  # 最多 4 个查询（原始 + 3 个改写）
-    except Exception as e:
-        logger.warning(f"[查询改写] 失败，使用原始查询: {e}")
-
-    return [query]
-
+# 查询改写（rewrite_query / _REWRITE_POOL / QUERY_REWRITE_TIMEOUT）在第廿四轮整块删掉：
+# 它唯一的调用方是那条"建好却从没被 invoke"的非流式 LangGraph 图，而回话那一句早就改回
+# 用用户原话单查询（第廿轮：1.2 秒上限摆在中转 25 秒旁边，等于每轮先白等再退回原句）。
+# 留下来的教训写在 RUNLOG 第十三轮：**别把线程池包在 `with` 里做超时**——
+# future.result(5) 抛了 TimeoutError，退出 with 解释器照样 shutdown(wait=True) 等它跑完
+# （实测模型睡 8 秒，调用方等了 8.00 秒；换成模块级长寿命池 + future.cancel() 才真是 5.18 秒）。
 
 # ================================================================
 # 记忆管理器（核心）
@@ -1264,14 +1197,13 @@ class MemoryManager:
         limit: int = 5,
         emotion_filter: Optional[EmotionType] = None,
         min_importance: float = 0.0,
-        queries: Optional[List[str]] = None,
         conversation_id: Optional[str] = None,
     ) -> List[MemoryItem]:
-        """
-        混合检索：语义 + 关键词多路召回 → RRF 融合 → Reranking。
+        """混合检索：语义 + 关键词两路召回 → RRF 融合 → Reranking。
 
-        参数：
-        - queries: 可选的改写查询列表，用于多查询检索
+        第廿轮起回话那一句**只用用户原话这一个查询**（多路改写是唯一调用方的死代码已删）；
+        以前那个 `queries=[...]` 的多路扇出没有任何活着的调用方，一起拿掉了——
+        留着它等于让下一个人以为线上会走多路。
         """
         self._ensure_search_state()
         started = time.perf_counter()
@@ -1283,36 +1215,29 @@ class MemoryManager:
             self._record_search_metrics((time.perf_counter() - started) * 1000, 0.0, 0.0, 0.0, 0.0)
             return []
 
-        search_queries = queries or [query]
-
         # 多路召回 + RRF 融合
         rrf_scores: Dict[str, float] = {}  # memory_id -> rrf_score
         rrf_k = 60
 
-        query_embeddings = self._get_query_embeddings(search_queries)
+        query_embeddings = self._get_query_embeddings([query])
         embedding_elapsed = (time.perf_counter() - started) * 1000
-        semantic_elapsed = 0.0
-        keyword_elapsed = 0.0
-        for q in search_queries:
-            # 语义检索
-            semantic_started = time.perf_counter()
-            semantic_results = self._semantic_search_raw(
-                user_memories, q, emotion_filter, min_importance,
-                user_id=user_id, query_embedding=query_embeddings.get(q),
-            )
-            semantic_elapsed += (time.perf_counter() - semantic_started) * 1000
-            # 关键词检索
-            keyword_started = time.perf_counter()
-            keyword_results = self._keyword_search_raw(
-                user_memories, q, emotion_filter, min_importance, user_id=user_id,
-            )
-            keyword_elapsed += (time.perf_counter() - keyword_started) * 1000
+        semantic_started = time.perf_counter()
+        semantic_results = self._semantic_search_raw(
+            user_memories, query, emotion_filter, min_importance,
+            user_id=user_id, query_embedding=query_embeddings.get(query),
+        )
+        semantic_elapsed = (time.perf_counter() - semantic_started) * 1000
+        keyword_started = time.perf_counter()
+        keyword_results = self._keyword_search_raw(
+            user_memories, query, emotion_filter, min_importance, user_id=user_id,
+        )
+        keyword_elapsed = (time.perf_counter() - keyword_started) * 1000
 
-            # RRF: score = 1 / (k + rank + 1)
-            for rank, (score, memory) in enumerate(semantic_results):
-                rrf_scores[memory.id] = rrf_scores.get(memory.id, 0) + 1.0 / (rrf_k + rank + 1)
-            for rank, (score, memory) in enumerate(keyword_results):
-                rrf_scores[memory.id] = rrf_scores.get(memory.id, 0) + 1.0 / (rrf_k + rank + 1)
+        # RRF: score = 1 / (k + rank + 1)
+        for rank, (score, memory) in enumerate(semantic_results):
+            rrf_scores[memory.id] = rrf_scores.get(memory.id, 0) + 1.0 / (rrf_k + rank + 1)
+        for rank, (score, memory) in enumerate(keyword_results):
+            rrf_scores[memory.id] = rrf_scores.get(memory.id, 0) + 1.0 / (rrf_k + rank + 1)
 
         # 构建候选列表
         candidates = []

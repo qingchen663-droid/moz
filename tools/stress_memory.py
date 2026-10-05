@@ -214,9 +214,13 @@ def run(levels, seed=7, prod_queries=3, sample=12, bulk=False):
         p50 = statistics.median(lat)
         p95 = sorted(lat)[max(0, int(len(lat) * 0.95) - 1)]
 
-        # 线上是"查询改写 + 多路召回"：limit=10、queries 由 rewrite_query 给多条
+        # 线上口径（第廿四轮核过）：limit=10、**用户原话单查询**，多路改写那套已随死代码删掉
         q3 = [f"用户提到的{rng.choice(TOPICS)}", f"{rng.choice(PEOPLE)}{rng.choice(TOPICS)}", "上次说的那件事"]
-        _, prod_ms = timed(manager.search_memories, USER, q3[0], limit=10, queries=q3)
+        prod_ms = []
+        for one in q3:
+            _, ms = timed(manager.search_memories, USER, one, limit=10)
+            prod_ms.append(ms)
+        prod_ms = statistics.median(prod_ms)
 
         hits = 0
         missed = []

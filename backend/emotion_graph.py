@@ -31,13 +31,12 @@ import datetime
 import threading
 import logging
 from collections import OrderedDict
-from typing import TypedDict, Annotated, Optional, List, Dict, Any
+from typing import TypedDict, Optional, List, Dict
 from dotenv import load_dotenv
 from llm_config import get_llm_client
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langgraph.graph import StateGraph, END
 
-from memory_manager import MemoryManager, MemoryCategory, EmotionAnalyzer, EmotionType, rewrite_query
+from memory_manager import MemoryManager, MemoryCategory, EmotionAnalyzer, EmotionType
 from working_memory import WorkingMemoryStore, update_working_memory
 import care_extractor
 import emotion_state
@@ -82,28 +81,18 @@ def get_chat_client(temperature: float = 0.7, top_p: float = None, use_thinking:
 # ================================================================
 # State 定义（信息总线）
 # ================================================================
-
-def merge_dicts(a: dict, b: dict) -> dict:
-    """合并两个字典，b 的优先级更高。"""
-    return {**a, **b}
-
-
-def append_log(logs: List[str], new_log: List[str]) -> List[str]:
-    """累积工作流日志。"""
-    return logs + new_log
-
+#
+# 第廿四轮：以前这个 dict 由 LangGraph 的节点边传递、字段靠 reducer 累积，
+# 现在只有流式那一条路径在装配它——所以删掉了 `merge_dicts`/`append_log` 两个 reducer
+# 和那个从没被赋值的 `_memory_manager`，别再按"图节点会合并状态"来读下面这段。
 
 class AgentState(TypedDict):
-    """
-    工作流 State（信息总线）
-    
-    各 Agent 通过读写 State 来协作。
-    """
+    """一轮对话上下文的字段清单（运行时就是一普通 dict，由 `_stream()` 逐步填）。"""
     # 用户输入
     user_id: str                                    # 用户唯一标识
     user_message: str                               # 当前用户消息
     conversation_id: Optional[str]                  # 当前会话 ID，用于记忆频率治理
-    conversation_history: List[Dict]                # 当前对话历史（短期记忆）
+    conversation_history: List[Dict]                # 当前对话历史（短期记忆，已截窗）
     image_data: Optional[str]                       # 上传图片的 base64 data URL（多模态用）
 
     # 情感分析 Agent 输出
@@ -117,16 +106,14 @@ class AgentState(TypedDict):
     memory_context: Optional[str]                   # 格式化后的记忆上下文
     memory_summary: Optional[str]                   # 记忆摘要（供对话 Agent 使用）
     working_memory_text: Optional[str]              # 工作记忆文本（跨对话上下文）
+    profile_context: Optional[str]                  # 档案卡那一行（第廿四轮才真的接进流式路径）
 
     # 对话 Agent 输出
     assistant_reply: Optional[str]                  # 最终回复
 
     # 元数据
     workflow_start_time: Optional[float]            # 工作流开始时间
-    workflow_log: Annotated[List[str], append_log]  # 工作流日志（可累积）
-
-    # 内部依赖（不通过 reducer 传递）
-    _memory_manager: Any = None
+    workflow_log: List[str]                         # 排障用的日志行
 
 
 # ================================================================
@@ -220,23 +207,6 @@ def emotion_analysis_node(state: AgentState) -> Dict:
 # 对话摘要管理（长对话自动摘要，避免上下文溢出）
 # ================================================================
 
-MEMORY_AGENT_PROMPT = """你是一个记忆管理专家，负责为用户检索和管理长期记忆。
-
-你的任务：
-1. **检索相关记忆**：根据用户当前输入，找出相关的历史记忆
-2. **生成记忆摘要**：将检索到的记忆整理成简洁的背景信息
-3. **评估记忆重要性**：标记哪些记忆是关键的，哪些可以忽略
-
-输出格式（JSON）：
-{
-    "memory_context": "将检索到的记忆整理成自然语言背景信息，供对话 Agent 使用",
-    "key_memories": ["关键记忆1", "关键记忆2"],
-    "memory_summary": "一句话总结用户的相关背景，例如：用户是程序员，最近工作压力大，有一个女朋友"
-}
-
-注意：
-- memory_context 要包含所有相关记忆细节
-- memory_summary 要非常简洁（30字以内）"""
 
 _summary_cache: OrderedDict = OrderedDict()
 _SUMMARY_CACHE_MAX_SIZE = 100
@@ -420,27 +390,6 @@ def get_dialogue_prompt() -> str:
     return _custom_dialogue_prompt if _custom_dialogue_prompt else DIALOGUE_AGENT_PROMPT
 
 
-def dialogue_agent_node(state: AgentState) -> Dict:
-    """对话 Agent 节点：根据记忆和情感上下文，生成共情回复。"""
-    start = time.time()
-    logger.info("💬 [对话 Agent] 开始生成回复...")
-
-    llm = get_chat_client(temperature=0.8, top_p=0.9)
-
-    messages = _build_dialogue_messages(state)
-
-    response = llm.invoke(messages)
-    reply = response.content.strip()
-
-    elapsed = time.time() - start
-    logger.info(f"✅ [对话 Agent] 完成 ({elapsed:.2f}s)")
-
-    return {
-        "assistant_reply": reply,
-        "workflow_log": [f"[对话生成] 回复长度: {len(reply)} 字符"],
-    }
-
-
 def _build_dialogue_messages(state: AgentState) -> list:
     """构建对话 Agent 的消息列表（供流式和非流式共用）。"""
     emotion_summary = state.get("emotion_summary", "")
@@ -533,221 +482,6 @@ def _build_dialogue_messages(state: AgentState) -> list:
         messages.append(HumanMessage(content=state["user_message"]))
 
     return messages
-
-
-# ================================================================
-# 构建工作流图
-# ================================================================
-
-def build_emotion_graph(
-    memory_manager: Optional[MemoryManager] = None,
-    working_memory_store: Optional[WorkingMemoryStore] = None,
-    profile_manager=None,
-) -> StateGraph:
-    """
-    构建情感陪伴 Agent 工作流图。
-    
-    工作流：
-    1. START → 情感分析 → 记忆检索 → 对话生成 → 记忆存储 → END
-    
-    注意：使用闭包传递依赖，避免 LangGraph State 序列化问题。
-    """
-    logger.info(f"[DEBUG] build_emotion_graph: memory_manager={'OK' if memory_manager else 'None'}")
-    graph = StateGraph(AgentState)
-    set_working_memory_ref(working_memory_store)
-
-    # 使用闭包创建节点函数，捕获依赖
-    def memory_node_with_closure(state: AgentState) -> Dict:
-        logger.info("🧠 [记忆 Agent] 开始检索记忆...")
-        user_id = state["user_id"]
-        user_message = state["user_message"]
-
-        # 加载工作记忆
-        working_memory_text = ""
-        if working_memory_store:
-            working_memory_text = working_memory_store.format_for_prompt(user_id)
-
-        # 新增：加载档案卡
-        profile_context = ""
-        if profile_manager:
-            profile = profile_manager.get_profile(user_id)
-            if profile:
-                profile_context = profile.to_prompt_context()
-
-        # 查询改写：将口语化输入扩展为多个检索查询
-        queries = rewrite_query(user_message)
-        retrieved = []
-        if memory_manager:
-            local_results = memory_manager.search_memories(
-                user_id,
-                user_message,
-                limit=10,
-                queries=queries,
-                conversation_id=state.get("conversation_id"),
-            )
-            retrieved = [{"memory": m.content, "source": "local"} for m in local_results]
-            logger.info(f"[记忆检索] 本地检索: {len(retrieved)} 条")
-
-        memory_texts = [r.get("memory", "") for r in retrieved if r.get("memory")]
-
-        llm = get_chat_client(temperature=0.3, use_thinking=False)
-        if memory_texts:
-            memory_content = "\n".join([f"- {m}" for m in memory_texts])
-            system_msg = SystemMessage(content=MEMORY_AGENT_PROMPT)
-            user_msg = HumanMessage(content=f"以下是检索到的记忆，请生成记忆摘要：\n\n{memory_content}")
-            try:
-                response = llm.invoke([system_msg, user_msg])
-                content = response.content.strip()
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
-                result = json.loads(content)
-                memory_context = result.get("memory_context", memory_content)
-                memory_summary = result.get("memory_summary", "")
-            except Exception:
-                memory_context = memory_content
-                memory_summary = f"共 {len(memory_texts)} 条相关记忆"
-        else:
-            memory_context = "暂无相关记忆"
-            memory_summary = "新用户，暂无历史记忆"
-
-        logger.info(f"✅ [记忆 Agent] 完成: {len(retrieved)} 条记忆")
-        return {
-            "retrieved_memories": retrieved,
-            "memory_context": memory_context,
-            "memory_summary": memory_summary,
-            "working_memory_text": working_memory_text,
-            "profile_context": profile_context,  # 新增：传递档案卡上下文
-            "workflow_log": [f"[记忆检索] {len(retrieved)} 条相关记忆"],
-        }
-
-    def save_memory_node_with_closure(state: AgentState) -> Dict:
-        user_id = state["user_id"]
-        user_msg = state["user_message"]
-        reply = state.get("assistant_reply", "")
-
-        if not reply:
-            return {"workflow_log": ["[记忆存储] 跳过，无回复"]}
-
-        # 1. 更新工作记忆（现有逻辑）
-        if working_memory_store:
-            try:
-                update_llm = get_chat_client(temperature=0.0, use_thinking=False)
-                update_working_memory(working_memory_store, user_id, user_msg, reply, update_llm)
-            except Exception as e:
-                logger.warning(f"[工作记忆更新] 失败: {e}")
-
-        # 2. 存储长期记忆（传递情感分析 Agent 的结果）
-        if memory_manager:
-            try:
-                # 从情感分析 Agent 的结果中提取情感标签
-                emotion_analysis = state.get("emotion_analysis")
-                emotion_type = None
-                emotion_intensity = None
-                if emotion_analysis:
-                    try:
-                        emotion_type = EmotionType.from_string(emotion_analysis.get("current_emotion", ""))
-                    except (ValueError, AttributeError):
-                        emotion_type = None
-                    emotion_intensity = emotion_analysis.get("emotion_intensity")
-                
-                memory_manager.extract_and_store_facts(
-                    user_id, user_msg, reply,
-                    category=MemoryCategory.EMOTION,
-                    emotion=emotion_type,
-                    emotion_intensity=emotion_intensity,
-                    conversation_id=state.get("conversation_id"),
-                )
-                logger.info("💾 [记忆存储] 已保存")
-            except Exception as e:
-                logger.warning(f"[记忆存储] 失败: {e}")
-
-        # 3. 新增：更新档案卡
-        if profile_manager:
-            try:
-                from user_profile import ProfileUpdater
-                profile_updater = ProfileUpdater(profile_manager)
-                llm_client = get_chat_client(temperature=0.0, use_thinking=False)
-                updated_fields = profile_updater.update_from_conversation(
-                    user_id=user_id,
-                    user_msg=user_msg,
-                    assistant_msg=reply,
-                    llm_client=llm_client,
-                )
-                if updated_fields:
-                    logger.info(f"[档案卡更新] 用户 {user_id}: 更新了 {updated_fields}")
-            except Exception as e:
-                logger.warning(f"[档案卡更新] 失败: {e}")
-
-        # 4. 新增：提取时间标签并附加到本次对话产生的所有记忆
-        if memory_manager:
-            try:
-                from temporal_metadata import TemporalExtractor
-                temporal = TemporalExtractor.extract_from_text(user_msg)
-                if temporal.event_time or temporal.time_context or temporal.recurrence:
-                    count = memory_manager.attach_temporal_metadata(
-                        user_id=user_id,
-                        temporal_data=temporal.to_dict(),
-                    )
-                    if count:
-                        logger.info(f"[时间标签] 为 {count} 条记忆附加了时间标签")
-            except Exception as e:
-                logger.warning(f"[时间标签更新] 失败: {e}")
-
-        return {"workflow_log": ["[记忆存储] 完成"]}
-
-    # 添加节点
-    graph.add_node("emotion_analysis", emotion_analysis_node)
-    graph.add_node("memory_retrieval", memory_node_with_closure)
-    graph.add_node("dialogue_generation", dialogue_agent_node)
-    graph.add_node("memory_storage", save_memory_node_with_closure)
-
-    # 设置边
-    graph.set_entry_point("emotion_analysis")
-    graph.add_edge("emotion_analysis", "memory_retrieval")
-    graph.add_edge("memory_retrieval", "dialogue_generation")
-    graph.add_edge("dialogue_generation", "memory_storage")
-    graph.add_edge("memory_storage", END)
-
-    return graph.compile()
-
-
-# ================================================================
-# 便捷调用函数
-# ================================================================
-
-def run_emotion_workflow(
-    graph,
-    user_id: str,
-    user_message: str,
-    conversation_history: List[Dict] = None,
-    image_data: str = None,
-) -> str:
-    initial_state = {
-        "user_id": user_id,
-        "user_message": user_message,
-        "conversation_history": _sanitize_history(conversation_history),
-        "image_data": image_data,
-        "emotion_analysis": None,
-        "emotion_summary": None,
-        "retrieved_memories": None,
-        "memory_context": None,
-        "memory_summary": None,
-        "assistant_reply": None,
-        "workflow_start_time": time.time(),
-        "workflow_log": [],
-    }
-
-    result = graph.invoke(initial_state)
-
-    reply = result.get("assistant_reply", "抱歉，我暂时无法回复。")
-    
-    total_time = time.time() - (result.get("workflow_start_time") or time.time())
-    logger.info(f"📊 工作流完成 (总耗时: {total_time:.2f}s)")
-    logger.info(f"📋 工作流日志: {' → '.join(result.get('workflow_log', []))}")
-
-    return reply
 
 
 class SaveDeps:
@@ -964,7 +698,8 @@ def run_emotion_workflow_streaming(
                 prepared = f"{state.get('plan_context', '')}{state.get('baseline_context', '')}"
 
             retrieval_task = asyncio.create_task(asyncio.to_thread(
-                _run_memory_retrieval, initial_state, memory_manager, working_memory_store))
+                _run_memory_retrieval, initial_state, memory_manager, working_memory_store,
+                profile_manager))
 
             if emotion_state.worth_waiting(live):
                 # 用户 2026-09-28 拍板：医院/忌日/起冲突/落榜/马上答辩这几类，本轮值得等一次模型。
@@ -1078,8 +813,9 @@ def _run_memory_retrieval(
     state: Dict,
     memory_manager: Optional[MemoryManager],
     working_memory_store: Optional[WorkingMemoryStore] = None,
+    profile_manager=None,
 ) -> Dict:
-    """独立运行记忆检索节点（供流式工作流调用）。"""
+    """独立运行记忆检索节点（供流式工作流调用）。全本地读，不调上游。"""
     user_id = state["user_id"]
     user_message = state["user_message"]
 
@@ -1087,6 +823,18 @@ def _run_memory_retrieval(
     working_memory_text = ""
     if working_memory_store:
         working_memory_text = working_memory_store.format_for_prompt(user_id)
+
+    # 档案卡：第廿四轮才接上。它一直只由那条"建好却从没被调用"的非流式图填，
+    # 而 `_build_dialogue_messages` 读的是这个字段——等于她把档案卡存在库里、
+    # 说话时一次都没用过（界面上「档案卡」那一栏当然是有内容的，更容易看不出来）。
+    profile_context = ""
+    if profile_manager:
+        try:
+            profile = profile_manager.get_profile(user_id)
+            if profile:
+                profile_context = profile.to_prompt_context()
+        except Exception as e:
+            logger.warning(f"[档案卡] 本轮没读出来（不影响回话）: {e}")
 
     # 查询改写留在这里不调：它是一次上游往返，而它在首字路径上从来没赢过——
     # 上限 1.2 秒（memory_manager.py:613），中转实测中位 25 秒，等于每轮先白等 1.2 秒
@@ -1121,5 +869,6 @@ def _run_memory_retrieval(
         "memory_context": memory_context,
         "memory_summary": memory_summary,
         "working_memory_text": working_memory_text,
+        "profile_context": profile_context,
         "workflow_log": [f"[记忆检索] {len(retrieved)} 条相关记忆"],
     }
