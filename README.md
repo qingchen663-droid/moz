@@ -226,7 +226,7 @@ moz 由三个协作的 AI Agent 分工驱动：**情感分析** 与 **记忆检�
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/wenbo-zhang1/moz.git
+git clone https://github.com/qingchen663-droid/moz.git
 cd moz
 ```
 
@@ -548,4 +548,4 @@ PR 提交前请确保：前端 `npm run lint && npm run build` 通过，后端 `
 
 ## License
 
-[AGPL-3.0License](./LICENSE) | Copyright (c) 2026 wenbo-zhang1
+[AGPL-3.0License](./LICENSE) | Copyright (c) 2026 qingchen663-droid

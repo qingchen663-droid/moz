@@ -19,7 +19,7 @@ def _shared_http_client():
     """全进程共用一个 httpx 客户端（连接池按 host 复用，httpx 文档写明可跨线程共享）。
 
     原来每轮对话、每个后台任务都新建一个 ChatOpenAI → 新建一个 httpx 客户端 →
-    从零再来一遍 TCP+TLS。实测到 api.hcnsec.cn:443 一次完整握手中位 **222ms**
+    从零再来一遍 TCP+TLS。实测到 relay.example.com:443 一次完整握手中位 **222ms**
     （TCP 83ms；10 次采样），这一下正是站在"按下发送 → 第一个字"里的。
     密钥不在 httpx 客户端上（它是每次请求的 header），所以换模型/换渠道/换 key
     都不用重建，也就不存在"缓存了过期状态"这件事。

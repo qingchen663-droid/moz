@@ -159,7 +159,7 @@ MODEL_PROFILES = {
     "qwen": {
         "extra_body": {"enable_thinking": True, "return_reasoning": True},
     },
-    # MiMo 走中转（api.hcnsec.cn）。`tools/probe_first_token.py` 2026-09-29 实测：
+    # MiMo 走中转（relay.example.com）。`tools/probe_first_token.py` 2026-09-29 实测：
     #   不带任何参数 → 中转**默认就在先想后说**，每条 113~636 字的 reasoning，用户一个字
     #     都看不到（`_consume_stream` 只取 chunk.content），首字因此 2.1~13.4 秒；
     #   `thinking:{type:disabled}` → 直接 400，并回了一句 "Use reasoning_effort"；
@@ -239,7 +239,7 @@ def get_embed_config() -> tuple:
     """向量服务的 (模型, 地址, provider)。默认跟着 chat 那条通道走——同一把令牌。
 
     踩过的坑：这里原来硬编码 ``embedding-3`` + ``open.bigmodel.cn``，而用户手上的令牌是
-    ``api.hcnsec.cn`` 中转发出来的。同一个 key 在智谱那边必然 401，于是"语义路不可用"
+    ``relay.example.com`` 中转发出来的。同一个 key 在智谱那边必然 401，于是"语义路不可用"
     被一路误判成"这套环境没有向量模型"。实测中转上有 ``Qwen3-Embedding-8B``（2048 维，200 OK）。
     要指回别处：``MOZ_EMBED_MODEL`` / ``MOZ_EMBED_BASE_URL``。
     """
