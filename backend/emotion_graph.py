@@ -792,7 +792,11 @@ def run_emotion_workflow_streaming(
                     nonlocal full_reply
                     try:
                         for chunk in llm.stream(messages):
-                            token = chunk.content
+                            token, stream_bad = _stream_token_or_error(chunk.content)
+                            if stream_bad is not None:
+                                # 上游把异常对象塞进了 content：交给既有兜底路径，别拼进正文
+                                stream_error[0] = stream_bad
+                                break
                             if token:
                                 full_reply += token
                                 token_queue.put_nowait(token)
@@ -873,6 +877,24 @@ def run_emotion_workflow_streaming(
             yield {'type': 'error', 'text': friendly_llm_error(e, bool(state.get("image_data")))}
 
     return _stream()
+
+
+def _stream_token_or_error(content):
+    """从中转回来的 chunk 里取出要播的文本；取不出文本就当作流内错误交回兜底路径。
+
+    起因是实测到过 `chunk.content` 是一个 **RuntimeError 对象**而不是字符串，
+    老写法 `full_reply += token` 当场抛
+    `TypeError: can only concatenate str (not "RuntimeError") to str`，
+    把整条流式工作流打死（用户看到的是"她没回话"，日志里只留下一行"流式工作流失败"）。
+    返回 ``(文本, 错误对象或 None)``。
+    """
+    if content is None:
+        return "", None
+    if isinstance(content, str):
+        return content, None
+    if isinstance(content, BaseException):
+        return "", content
+    return "", RuntimeError("中转返回了非文本内容块（%s）" % type(content).__name__)
 
 
 def _run_memory_retrieval(

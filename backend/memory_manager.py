@@ -41,6 +41,8 @@ from memory_governance import (
     initial_grade,
     normalized_content,
     is_near_duplicate,
+    MAX_FILLER_GAP,
+    negated,
     is_question_shaped,
     drop_redundant_prefix_facts,
 )
@@ -154,6 +156,11 @@ class MemoryItem:
     base_degree_score: float = 0.40
     locked: bool = False
 
+    # 条件槽：这条记忆在什么情境成立 / 什么情境被明确排除。
+    # 空串 = 从未声明，检索面按"无条件"处理——既不加分也不减分。
+    when_valid: str = ""
+    when_invalid: str = ""
+
     mention_count: int = 0
     independent_conversation_count: int = 0
     last_mentioned_at: float = 0.0
@@ -215,6 +222,8 @@ class MemoryItem:
             "regrade_reason": self.regrade_reason,
             "version": self.version,
             "updated_at": self.updated_at,
+            "when_valid": self.when_valid,
+            "when_invalid": self.when_invalid,
         }
         if self.embedding is not None:
             d["embedding"] = self.embedding
@@ -354,12 +363,14 @@ class EmbeddingService:
         if self._client is not None:
             return
         try:
-            from model_config import EMBED_MODEL, EMBED_BASE_URL, EMBED_PROVIDER, resolve_api_key
-            api_key = resolve_api_key(EMBED_PROVIDER)
+            # 每次构造都实时取配置：向量端点跟着 chat 那条通道走（详见 model_config.get_embed_config）
+            from model_config import get_embed_config, resolve_api_key
+            model, base_url, provider = get_embed_config()
+            api_key = resolve_api_key(provider)
             from openai import OpenAI
-            self._client = OpenAI(api_key=api_key, base_url=EMBED_BASE_URL.rsplit("/", 1)[0])
-            self._model = EMBED_MODEL
-            logger.info(f"[EmbeddingService] 初始化成功, model={EMBED_MODEL}")
+            self._client = OpenAI(api_key=api_key, base_url=base_url.rsplit("/", 1)[0])
+            self._model = model
+            logger.info(f"[EmbeddingService] 初始化成功, model={model}, base={base_url.rsplit('/', 1)[0]}")
         except Exception as e:
             logger.warning(f"[EmbeddingService] 初始化失败: {e}, 将降级到关键词匹配")
             self._client = None
@@ -617,6 +628,42 @@ class ImportanceScorer:
 # 记忆管理器（核心）
 # ================================================================
 
+def as_fact_tuples(items) -> list:
+    """把事实条目统一成 ``(文本, 生效条件, 不适用条件)``。
+
+    调用方（含桩测与快检门禁）习惯直接返回字符串列表，这里两种形态都收——
+    否则桩住老名字的测试会被绕过、快检门禁就打到大模型上了。
+    """
+    out = []
+    for item in items or []:
+        if isinstance(item, str):
+            out.append((item, "", ""))
+        elif isinstance(item, dict):
+            text = str(item.get("fact") or item.get("text") or "").strip()
+            if not text:
+                continue
+            out.append((text,
+                        str(item.get("when_valid") or "").strip(),
+                        str(item.get("when_invalid") or "").strip()))
+        elif isinstance(item, (tuple, list)) and item:
+            text = str(item[0] or "").strip()
+            if not text:
+                continue
+            valid = str(item[1] or "").strip() if len(item) > 1 else ""
+            invalid = str(item[2] or "").strip() if len(item) > 2 else ""
+            out.append((text, valid, invalid))
+    return out
+
+
+def _dup_prefilter(new_len: int, other_len: int, new_negated: bool, other_negated: bool) -> bool:
+    """判重前的必要条件粗筛。返回 False 时 `is_near_duplicate` 必然也返回 False。
+
+    两个条件都直接来自判重函数本身：否定式不同一律不算重复；
+    长度差超过填充词上限就不可能"多出来的全是虚词"。
+    """
+    return other_negated == new_negated and abs(other_len - new_len) <= MAX_FILLER_GAP
+
+
 class MemoryManager:
     """
     高级记忆管理器。
@@ -659,6 +706,9 @@ class MemoryManager:
         self._keyword_derived: Dict[str, Dict[str, tuple]] = {}
         self._index_generation: Dict[str, int] = {}
         self._query_embedding_cache: Dict[str, Tuple[float, List[float]]] = {}
+        self._probe_lock = threading.Lock()
+        self._dup_norm: Dict[str, Dict[str, tuple]] = {}     # 实例级：跨 manager 共享会把另一个实例的探测当成自己人在跑
+        self._ensure_maintenance_state()
         self._query_embedding_cache_ttl = float(os.environ.get("MOZ_QUERY_EMBED_CACHE_TTL", "60"))
         self._query_embedding_cache_max = int(os.environ.get("MOZ_QUERY_EMBED_CACHE_SIZE", "128"))
         self._search_metrics = {
@@ -683,6 +733,8 @@ class MemoryManager:
 
     def _ensure_search_state(self) -> None:
         """Initialize search-only state for lightweight test/factory instances."""
+        if self.__dict__.get("_probe_lock") is None:
+            self.__dict__["_probe_lock"] = threading.Lock()
         if not hasattr(self, "_search_index_cache"):
             self._search_index_cache = {}
         if not hasattr(self, "_keyword_index_cache"):
@@ -702,8 +754,33 @@ class MemoryManager:
                 "searches_total": 0,
                 "cache_hits": 0,
                 "cache_misses": 0,
+                "embed_probe": 0,
+                "embed_skip": 0,
+                "neg_routed": 0,
+                "defer_demoted": 0,
                 "stage_ms": {key: 0.0 for key in ("embedding", "semantic", "keyword", "rerank", "total")},
             }
+        for _key in ("embed_probe", "embed_skip", "neg_routed", "defer_demoted"):
+            self._search_metrics.setdefault(_key, 0)
+
+    def _bump_search_counter(self, key: str, amount: int = 1) -> None:
+        """给检索面记一个可核对的计数（不靠日志数次数）。"""
+        self._ensure_search_state()
+        with self._state_lock:
+            self._search_metrics[key] = self._search_metrics.get(key, 0) + amount
+
+    def _dup_norm_for(self, user_id: str) -> Dict[str, tuple]:
+        """每个用户一份「正文 → 归一化派生数据」缓存；攒够了整份重来。
+
+        轻量实例（测试里直接造对象）可能没有这个属性，这里一并兜住。
+        """
+        if not hasattr(self, "_dup_norm"):
+            self._dup_norm = {}
+        derived = self._dup_norm.setdefault(user_id, {})
+        count = len(self._get_user_memories(user_id))
+        if len(derived) > 2 * max(count, 8):
+            derived.clear()
+        return derived
 
     def _generate_id(self, content: str, user_id: str) -> str:
         """生成记忆唯一 ID。"""
@@ -723,6 +800,8 @@ class MemoryManager:
         conversation_id: Optional[str] = None,
         message_id: Optional[str] = None,
         supersedes_id: Optional[str] = None,
+        when_valid: Optional[str] = None,
+        when_invalid: Optional[str] = None,
     ) -> MemoryItem:
         """Add a governed memory, or reinforce an equivalent active memory."""
         content = (content or "").strip()
@@ -753,10 +832,26 @@ class MemoryManager:
 
         # 这台机器没有可用的 embedding：归一化相同算同一条，写法不同的同一件事
         # 靠二元组重叠系数并条。宁可并错也不要同一件事攒成三条互相冲突的记忆。
+        #
+        # 原来每条已有记忆都要重跑一遍 normalized_content（NFKC + 三次正则 + 一次 replace），
+        # 实测 add_memory 的 p50 随条数线性涨：N=1000 52ms / N=4000 210ms。
+        # 归一化只跟正文有关、正文不可变，所以每个用户缓存一份；再用判重自身的两个
+        # 必要条件（否定式不同、长度差超阈）先筛——被筛掉的按原函数必然返回 False，
+        # 所以粗筛后的结果与逐条全判**完全一致**，由测试钉住。
+        new_negated = negated(normalized)
+        new_len = len(normalized)
+        derived = self._dup_norm_for(user_id)
         for memory in user_memories.values():
             if not memory.active():
                 continue
-            other = normalized_content(memory.content)
+            entry = derived.get(memory.id)
+            if entry is None or entry[0] is not memory.content:
+                other = normalized_content(memory.content)
+                entry = (memory.content, other, negated(other), len(other))
+                derived[memory.id] = entry
+            _, other, other_negated, other_len = entry
+            if not _dup_prefilter(new_len, other_len, new_negated, other_negated):
+                continue
             if not is_near_duplicate(normalized, other):
                 continue
             if other != normalized:
@@ -768,6 +863,12 @@ class MemoryManager:
                 conversation_id=conversation_id,
                 message_id=message_id,
             )
+
+        # 条件槽：调用方给了就用调用方的，否则从正文确定性取一次（取不到留空）。
+        from memory_conditions import derive_condition
+        derived_valid, derived_invalid = derive_condition(content)
+        resolved_valid = (when_valid if when_valid is not None else derived_valid or "").strip()
+        resolved_invalid = (when_invalid if when_invalid is not None else derived_invalid or "").strip()
 
         factors, degree_score = DegreeScorer.calculate(
             content=content,
@@ -806,6 +907,8 @@ class MemoryManager:
             layer=grade.legacy_layer,
             last_regraded_at=now,
             regrade_reason="created",
+            when_valid=resolved_valid,
+            when_invalid=resolved_invalid,
         )
 
         embedding = self.embedding_service.get_embedding(content)
@@ -826,11 +929,18 @@ class MemoryManager:
                     "[记忆去重] 合并候选 %s 到 %s (similarity=%.3f)",
                     memory_id, semantic_duplicate.id, best_similarity,
                 )
+                # 原来这里往 reinforce_memory 传了个它没有的 importance_value 参数：
+                # 向量一路没通的时候这段代码永远跑不到，语义路一接上就 TypeError
+                # 把整轮落库打断。重要性取两者较大这件事在本函数里做，不塞进 reinforce。
+                if importance > semantic_duplicate.importance:
+                    semantic_duplicate.importance = importance
+                    semantic_duplicate.regrade_reason = "semantic_dedupe"
+                    semantic_duplicate.updated_at = now
+                    self._dirty.add((user_id, semantic_duplicate.id))
                 return self.reinforce_memory(
                     user_id=user_id,
                     memory_id=semantic_duplicate.id,
                     event_type="mentioned",
-                    importance_value=max(semantic_duplicate.importance, importance),
                     conversation_id=conversation_id,
                     message_id=message_id,
                 )
@@ -847,7 +957,10 @@ class MemoryManager:
 
         count = len(user_memories)
         if count >= self.CONSOLIDATION_TRIGGER:
-            self.auto_maintain(user_id)
+            # 容量维护不再在写路径上等：实测（N=1200 全带向量）一次同步 auto_maintain
+            # 会占住这一句 45 秒，其中 93.7% 花在 find_clusters 的两两余弦上。
+            # 只登记待办，由单飞后台线程消化；测试与心跳可显式 drain。
+            self._schedule_maintenance(user_id)
         elif count > 50 and count % 10 == 0:
             self.prune_memories(user_id)
         self._invalidate_search_cache(user_id)
@@ -1245,6 +1358,31 @@ class MemoryManager:
             if mid in user_memories:
                 candidates.append((rrf_score, user_memories[mid]))
 
+        # DEFER：声明了「生效条件」却没被本次查询确认的记忆**降档但不删**。
+        # 借鉴"不确定就标 DEFER 而不是硬答"——宁可用不上的少一点，也不把没确认的条件当事实说出去。
+        # 没声明条件的记忆完全不受影响（老库不因此改排序）。
+        from memory_conditions import DEFER_ENABLED as _DEFER
+        from memory_conditions import condition_confirmed as _confirmed, prepare_query as _prep_cond
+        if _DEFER and candidates:
+            _cq = _prep_cond(query)
+            # 只有"另有被本次查询确认过的条件"时才把未确认的往后放。
+            # 无条件记忆并不比它更"被确认"——过去把它一律压到无条件记忆之下，
+            # 实测把该命中的挤出 top10（干扰池 hit@10 0.923→0.885），那是纯伤害。
+            confirmed_any = any(m.when_valid and _confirmed(m.when_valid, _cq)
+                                for _score, m in candidates)
+            if confirmed_any:
+                deferred = 0
+                tiered = []
+                for score, m in candidates:
+                    if m.when_valid and not _confirmed(m.when_valid, _cq):
+                        tiered.append((score * 0.5, m))
+                        deferred += 1
+                    else:
+                        tiered.append((score, m))
+                if deferred:
+                    self._bump_search_counter("defer_demoted", deferred)
+                candidates = tiered
+
         if not candidates:
             self._record_search_metrics(
                 (time.perf_counter() - started) * 1000,
@@ -1384,12 +1522,22 @@ class MemoryManager:
                 else:
                     missing.append(query)
         if missing:
-            embeddings = self.embedding_service.get_embeddings_batch(missing)
-            for query, embedding in zip(missing, embeddings):
-                if embedding is not None:
-                    with self._state_lock:
-                        self._query_embedding_cache[query] = (now, embedding)
-                    result[query] = embedding
+            # 首字路径不为"再试一次"付往返：向量服务可达时把探测丢给单飞后台线程，
+            # 本轮直接用已有向量/关键词那一路；探测结果进缓存，下一句起生效。
+            # 想退回同步探测（宁可第一句慢，也要这一句就用语义路）设 MOZ_EMBED_PROBE=inline。
+            if self.embedding_service.available():
+                self._bump_search_counter("embed_probe")
+                if os.environ.get("MOZ_EMBED_PROBE", "background").strip().lower() == "inline":
+                    embeddings = self.embedding_service.get_embeddings_batch(missing)
+                    for query, embedding in zip(missing, embeddings):
+                        if embedding is not None:
+                            with self._state_lock:
+                                self._query_embedding_cache[query] = (now, embedding)
+                            result[query] = embedding
+                else:
+                    self._request_probe_async(missing)
+            else:
+                self._bump_search_counter("embed_skip")
         with self._state_lock:
             if len(self._query_embedding_cache) > self._query_embedding_cache_max:
                 oldest = sorted(self._query_embedding_cache.items(), key=lambda item: item[1][0])
@@ -1439,6 +1587,39 @@ class MemoryManager:
                 self._backfill_lock.release()
 
         threading.Thread(target=_run, daemon=True).start()
+        return True
+
+    def _request_probe_async(self, queries: List[str]) -> bool:
+        """查询向量的探测放到后台：用户这一句不等网络。
+
+        单飞——已经有一批在路上就不排第二遍；失败由 EmbeddingService 自己的
+        指数退避记账，成功则填进 `_query_embedding_cache`，下一句起语义路自然生效。
+        """
+        if not queries or not self.embedding_service.available():
+            return False
+        if not self._probe_lock.acquire(blocking=False):
+            return False
+
+        def _run():
+            try:
+                embeddings = self.embedding_service.get_embeddings_batch(queries)
+                stamp = time.time()
+                with self._state_lock:
+                    for query, embedding in zip(queries, embeddings):
+                        if embedding is not None:
+                            self._query_embedding_cache[query] = (stamp, embedding)
+                            self._search_metrics["probe_wins"] = \
+                                self._search_metrics.get("probe_wins", 0) + 1
+            except Exception as e:
+                logger.debug("[向量探测] 后台这一批失败: %s", e)
+            finally:
+                self._probe_lock.release()
+
+        try:
+            threading.Thread(target=_run, daemon=True).start()
+        except Exception:
+            self._probe_lock.release()
+            return False
         return True
 
     def _semantic_search_raw(
@@ -1492,6 +1673,7 @@ class MemoryManager:
             if similarities[idx] > 0.1:
                 filtered_indices.append((similarities[idx], memory))
 
+        filtered_indices = self._apply_negative_routing(filtered_indices, query)
         filtered_indices.sort(key=lambda x: x[0], reverse=True)
         return filtered_indices
 
@@ -1533,12 +1715,15 @@ class MemoryManager:
 
         prepared = self._prepare_query(query)
         query_tokens = prepared["tokens"]
+        scored_terms = prepared["scored"]
         k1, b = 1.2, 0.75
         # idf 只跟语料和查询词表有关，跟具体某条记忆无关：先算好，别在几万条里重复 math.log
         idf = {
             token: math.log(1 + (total_docs - df.get(token, 0) + 0.5) / (df.get(token, 0) + 0.5))
-            for token in set(query_tokens)
+            for token in {t for t, _ in scored_terms}
         }
+        # 分母仍按原查询词数：同义扩展是"额外能对上"的证据，只加不减，
+        # 不参与归一化，免得把本来就命中的原词分数稀释掉。
         score_denom = max(len(query_tokens), 1)
         length_denom = max(avgdl, 1)
         prunable = prepared["prunable"]
@@ -1556,17 +1741,35 @@ class MemoryManager:
             else:
                 lex_possible = True
             bm25 = 0.0
-            for token in query_tokens:
+            for token, weight in scored_terms:
                 tf = counts.get(token)
                 if tf is None:
                     continue
-                bm25 += idf[token] * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / length_denom))
+                bm25 += weight * idf[token] * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / length_denom))
             lexical = self._match_prepared(memory, prepared, clean_content) if lex_possible else 0.0
             score = lexical + min(0.4, bm25 / score_denom)
             if score > 0:
                 results.append((score, memory))
+        # 负路由放在**召回路本身**，不放fusion之后：以后谁新开一条读法（直接调这两路）
+        # 也不会把"自己声明过不适用情境"的记忆当答案带出去。
+        results = self._apply_negative_routing(results, query)
         results.sort(key=lambda x: x[0], reverse=True)
         return results
+
+    def _apply_negative_routing(self, results, query: str):
+        """命中记忆自己声明的「不适用条件」的，不返回它（借鉴声明条件裁决）。
+
+        没声明条件的记忆完全不受影响；剔掉的条数计入 `neg_routed`，不静默消失。
+        """
+        from memory_conditions import conflicts_with_query, prepare_query
+        if not results or not any(getattr(m, "when_invalid", "") for _score, m in results):
+            return results
+        prepared = prepare_query(query)
+        kept = [(score, m) for score, m in results if not conflicts_with_query(m.when_invalid, prepared)]
+        dropped = len(results) - len(kept)
+        if dropped:
+            self._bump_search_counter("neg_routed", dropped)
+        return kept
 
     def _keyword_index(
         self,
@@ -1665,6 +1868,14 @@ class MemoryManager:
         #   ascii     = 英文/数字词元（第 3 条分支的英文回退）
         #   prunable  = 这个查询能不能安全剪枝（下面那条注释解释什么时候不能）
         g2 = frozenset(clean_query[i:i + 2] for i in range(len(clean_query) - 1))
+        # 同义扩展：纯本地查表，不发网络。扩展词同时进打分集合与剪枝集合——
+        # 剪枝集合变宽只会少剪几条（宁可全扫，不许漏召回），不会把真命中剪掉。
+        from memory_synonyms import ENABLED as _SYN_ENABLED, expand as _syn_expand
+        expansions = _syn_expand(tokens) if _SYN_ENABLED else {}
+        scored = [(token, 1.0) for token in tokens]
+        scored.extend((token, weight) for token, weight in expansions.items())
+        all_tokens = list(tokens) + [t for t in expansions if t not in tokens]
+        token_set = frozenset(all_tokens)
         # 只有当查询里每个空格分词都至少有 2 个字母数字时才能剪：
         # 否则会出现"单字成词"（如「小 林 的」这种），那种命中既不在 2 字连写里、
         # 也不在英文词元里，剪枝就会把真命中丢掉。宁可退化成全扫，不许漏召回。
@@ -1676,9 +1887,11 @@ class MemoryManager:
             "substrings": substrings,
             "query_words": query_words,
             "tokens": tokens,
-            "token_set": frozenset(tokens),
+            "scored": scored,
+            "expanded": len(expansions),
+            "token_set": token_set,
             "g2": g2,
-            "ascii": frozenset(t for t in tokens if t.isascii()),
+            "ascii": frozenset(t for t in all_tokens if t.isascii()),
             "prunable": prunable,
         }
 
@@ -1708,6 +1921,10 @@ class MemoryManager:
             "cache_hits": self._search_metrics["cache_hits"],
             "cache_misses": self._search_metrics["cache_misses"],
             "cache_hit_rate": round(self._search_metrics["cache_hits"] / cache_lookups, 3) if cache_lookups else 0.0,
+            "embed_probe": self._search_metrics.get("embed_probe", 0),
+            "embed_skip": self._search_metrics.get("embed_skip", 0),
+            "neg_routed": self._search_metrics.get("neg_routed", 0),
+            "defer_demoted": self._search_metrics.get("defer_demoted", 0),
             "avg_stage_ms": {key: round(value / total, 3) if total else 0.0 for key, value in stage_ms.items()},
         }
 
@@ -1874,10 +2091,83 @@ class MemoryManager:
     # 归档条数超过这个值才允许物理删除；0 = 永不硬删（一条归档才 ~180 字节，留着不心疼）
     ARCHIVE_DELETE_AFTER = int(os.environ.get("MOZ_ARCHIVE_DELETE_AFTER", "0"))
 
+    def _ensure_maintenance_state(self) -> None:
+        """维护用的锁与待办必须是**实例级**：类属性会让两个 manager 互相以为"有人在跑"。"""
+        if self.__dict__.get("_maintenance_lock") is None:
+            self.__dict__["_maintenance_lock"] = threading.Lock()
+        if self.__dict__.get("_maintenance_due") is None:
+            self.__dict__["_maintenance_due"] = set()
+        self.__dict__.setdefault("_maintenance_runs", 0)
+
+    def _schedule_maintenance(self, user_id: str) -> bool:
+        """登记一次容量维护，并保证最多一个线程在路上（单飞，不排队第二遍）。"""
+        self._ensure_maintenance_state()
+        with self._state_lock:
+            self._maintenance_due.add(user_id)
+        if not self._maintenance_lock.acquire(blocking=False):
+            return False
+        try:
+            threading.Thread(target=self._maintenance_worker, daemon=True).start()
+        except Exception:
+            # 线程起不来就把待办留着，下一次写入或心跳会再接手——绝不假装已经维护过
+            self._maintenance_lock.release()
+            logger.warning("[容量维护] 后台线程未启动，待办保留：%s", user_id)
+            return False
+        return True
+
+    def _maintenance_worker(self) -> None:
+        try:
+            while True:
+                with self._state_lock:
+                    if not self._maintenance_due:
+                        return
+                    uid = self._maintenance_due.pop()
+                try:
+                    self.auto_maintain(uid)
+                    with self._state_lock:
+                        self._maintenance_runs = getattr(self, "_maintenance_runs", 0) + 1
+                except Exception as e:
+                    logger.warning("[容量维护] user=%s 维护失败: %s", uid, e)
+        finally:
+            self._maintenance_lock.release()
+
+    def drain_maintenance_due(self, timeout_s: float = 60.0) -> Dict:
+        """把待办维护跑完并等它结束——给测试/心跳用的同步入口。
+
+        返回 ``{"drained": n, "remaining": n}``，``drained`` 是**实际跑完的次数**
+        （本线程跑的 + 后台线程在此期间跑完的）；等到超时仍有在路上时带
+        ``timed_out: True``，不谎报为已完成。
+        """
+        self._ensure_maintenance_state()
+        base = getattr(self, "_maintenance_runs", 0)
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            with self._state_lock:
+                pending = bool(self._maintenance_due)
+                runs = getattr(self, "_maintenance_runs", 0)
+            if not pending and not self._maintenance_lock.locked():
+                return {"drained": runs - base, "remaining": 0}
+            if pending and not self._maintenance_lock.locked():
+                # 后台线程不在路上，这一线程接手跑一条
+                uid = None
+                with self._state_lock:
+                    if self._maintenance_due:
+                        uid = self._maintenance_due.pop()
+                if uid:
+                    self.auto_maintain(uid)
+                    with self._state_lock:
+                        self._maintenance_runs = getattr(self, "_maintenance_runs", 0) + 1
+            if time.monotonic() >= deadline:
+                with self._state_lock:
+                    return {"drained": getattr(self, "_maintenance_runs", 0) - base,
+                            "remaining": len(self._maintenance_due), "timed_out": True}
+            time.sleep(0.05)
+
     def auto_maintain(self, user_id: str):
         """Auto-maintain memory count: consolidate first, then archive lowest-value.
-        
-        Called after add_memory when count exceeds soft threshold.
+
+        由 `_schedule_maintenance` 的单飞后台线程消化，或测试/心跳显式 drain；
+        `add_memory` 不再同步等它（N=1200 全带向量时同步跑一次实测占住写句 45 秒）。
         Three-tier strategy:
         1. If > consolidation_trigger: merge related fragments via MemoryConsolidator
         2. If still > max_active: archive lowest degree_score unconsolidated memories  
@@ -2266,13 +2556,21 @@ class MemoryManager:
         
         返回提取到的事实列表。
         """
-        extracted_facts = self._extract_facts(user_msg, assistant_msg)
+        extracted = as_fact_tuples(self._extract_facts(user_msg, assistant_msg))
 
-        if extracted_facts:
+        if extracted:
             # 同一句话抽出"一窄一宽"两条时，窄的那条整段藏在宽的那条开头，不必各存一份
-            fresh = drop_redundant_prefix_facts(
-                [f for f in extracted_facts if not is_question_shaped(f)])
-            for fact in fresh:
+            keep = set(drop_redundant_prefix_facts(
+                [text for text, _v, _i in extracted if not is_question_shaped(text)]))
+            from memory_conditions import trustworthy
+            for fact, when_valid, when_invalid in extracted:
+                if fact not in keep:
+                    continue
+                # 抽取器的条件要能在用户原话里找到词面，说反或编出来的一律不采信
+                if when_valid and not trustworthy(when_valid, user_msg):
+                    when_valid = ""
+                if when_invalid and not trustworthy(when_invalid, user_msg):
+                    when_invalid = ""
                 supersedes = self._resolve_fact_conflicts(user_id, fact, category)
                 self.add_memory(
                     user_id=user_id,
@@ -2282,6 +2580,9 @@ class MemoryManager:
                     emotion_intensity=emotion_intensity,
                     conversation_id=conversation_id,
                     supersedes_id=supersedes,
+                    # 抽取器说了条件就用它；没说过（空串）就交回正文规则去抽，不替用户编
+                    when_valid=when_valid or None,
+                    when_invalid=when_invalid or None,
                 )
         else:
             user_summary = user_msg.strip()[:60]
@@ -2315,11 +2616,16 @@ class MemoryManager:
                     conversation_id=conversation_id,
                 )
 
-        return extracted_facts
+        # 对外仍返回纯文本列表（调用方与改之前一样只认事实文本）
+        return [text for text, _v, _i in extracted]
 
-    def _extract_facts(self, user_msg: str, assistant_msg: str) -> List[str]:
-        """从对话中提取关于用户的关键事实。使用规则 + LLM 混合提取。"""
-        facts = []
+    def _extract_facts(self, user_msg: str, assistant_msg: str) -> List[tuple]:
+        """从对话中提取关键事实，规则 + LLM 混合，带上抽取器声明的条件槽。
+
+        每条是 ``(文本, 生效条件, 不适用条件)``。条件**只有用户明确说了才填**，
+        拿不到留空串——空串传下去会退回正文规则抽取，绝不替用户编一个条件。
+        """
+        facts: List[tuple] = []
         logger.debug("[事实提取] 收到用户消息，长度=%d", len(user_msg))
 
         info_keywords = ["我叫", "我是", "我喜欢", "我不喜欢", "我的职业", "我的工作",
@@ -2334,29 +2640,30 @@ class MemoryManager:
                     if kw in s and 4 <= len(s) <= 100:
                         if any(s.startswith(p) or f" {p}" in s or f"，{p}" in s for p in ai_subject_patterns):
                             continue
-                        facts.append(f"[关于用户] {s}")
+                        facts.append((f"[关于用户] {s}", "", ""))
                 break
 
         emotion_keywords = ["焦虑", "孤独", "悲伤", "痛苦", "迷茫",
                            "压力大", "崩溃", "失望", "愤怒", "抑郁"]
         for kw in emotion_keywords:
             if kw in user_msg:
-                facts.append(f"[用户情感状态] 用户正在经历{kw}")
+                facts.append((f"[用户情感状态] 用户正在经历{kw}", "", ""))
                 break
 
         try:
-            llm_facts = self._llm_extract_facts(user_msg, assistant_msg)
-            existing = set(facts)
-            for f in llm_facts:
-                if f not in existing:
-                    facts.append(f)
+            llm_facts = as_fact_tuples(self._llm_extract_facts(user_msg, assistant_msg))
+            existing = {item[0] for item in facts}
+            for item in llm_facts:
+                if item[0] not in existing:
+                    facts.append(item)
         except Exception as e:
             logger.warning(f"[事实提取] LLM 提取失败: {e}")
 
-        facts = self._filter_low_quality_facts(facts)
+        kept_texts = set(self._filter_low_quality_facts([item[0] for item in facts])[:5])
+        result = [item for item in facts if item[0] in kept_texts]
 
-        logger.info(f"[事实提取] 提取了 {len(facts)} 条事实")
-        return facts[:5]
+        logger.info(f"[事实提取] 提取了 {len(result)} 条事实")
+        return result
 
     def _filter_low_quality_facts(self, facts: List[str]) -> List[str]:
         """过滤低质量事实。"""
@@ -2374,8 +2681,8 @@ class MemoryManager:
             filtered.append(f)
         return filtered
 
-    def _llm_extract_facts(self, user_msg: str, assistant_msg: str) -> List[str]:
-        """调用 LLM 从对话中提取关键事实。"""
+    def _llm_extract_facts(self, user_msg: str, assistant_msg: str) -> List[tuple]:
+        """调用 LLM 从对话中提取关键事实，返回 ``(文本, 生效条件, 不适用条件)``。"""
         try:
             from llm_config import get_llm_client
             from langchain_core.messages import HumanMessage
@@ -2410,8 +2717,10 @@ AI：{assistant_msg}
 - AI 的建议（除非用户明确采纳）
 - 任何推测性内容
 
-以 JSON 数组格式返回，每条事实是完整的陈述句：
-["用户今天很难过", "AI曾向用户推荐了歌曲《晴天》"]
+以 JSON 数组返回，每条事实是完整的陈述句，也可以写成对象带上**条件槽**：
+["用户今天很难过", {{ "fact": "如果下雨就不去跑步", "when_valid": "下雨", "when_invalid": "" }}]
+条件槽只在用户**明确说了条件**时才填（"除非/如果…就/不要…的时候"），
+没说过就留空串或整个字段省略——编一个条件比漏一个条件更糟，它会以后错杀正常回答。
 如果没有值得提取的信息，返回 []。"""
 
             response = llm.invoke([HumanMessage(content=prompt)])
@@ -2425,12 +2734,17 @@ AI：{assistant_msg}
             if isinstance(facts, list):
                 tagged = []
                 for f in facts:
-                    if not f or len(f) <= 5:
+                    when_valid = when_invalid = ""
+                    if isinstance(f, dict):
+                        when_valid = str(f.get("when_valid") or "").strip()
+                        when_invalid = str(f.get("when_invalid") or "").strip()
+                        f = str(f.get("fact") or f.get("text") or "")
+                    if not isinstance(f, str) or not f or len(f) <= 5:
                         continue
                     if f.startswith("AI") or f.startswith("ai") or "AI曾" in f or "AI向" in f or "AI建议" in f or "AI推荐" in f:
-                        tagged.append(f"[AI互动] {f}")
+                        tagged.append((f"[AI互动] {f}", when_valid, when_invalid))
                     else:
-                        tagged.append(f"[关于用户] {f}")
+                        tagged.append((f"[关于用户] {f}", when_valid, when_invalid))
                 return tagged
         except Exception as e:
             logger.warning(f"[事实提取] LLM 提取错误: {e}")

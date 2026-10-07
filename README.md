@@ -209,9 +209,9 @@ moz 由三个协作的 AI Agent 分工驱动：**情感分析** 与 **记忆检�
 | **Agent 编排** | 自研流式编排（LangChain 客户端） | 三 Agent 分工；第廿四轮删掉了那条建好却从没被调用的非流式 LangGraph 图 |
 | **LLM 客户端** | langchain-openai (ChatOpenAI) | 统一接口，支持多模型 |
 | **记忆系统** | 多层认知记忆模型 | 档案卡 + 三层分级 + 时间标签 + 遗忘曲线 + RRF 混合检索 + Reranking |
-| **语义向量** | 智谱 Embedding API (embedding-3) | 余弦相似度记忆匹配；令牌失效时自动指数退避、检索走关键词 |
+| **语义向量** | 跟着 chat 通道走的中转 embedding（默认 `Qwen3-Embedding-8B`，2048 维；`MOZ_EMBED_MODEL` / `MOZ_EMBED_BASE_URL` 可覆盖） | 余弦相似度记忆匹配；不可用时自动指数退避、检索走关键词。**注意**：这里曾硬编码智谱 `embedding-3`，而令牌是中转发的——同一个 key 在智谱必然 401，于是被误判成"这套环境没有向量模型" |
 | **存储** | SQLite (WAL 模式) | 对话 & 记忆 & 档案卡持久化，增量写入 |
-| **测试** | pytest (145 tests) + Vitest (67 tests) + `tools/selftest.py`（51 项全局快检门禁） | 后端核心算法 + 前端交互 + 端到端行为契约 |
+| **测试** | pytest (167 tests) + Vitest (67 tests) + `tools/selftest.py`（51 项全局快检门禁）+ 检索面四臂门禁 | 后端核心算法 + 前端交互 + 端到端行为契约 + 检索命中读数 |
 | **质量门禁** | `tools/selftest.py` + pytest + tsc/vitest | 四条命令全绿才提交（见上面「度量与自测」）。**没有 CI 流水线**——门禁靠人跑 |
 
 ---
@@ -340,7 +340,9 @@ MOZ_EMBED_FAILURE_COOLDOWN_MAX=1800  # 向量服务失败后的退避封顶（�
   `emotion.thinking`（思考参数发没发出去）、`emotion.prewarm`
 - 门禁：`tools/selftest.py` **51 项快检**（秒级、全打桩、不碰大模型、不写用户数据；
   `--full` 另加真实对话与中转看图）。**其中 11 项走 HTTP，后端没起会全红——那是环境不是代码**
-- 单元测试：`pytest backend/tests`（152 条）+ 前端 `npx tsc -b && npx vitest run`
+- 单元测试：`pytest backend/tests`（155 条）+ 前端 `npx tsc -b && npx vitest run`
+- 检索面门禁：`python backend/memory_retrieval_bench.py`（三臂 A/B：同义扩展、条件负路由；
+  只考检索命中不考答案对错，含反向对照——某一臂测不出变化它会判失败，不许当通过）
 
 ---
 

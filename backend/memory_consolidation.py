@@ -24,8 +24,14 @@ class MemoryConsolidator:
         self.memory_manager = memory_manager
 
     def find_clusters(self, user_id: str) -> List[List]:
-        """Group active, unconsolidated memories by semantic similarity."""
-        from memory_manager import EmbeddingService
+        """Group active, unconsolidated memories by semantic similarity.
+
+        逐对调 `EmbeddingService.cosine_similarity` 在 1200 条上要跑 719,400 次
+        「新建两个 np.array + 两次求模 + 一次点积」（实测单次 59µs，整轮 42.5 秒），
+        而同一件事用一次归一化矩阵乘就够。这里保留原有的取样顺序与判据
+        （seed 之后、未分组、sim >= CLUSTER_SIMILARITY），只换算法。
+        """
+        import numpy as np
 
         user_memories = self.memory_manager._get_user_memories(user_id)
         candidates = [
@@ -38,19 +44,24 @@ class MemoryConsolidator:
         if len(candidates) < MIN_CLUSTER_SIZE:
             return []
 
+        matrix = np.array([m.embedding for m in candidates], dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1)
+        norms[norms == 0] = 1.0
+        unit = matrix / norms[:, None]
+
         assigned = set()
         clusters = []
         for i, seed in enumerate(candidates):
             if seed.id in assigned:
                 continue
+            # 一个 seed 一次行点积：O(n) 次 BLAS，而不是 O(n^2) 次 numpy 小调用
+            sims = unit @ unit[i]
             cluster = [seed]
-            for other in candidates[i + 1:]:
+            for j in range(i + 1, len(candidates)):
+                other = candidates[j]
                 if other.id in assigned or other.embedding is None:
                     continue
-                sim = EmbeddingService.cosine_similarity(
-                    seed.embedding, other.embedding
-                )
-                if sim >= CLUSTER_SIMILARITY:
+                if float(sims[j]) >= CLUSTER_SIMILARITY:
                     cluster.append(other)
             if len(cluster) >= MIN_CLUSTER_SIZE:
                 clusters.append(cluster)

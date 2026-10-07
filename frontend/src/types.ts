@@ -184,6 +184,9 @@ export interface MemoryDetail {
   is_consolidated: boolean
   tags: string[]
   temporal_data: Record<string, any>
+  /** 条件槽：这条在什么情境成立 / 什么情境被明确排除（后端没声明时是空串或缺字段） */
+  when_valid?: string
+  when_invalid?: string
 }
 
 export interface WorkingMemory {

@@ -179,9 +179,9 @@ def get_model_profile(model_name: str) -> dict:
             return MODEL_PROFILES[key]
     return {}
 
-EMBED_MODEL = "embedding-3"
-EMBED_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/embeddings"
-EMBED_PROVIDER = "zhipu"
+# 向量服务的模型/地址在文件后半部定义（见 get_embed_config）——它要用 detect_provider，
+# 不能在这行位置求值。
+DEFAULT_EMBED_MODEL = "Qwen3-Embedding-8B"
 
 PROVIDER_KEY_MAP = {
     "deepseek":    "DEEPSEEK_API_KEY",
@@ -233,3 +233,23 @@ def get_chat_api_key() -> str:
         return cfg["api_key"]
     provider = detect_provider(cfg["model"], cfg["base_url"])
     return resolve_api_key(provider)
+
+
+def get_embed_config() -> tuple:
+    """向量服务的 (模型, 地址, provider)。默认跟着 chat 那条通道走——同一把令牌。
+
+    踩过的坑：这里原来硬编码 ``embedding-3`` + ``open.bigmodel.cn``，而用户手上的令牌是
+    ``api.hcnsec.cn`` 中转发出来的。同一个 key 在智谱那边必然 401，于是"语义路不可用"
+    被一路误判成"这套环境没有向量模型"。实测中转上有 ``Qwen3-Embedding-8B``（2048 维，200 OK）。
+    要指回别处：``MOZ_EMBED_MODEL`` / ``MOZ_EMBED_BASE_URL``。
+    """
+    cfg = load_active_config()
+    model = (os.environ.get("MOZ_EMBED_MODEL") or "").strip() or DEFAULT_EMBED_MODEL
+    base = (os.environ.get("MOZ_EMBED_BASE_URL") or "").strip()
+    if not base:
+        chat_base = (cfg.get("base_url") or "").rstrip("/")
+        base = chat_base + "/embeddings" if chat_base else "https://open.bigmodel.cn/api/paas/v4/embeddings"
+    return model, base, detect_provider(model, base)
+
+
+EMBED_MODEL, EMBED_BASE_URL, EMBED_PROVIDER = get_embed_config()

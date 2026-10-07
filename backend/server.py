@@ -174,6 +174,16 @@ def _log_startup_summary():
     features.append("记忆: 本地记忆系统")
     features.append(f"多模态: {'支持' if _app_state.get('multimodal') else '不支持'}")
     features.append(f"认证: {'已启用' if MOZ_ACCESS_KEY else '未启用'}")
+    _mm = _app_state.get("memory_manager")
+    if _mm is not None:
+        # 语义那一路到底有没有在参与，启动时就讲明白：库里一条向量都没有时，
+        # "混合检索"其实只有关键词一路在加分——这不该只有读代码的人知道。
+        with _mm._state_lock:
+            _with_vec = sum(1 for _memos in _mm.memories.values() for _m in _memos.values()
+                            if getattr(_m, "embedding", None) is not None)
+        _svc = "冷却中" if not _mm.embedding_service.available() else "在位（本轮未探测）"
+        features.append(f"语义路: {_svc}，库里带向量记忆 {_with_vec} 条"
+                        + ("（→ 检索实际只走关键词一路）" if _with_vec == 0 else ""))
     logger.info("启动配置摘要: " + " | ".join(features))
 
 @asynccontextmanager
@@ -235,6 +245,14 @@ async def lifespan(app: FastAPI):
             await emotion_state.run_prewarm(save_deps, job)
         else:
             await run_save_job(save_deps, job)
+
+    # 容量维护不再等"下一次写入"才发生：启动时就把已经超阈值的用户登记上，
+    # 由 MemoryManager 的单飞后台线程消化（写路径已不同步跑它）。
+    for _uid in mm.get_all_user_ids():
+        _active = sum(1 for _m in mm._get_user_memories(_uid).values() if _m.active())
+        if _active >= mm.CONSOLIDATION_TRIGGER:
+            logger.info("[容量维护] 启动发现 user=%s active=%d 超阈值，登记待办", _uid, _active)
+            mm._schedule_maintenance(_uid)
 
     save_worker = SaveWorker(_app_state["save_queue"], _dispatch_job)
     _app_state["save_worker"] = save_worker

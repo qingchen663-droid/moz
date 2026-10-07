@@ -118,6 +118,15 @@ def _negated(text: str) -> bool:
     return any(ch in text for ch in "不没别")
 
 
+# 判重的两个**必要条件**对外暴露：检索侧想先粗筛再全判时，必须用同一口径，
+# 不然两边各写一份"否定式"或"长度差"的判断，早晚会漂。等价性由 tests 钉住。
+def negated(text: str) -> bool:
+    return _negated(text)
+
+
+MAX_FILLER_GAP = _MAX_FILLER_GAP
+
+
 _MIN_PREFIX_LEN = 4      # 两三个字的片段（"喜欢"）别拿去当前缀比对
 
 

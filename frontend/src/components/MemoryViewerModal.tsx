@@ -156,6 +156,8 @@ export default function MemoryViewerModal({ onClose }: Props) {
       CATEGORY_LABELS[m.category] ?? '',
       m.emotion,
       EMOTION_LABELS[m.emotion] ?? '',
+      m.when_valid ?? '',
+      m.when_invalid ?? '',
       ...(m.tags ?? []),
     ]
       .join(' ')
@@ -695,6 +697,15 @@ function MemoryList({
             </div>
 
             <div className="mem-card-content">{text}</div>
+
+            {(m.when_valid || m.when_invalid) && (
+              <div className="mem-card-tags">
+                {m.when_valid ? <span className="mem-tag">成立时：{m.when_valid}</span> : null}
+                {m.when_invalid ? (
+                  <span className="mem-tag mem-tag--from">不适用：{m.when_invalid}</span>
+                ) : null}
+              </div>
+            )}
 
             {(chip || temporalLabel || m.tags.length > 0) && (
               <div className="mem-card-tags">

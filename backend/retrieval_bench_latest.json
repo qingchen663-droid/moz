@@ -1,0 +1,82 @@
+{
+  "A": {
+    "零干扰池": {
+      "hit@1": 0.63,
+      "hit@5": 0.852,
+      "hit@10": 0.889,
+      "MRR": 0.721,
+      "avg_ms": 1.4,
+      "neg_routed": 0,
+      "defer_demoted": 0
+    },
+    "干扰池": {
+      "hit@1": 0.556,
+      "hit@5": 0.815,
+      "hit@10": 0.852,
+      "MRR": 0.652,
+      "avg_ms": 1.5,
+      "neg_routed": 0,
+      "defer_demoted": 0
+    }
+  },
+  "B": {
+    "零干扰池": {
+      "hit@1": 0.63,
+      "hit@5": 0.852,
+      "hit@10": 0.963,
+      "MRR": 0.741,
+      "avg_ms": 1.4,
+      "neg_routed": 0,
+      "defer_demoted": 0
+    },
+    "干扰池": {
+      "hit@1": 0.556,
+      "hit@5": 0.852,
+      "hit@10": 0.889,
+      "MRR": 0.67,
+      "avg_ms": 1.7,
+      "neg_routed": 0,
+      "defer_demoted": 0
+    }
+  },
+  "C": {
+    "零干扰池": {
+      "hit@1": 0.63,
+      "hit@5": 0.852,
+      "hit@10": 0.963,
+      "MRR": 0.741,
+      "avg_ms": 1.4,
+      "neg_routed": 0,
+      "defer_demoted": 0
+    },
+    "干扰池": {
+      "hit@1": 0.556,
+      "hit@5": 0.852,
+      "hit@10": 0.889,
+      "MRR": 0.67,
+      "avg_ms": 1.5,
+      "neg_routed": 3,
+      "defer_demoted": 0
+    }
+  },
+  "D": {
+    "零干扰池": {
+      "hit@1": 0.63,
+      "hit@5": 0.852,
+      "hit@10": 0.963,
+      "MRR": 0.748,
+      "avg_ms": 1.4,
+      "neg_routed": 0,
+      "defer_demoted": 5
+    },
+    "干扰池": {
+      "hit@1": 0.556,
+      "hit@5": 0.852,
+      "hit@10": 0.889,
+      "MRR": 0.676,
+      "avg_ms": 1.6,
+      "neg_routed": 3,
+      "defer_demoted": 5
+    }
+  }
+}
